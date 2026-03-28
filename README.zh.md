@@ -302,7 +302,7 @@ episodic-claw 是 **100% 氛围编码（vibe coded）** 的产物。我描述我
 
 👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
 
-没有压力。插件永远是 MIT 许可证，永久免费。
+没有压力。插件永远是 MPL-2.0 许可证，永久免费。
 
 ---
 

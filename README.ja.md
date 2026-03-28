@@ -297,7 +297,7 @@ AIエージェントに、コンテキストウィンドウの圧縮要約より
 
 👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
 
-無理しなくていいです。プラグインはMITライセンスで永遠に無料です。
+無理しなくていいです。プラグインはMPL-2.0ライセンスで永遠に無料です。
 
 ---
 

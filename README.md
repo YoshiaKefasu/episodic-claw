@@ -319,7 +319,7 @@ Keeping this going requires a Claude or OpenAI Codex subscription — that's wha
 
 👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
 
-No pressure. The plugin will always be MIT licensed and free.
+No pressure. The plugin will always be MPL-2.0 licensed and free.
 
 ---
 
