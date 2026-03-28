@@ -1,0 +1,55 @@
+{
+  "id": "episodic-claw",
+  "displayName": "Episodic Memory",
+  "version": "0.1.0",
+  "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — no setup required.",
+  "kind": "memory",
+  "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
+  "author": {
+    "name": "YoshiaKefasu",
+    "url": "https://github.com/YoshiaKefasu"
+  },
+  "repository": "https://github.com/YoshiaKefasu/episodic-claw",
+  "homepage": "https://github.com/YoshiaKefasu/episodic-claw#readme",
+  "license": "MPL-2.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Enable or disable the plugin (default true)."
+      },
+      "reserveTokens": {
+        "type": "integer",
+        "description": "Max tokens reserved for injected episode memories in the system prompt (default 6144)."
+      },
+      "recentKeep": {
+        "type": "integer",
+        "description": "Number of recent turns to retain during compaction (default 30)."
+      },
+      "dedupWindow": {
+        "type": "integer",
+        "description": "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
+      },
+      "maxBufferChars": {
+        "type": "integer",
+        "minimum": 500,
+        "description": "Character threshold that triggers a forced buffer flush regardless of surprise score (default 7200). Must be >= 500."
+      },
+      "maxCharsPerChunk": {
+        "type": "integer",
+        "minimum": 500,
+        "description": "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
+      },
+      "sharedEpisodesDir": {
+        "type": "string",
+        "description": "(Planned — Phase 6) Path to a shared episodes directory across multiple agents. Has no effect in current version."
+      },
+      "allowCrossAgentRecall": {
+        "type": "boolean",
+        "description": "(Planned — Phase 6) Whether to include other agents' episodes in recall results. Has no effect in current version."
+      }
+    }
+  }
+}

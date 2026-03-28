@@ -1,0 +1,9 @@
+node_modules/
+tests/
+episodes_test*/
+*.log
+*.txt
+*.db
+*.jsonl
+!package.json
+!openclaw.plugin.json

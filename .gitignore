@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build outputs (JS compiled from TypeScript)
+dist/*.js
+dist/*.d.ts
+dist/*.d.ts.map
+dist/*.js.map
+dist/runner_hardcoded.js
+
+# Dev scripts / artifacts
+extract-logic.js
+bin/
+models.json
+
+# Personal episode data — NEVER commit user data
+episodes/
+
+# Temporary / runtime files
+openclaw-global.tmp.json
+*.tmp.json
+
+# npm pack output
+*.tgz
+
+# Go build artifacts in source directory
+go/episodic-core.exe
+go/episodic-core
+go/openclaw-go
+
+# GitNexus code intelligence index (developer tool)
+.gitnexus/
+
+# Claude Code developer configs — project-specific, not for end users
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript build cache
+tsconfig.tsbuildinfo
+
+# OS artifacts
+.DS_Store
+Thumbs.db

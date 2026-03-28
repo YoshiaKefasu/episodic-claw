@@ -1,0 +1,405 @@
+import { spawn, ChildProcess } from "child_process";
+import * as path from "path";
+import * as readline from "readline";
+import * as net from "net";
+import * as os from "os";
+import * as fs from "fs";
+
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem } from "./types";
+
+// BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
+const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
+
+interface RPCResponse {
+  jsonrpc: string;
+  result?: any;
+  error?: { code: number; message: string };
+  id?: number;
+  method?: string;
+  params?: any;
+}
+
+export class EpisodicCoreClient {
+  private child?: ChildProcess;
+  private socket?: net.Socket;
+  private connectOpts?: net.NetConnectOpts;  // reconnect 用
+  /** P1-Fix1: Thundering Herd 防止 Mutex */
+  private reconnectPromise?: Promise<void>;
+  private reqId = 1;
+  private pendingReqs = new Map<
+    number,
+    { resolve: (val: any) => void; reject: (err: any) => void }
+  >();
+
+  public onFileChange?: (event: FileEvent) => void;
+
+  private async getFreePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.on("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        const port = (srv.address() as net.AddressInfo).port;
+        srv.close(() => resolve(port));
+      });
+    });
+  }
+
+  async start(): Promise<void> {
+    const pluginRoot = path.resolve(__dirname, "..");
+    
+    // Determine socket path / TCP port based on platform
+    const isWin = os.platform() === "win32";
+    
+    let actualAddr = "";
+    let connectOpts: net.NetConnectOpts;
+
+    if (isWin) {
+      const port = await this.getFreePort();
+      actualAddr = `127.0.0.1:${port}`;
+      connectOpts = { port, host: "127.0.0.1" };
+    } else {
+      actualAddr = path.join(os.tmpdir(), `episodic-core-${Date.now()}.sock`);
+      connectOpts = { path: actualAddr };
+    }
+    this.connectOpts = connectOpts;  // save for reconnect
+    // クロスクロージャ/スレッド共有用にソケットアドレスをファイルに保存
+    try { fs.writeFileSync(SOCKET_ADDR_FILE, actualAddr, "utf8"); } catch {}
+
+    const binaryName = isWin ? "episodic-core.exe" : "episodic-core";
+    const binaryPath = path.join(pluginRoot, "dist", binaryName);
+    const goDir = path.join(pluginRoot, "go");
+
+    const forceGoRun = process.env.EPISODIC_USE_GO_RUN === "1";
+    const usePrebuilt = !forceGoRun && fs.existsSync(binaryPath);
+
+    console.log(`[Plugin] Spawn Go sidecar ${usePrebuilt ? "(binary)" : "(go run)"} at ${usePrebuilt ? binaryPath : path.join(pluginRoot, "go")} on ${actualAddr}`);
+    
+    if (usePrebuilt) {
+      this.child = spawn(binaryPath, ["-socket", actualAddr, "-ppid", process.pid.toString()], {
+        cwd: pluginRoot
+      });
+    } else {
+      const goDir = path.join(pluginRoot, "go");
+      this.child = spawn(isWin ? "go.exe" : "go", ["run", ".", "-socket", actualAddr, "-ppid", process.pid.toString()], { 
+        cwd: goDir 
+      });
+    }
+
+    this.child.on("error", (err) => {
+      console.error("[Plugin] Failed to launch Go sidecar:", err.message);
+      if (reject_) {
+        reject_(err);
+        reject_ = null;
+      }
+    });
+
+    if (!this.child.stderr) {
+      throw new Error("Failed to capture child process stderr");
+    }
+
+    this.child.stderr.on("data", (data) => {
+      console.warn(data.toString().trimEnd());
+    });
+
+    this.child.on("close", (code) => {
+      console.log(`[Plugin] Go sidecar exited with code ${code}`);
+      for (const [_, req] of this.pendingReqs) {
+        req.reject(new Error(`Process exited with code ${code}`));
+      }
+      this.pendingReqs.clear();
+      if (this.socket) {
+        this.socket.destroy();
+      }
+    });
+
+    // Connect to the socket with retry logic
+    let reject_: ((err: Error) => void) | null = null;
+    return new Promise((resolve, reject) => {
+      reject_ = reject;
+      let retries = 0;
+      const maxRetries = 150;
+      
+      const tryConnect = () => {
+        // If spawn itself failed (binary not found, go not in PATH), bail immediately
+        if (!reject_) return;
+
+        const sock = net.createConnection(connectOpts);
+
+        const onConnectError = (err: any) => {
+          sock.removeListener("connect", onConnected);
+          if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
+            retries++;
+            if (retries >= maxRetries) {
+               console.error(`[Plugin] Socket connection failed after ${maxRetries} retries:`, err);
+               reject(err);
+               return;
+            }
+            setTimeout(tryConnect, 200); // 200ms backoff
+          } else {
+            console.error(`[Plugin] Socket error:`, err);
+            reject(err);
+          }
+        };
+
+        const onConnected = () => {
+          sock.removeListener("error", onConnectError);
+          this.socket = sock;
+          console.log(`[Plugin] Connected to Go RPC socket`);
+          this.setupSocketReader(sock);
+          resolve();
+        };
+
+        sock.once("connect", onConnected);
+        sock.once("error", onConnectError);
+      };
+      
+      tryConnect();
+    });
+  }
+
+  private setupSocketReader(sock: net.Socket) {
+    const rl = readline.createInterface({
+      input: sock,
+      terminal: false,
+    });
+
+    // P1-Fix2: ソケット配信後の運用中エラーハンドラたち（P1-Fix3 と一体）
+    const rejectPending = (err: Error) => {
+      for (const [, req] of this.pendingReqs) {
+        req.reject(err);
+      }
+      this.pendingReqs.clear();
+    };
+
+    sock.on("close", () => {
+      console.warn("[Plugin] Go RPC socket closed unexpectedly");
+      rejectPending(new Error("Go sidecar socket closed unexpectedly"));
+      if (this.socket === sock) this.socket = undefined;
+    });
+
+    sock.on("error", (err) => {
+      console.error("[Plugin] Go RPC socket error (post-connect):", err.message);
+      rejectPending(err);
+      sock.destroy();
+      if (this.socket === sock) this.socket = undefined;
+    });
+
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      try {
+        const msg = JSON.parse(line) as RPCResponse;
+        
+        if (msg.method === "watcher.onFileChange" && msg.params) {
+          if (this.onFileChange) this.onFileChange(msg.params as FileEvent);
+          return;
+        }
+
+        if (msg.id !== undefined) {
+          const req = this.pendingReqs.get(msg.id);
+          if (req) {
+            this.pendingReqs.delete(msg.id);
+            if (msg.error) req.reject(new Error(msg.error.message));
+            else req.resolve(msg.result);
+          }
+        }
+      } catch (err) {
+        console.error("[Plugin] RPC Parse error:", err, "raw:", line);
+      }
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.connectOpts = undefined;
+    this.reconnectPromise = undefined;
+    // ソケットアドレスファイルのクリーンアップ
+    try { fs.unlinkSync(SOCKET_ADDR_FILE); } catch {}
+
+    if (this.socket) {
+      this.socket.destroy();
+      this.socket = undefined;
+    }
+    
+    if (this.child) {
+      const p = this.child;
+      this.child = undefined;
+      
+      await new Promise<void>((resolve) => {
+        let isResolved = false;
+        const done = () => {
+          if (!isResolved) {
+            isResolved = true;
+            resolve();
+          }
+        };
+        p.once("exit", done);
+        p.once("close", done);
+        
+        p.kill();
+        
+        // 念のためのタイムアウト
+        setTimeout(done, 2000);
+      });
+    }
+  }
+
+  /**
+   * P1-Fix1: reconnectPromise で同時呼び出しをシリアライズ（Thundering Herd 対策）
+   * P1-Fix3: 接続憨当中のエラーリスナーと接続後の運用中リスナーを分離
+   */
+  private reconnect(): Promise<void> {
+    if (this.reconnectPromise) {
+      // 既にリコネクト中ならその Promise を共有して待つ（競合防止）
+      return this.reconnectPromise;
+    }
+    if (!this.connectOpts) {
+      return Promise.reject(new Error("No connect options for reconnect"));
+    }
+    const opts = this.connectOpts;
+
+    this.reconnectPromise = new Promise<void>((resolve, reject) => {
+      let retries = 0;
+      const maxRetries = 3;
+
+      const tryReconnect = () => {
+        const sock = net.createConnection(opts);
+
+        // P1-Fix3: 接続憨当中の一時リスナー（接続完了時に必ず解除）
+        const onConnectError = (err: any) => {
+          sock.removeListener("connect", onConnected);
+          if ((err.code === "ECONNREFUSED" || err.code === "ENOENT") && retries < maxRetries) {
+            retries++;
+            setTimeout(tryReconnect, 500);
+          } else {
+            reject(new Error(`[Plugin] Reconnect failed: ${err.message}`));
+          }
+        };
+
+        const onConnected = () => {
+          sock.removeListener("error", onConnectError);
+          this.socket = sock;
+          console.log("[Plugin] Reconnected to Go RPC socket");
+          // 接続後は setupSocketReader 内で運用中エラーハンドラを登録
+          this.setupSocketReader(sock);
+          resolve();
+        };
+
+        sock.once("connect", onConnected);
+        sock.once("error", onConnectError);
+      };
+
+      tryReconnect();
+    }).finally(() => {
+      // 完了（成功・失敗両方）後に Mutex を解放
+      this.reconnectPromise = undefined;
+    });
+
+    return this.reconnectPromise;
+  }
+
+  private async request<T>(method: string, params: any = {}, timeoutMs = 120000): Promise<T> {
+    // P1-Fix1: ソケット断絶時は reconnect を待つ（同時呼び出しは Mutex でシリアライズ）
+    if (!this.socket || this.socket.destroyed) {
+      if (!this.connectOpts) {
+        // BUG-1修正: クロスクロージャ/スレッド対応 — ファイルからソケットアドレスを復元
+        try {
+          const addr = fs.readFileSync(SOCKET_ADDR_FILE, "utf8").trim();
+          if (addr) {
+            this.connectOpts = addr.startsWith("/")
+              ? { path: addr }
+              : (() => { const i = addr.lastIndexOf(":"); return { host: addr.slice(0, i), port: parseInt(addr.slice(i + 1)) }; })();
+            console.warn(`[Plugin] Loaded socket addr from file for cross-closure reconnect: ${addr}`);
+          }
+        } catch {}
+      }
+      if (this.connectOpts) {
+        console.warn("[Plugin] Socket disconnected, attempting reconnect before:", method);
+        await this.reconnect();
+      } else {
+        throw new Error("Go sidecar socket not connected");
+      }
+    }
+
+    const id = this.reqId;
+    this.reqId = (this.reqId % Number.MAX_SAFE_INTEGER) + 1;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingReqs.delete(id);
+        reject(new Error(`RPC timeout: ${method} (${timeoutMs}ms)`));
+      }, timeoutMs);
+      
+      this.pendingReqs.set(id, {
+        resolve: (val) => { clearTimeout(timer); resolve(val); },
+        reject: (err) => { clearTimeout(timer); reject(err); }
+      });
+      try {
+        const traceLog = "/root/.openclaw/ep-save-trace.log";
+        require("fs").appendFileSync(traceLog, `[rpc-client TRACE 2] request method=${method}. params object keys: ${Object.keys(params).join(",")}, summary present: ${'summary' in params}\n`);
+      } catch(e) {}
+      
+      const reqStr = JSON.stringify({ jsonrpc: "2.0", method, params, id }) + "\n";
+      
+      try {
+        const traceLog = "/root/.openclaw/ep-save-trace.log";
+        require("fs").appendFileSync(traceLog, `[rpc-client TRACE 3] Final reqStr: ${reqStr.trim()}\n`);
+      } catch(e) {}
+      
+      this.socket!.write(reqStr);
+    });
+  }
+
+  async startWatcher(watchPath: string): Promise<string> {
+    return this.request<string>("watcher.start", { path: watchPath });
+  }
+
+  async parseFrontmatter(filePath: string): Promise<MarkdownDocument> {
+    return this.request<MarkdownDocument>("frontmatter.parse", { file: filePath });
+  }
+
+  async rebuildIndex(dirPath: string, agentWs: string): Promise<string> {
+    return this.request<string>("indexer.rebuild", { path: dirPath, agentWs });
+  }
+
+  async recall(query: string, k: number, agentWs: string): Promise<any[]> {
+    return this.request<any[]>("ai.recall", { query, k, agentWs });
+  }
+
+  async calculateSurprise(text1: string, text2: string): Promise<{ surprise: number }> {
+    return this.request<{ surprise: number }>("ai.surprise", { text1, text2 });
+  }
+
+  async generateEpisodeSlug(summary: string, tags: string[], edges: any[], agentWs: string, savedBy: string = "", surprise: number = 0): Promise<{ path: string, slug: string }> {
+    try {
+      const traceLog = require("path").join(require("os").tmpdir(), "ep-save-trace.log");
+      require("fs").appendFileSync(traceLog, `\n[rpc-client TRACE 1] generateEpisodeSlug called. summary type=${typeof summary}, length=${summary?.length}\n`);
+    } catch(e) {}
+    return this.request<{ path: string, slug: string }>("ai.ingest", { summary, tags, edges, agentWs, savedBy, surprise });
+  }
+
+  async getWatermark(agentWs: string): Promise<Watermark> {
+    return this.request<Watermark>("indexer.getWatermark", { agentWs });
+  }
+
+  async setWatermark(agentWs: string, watermark: Watermark): Promise<boolean> {
+    return this.request<boolean>("indexer.setWatermark", { agentWs, watermark });
+  }
+
+  async setMeta(key: string, value: string, agentWs: string): Promise<boolean> {
+    return this.request<boolean>("ai.setMeta", { key, value, agentWs });
+  }
+
+  async batchIngest(items: BatchIngestItem[], agentWs: string, savedBy: string = ""): Promise<string[]> {
+    return this.request<string[]>("ai.batchIngest", { items, agentWs, savedBy });
+  }
+
+  async triggerBackgroundIndex(filePaths: string[], agentWs: string): Promise<string> {
+    return this.request<string>("ai.triggerBackgroundIndex", { filePaths, agentWs });
+  }
+
+  async consolidate(agentWs: string, apiKey: string): Promise<string> {
+    return this.request<string>("ai.consolidate", { agentWs, apiKey });
+  }
+
+  async expand(slug: string, agentWs: string): Promise<{ children: string[], body: string }> {
+    return this.request<{ children: string[], body: string }>("ai.expand", { slug, agentWs });
+  }
+}
