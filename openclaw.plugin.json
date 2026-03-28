@@ -12,6 +12,7 @@
   "repository": "https://github.com/YoshiaKefasu/episodic-claw",
   "homepage": "https://github.com/YoshiaKefasu/episodic-claw#readme",
   "license": "MPL-2.0",
+  "hosts": ["openclaw"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
