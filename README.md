@@ -44,19 +44,19 @@ The split means: **the agent never waits.** Ingest runs fire-and-forget. Recall 
 sequenceDiagram
     participant You
     participant OpenClaw
-    participant Plugin (TypeScript)
-    participant Go Sidecar
-    participant Pebble DB + HNSW
+    participant TS as Plugin (TypeScript)
+    participant Go as Go Sidecar
+    participant DB as Pebble DB + HNSW
 
     You->>OpenClaw: Send a message
-    OpenClaw->>Plugin (TypeScript): assemble() fires
-    Plugin (TypeScript)->>Plugin (TypeScript): Build query from last 5 messages
-    Plugin (TypeScript)->>Go Sidecar: RPC: recall(query, k=5)
-    Go Sidecar->>Go Sidecar: Gemini Embedding API
-    Go Sidecar->>Pebble DB + HNSW: Vector search → top-K episodes
-    Pebble DB + HNSW-->>Go Sidecar: Matching episode bodies
-    Go Sidecar-->>Plugin (TypeScript): Results
-    Plugin (TypeScript)->>OpenClaw: Prepend episodes to system prompt
+    OpenClaw->>TS: assemble() fires
+    TS->>TS: Build query from last 5 messages
+    TS->>Go: RPC: recall(query, k=5)
+    Go->>Go: Gemini Embedding API
+    Go->>DB: Vector search, top-K episodes
+    DB-->>Go: Matching episode bodies
+    Go-->>TS: Results
+    TS->>OpenClaw: Prepend episodes to system prompt
     OpenClaw->>You: AI replies with full historical context
 ```
 

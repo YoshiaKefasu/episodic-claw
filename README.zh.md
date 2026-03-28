@@ -42,22 +42,22 @@
 
 ```mermaid
 sequenceDiagram
-    participant 你
+    participant User as 你
     participant OpenClaw
-    participant 插件 (TypeScript)
-    participant Go Sidecar
-    participant Pebble DB + HNSW
+    participant TS as 插件 (TypeScript)
+    participant Go as Go Sidecar
+    participant DB as Pebble DB + HNSW
 
-    你->>OpenClaw: 发送消息
-    OpenClaw->>插件 (TypeScript): assemble() 触发
-    插件 (TypeScript)->>插件 (TypeScript): 从最近5条消息构建查询
-    插件 (TypeScript)->>Go Sidecar: RPC: recall(query, k=5)
-    Go Sidecar->>Go Sidecar: Gemini Embedding API 向量化
-    Go Sidecar->>Pebble DB + HNSW: 向量搜索 → 前K条情节
-    Pebble DB + HNSW-->>Go Sidecar: 匹配的情节内容
-    Go Sidecar-->>插件 (TypeScript): 返回结果
-    插件 (TypeScript)->>OpenClaw: 将情节注入系统提示词
-    OpenClaw->>你: AI 结合历史背景进行回复
+    User->>OpenClaw: 发送消息
+    OpenClaw->>TS: assemble() 触发
+    TS->>TS: 从最近5条消息构建查询
+    TS->>Go: RPC: recall(query, k=5)
+    Go->>Go: Gemini Embedding API 向量化
+    Go->>DB: 向量搜索，前K条情节
+    DB-->>Go: 匹配的情节内容
+    Go-->>TS: 返回结果
+    TS->>OpenClaw: 将情节注入系统提示词
+    OpenClaw->>User: AI 结合历史背景进行回复
 ```
 
 与此同时，新的情节在后台持续保存：

@@ -42,22 +42,22 @@
 
 ```mermaid
 sequenceDiagram
-    participant あなた
+    participant User as あなた
     participant OpenClaw
-    participant Plugin (TypeScript)
-    participant Goサイドカー
-    participant Pebble DB + HNSW
+    participant TS as Plugin (TypeScript)
+    participant Go as Goサイドカー
+    participant DB as Pebble DB + HNSW
 
-    あなた->>OpenClaw: メッセージを送信
-    OpenClaw->>Plugin (TypeScript): assemble() 発火
-    Plugin (TypeScript)->>Plugin (TypeScript): 直近5件からクエリ構築
-    Plugin (TypeScript)->>Goサイドカー: RPC: recall(query, k=5)
-    Goサイドカー->>Goサイドカー: Gemini Embedding API でベクトル化
-    Goサイドカー->>Pebble DB + HNSW: ベクトル検索 → トップK件
-    Pebble DB + HNSW-->>Goサイドカー: 一致したエピソード本文
-    Goサイドカー-->>Plugin (TypeScript): 結果を返す
-    Plugin (TypeScript)->>OpenClaw: エピソードをシステムプロンプトに注入
-    OpenClaw->>あなた: 過去の文脈を踏まえた返答
+    User->>OpenClaw: メッセージを送信
+    OpenClaw->>TS: assemble() 発火
+    TS->>TS: 直近5件からクエリ構築
+    TS->>Go: RPC: recall(query, k=5)
+    Go->>Go: Gemini Embedding API でベクトル化
+    Go->>DB: ベクトル検索、トップK件
+    DB-->>Go: 一致したエピソード本文
+    Go-->>TS: 結果を返す
+    TS->>OpenClaw: エピソードをシステムプロンプトに注入
+    OpenClaw->>User: 過去の文脈を踏まえた返答
 ```
 
 バックグラウンドでは、新しいエピソードが随時保存されています：
