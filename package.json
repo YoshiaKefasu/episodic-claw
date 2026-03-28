@@ -9,7 +9,10 @@
   "openclaw": {
     "extensions": [
       "index.ts"
-    ]
+    ],
+    "compat": {
+      "pluginApi": "1.0"
+    }
   },
   "scripts": {
     "build": "npm-run-all build:ts build:go",
