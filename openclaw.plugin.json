@@ -12,6 +12,13 @@
   "repository": "https://github.com/YoshiaKefasu/episodic-claw",
   "homepage": "https://github.com/YoshiaKefasu/episodic-claw#readme",
   "license": "MPL-2.0",
+  "credentials": {
+    "GEMINI_API_KEY": {
+      "description": "Gemini API key used by the Go sidecar to embed conversation episodes via the Gemini Embedding API. This key must already be present in your OpenClaw environment — the plugin reads it from the environment and never stores it.",
+      "required": true,
+      "source": "environment"
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

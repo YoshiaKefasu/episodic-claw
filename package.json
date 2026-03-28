@@ -28,6 +28,7 @@
   "files": [
     "dist/**/*.js",
     "!dist/runner_hardcoded.js",
+    "!dist/runner.js",
     "scripts/postinstall.js",
     "openclaw.plugin.json",
     "CHANGELOG.md"
