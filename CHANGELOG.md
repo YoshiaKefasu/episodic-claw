@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1] — 2026-03-28
+
+### Fixed
+- Removed `dist/runner.js` dev artifact (contained hardcoded developer paths) from npm package via `"files"` negation
+- Declared `GEMINI_API_KEY` as a required credential in `openclaw.plugin.json` to satisfy ClaWhub security scan
+- Added `openclaw.compat.pluginApi: "1.0"` to `package.json` (required by ClaWhub validator)
+- Fixed Mermaid `sequenceDiagram` parse errors in README files: participant aliases now use `participant X as Foo + Bar` syntax
+- Switched license from MIT to MPL-2.0 (file-level copyleft — modifications to source files must stay open)
+- Replaced bundled Go binaries with `postinstall.js` download from GitHub Releases, reducing npm package from ~24 MB → 44 KB
+
 ## [0.1.0] — 2026-03-28
 
 First public release.
