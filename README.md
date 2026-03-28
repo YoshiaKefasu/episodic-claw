@@ -60,6 +60,8 @@ sequenceDiagram
     OpenClaw->>You: AI replies with full historical context
 ```
 
+![Sequence diagram: episodic recall flow](docs/sequenceDiagram.png)
+
 And in the background, new episodes are being saved:
 
 **Step A — Surprise Score detects a topic change.** After each turn, the plugin checks: did the conversation just shift to a new topic? If yes, the current buffer is sealed and saved as an episode.
@@ -75,6 +77,8 @@ flowchart LR
     E --> F[Pebble DB stores episode\nHNSW indexes the vector]
     B -->|Score low| G[Keep buffering messages]
 ```
+
+![Flowchart: episode save pipeline](docs/flowchart.png)
 
 ---
 

@@ -60,6 +60,8 @@ sequenceDiagram
     OpenClaw->>User: AI 结合历史背景进行回复
 ```
 
+![序列图：情节召回流程](docs/sequenceDiagram.png)
+
 与此同时，新的情节在后台持续保存：
 
 **步骤 A — Surprise Score 检测话题转换。** 每轮对话后，插件检测"对话是否发生了重大转变"。若是，则封存当前缓冲区并保存为一个情节。
@@ -75,6 +77,8 @@ flowchart LR
     E --> F[Pebble DB 存储情节\nHNSW 更新索引]
     B -->|得分较低| G[继续追加到缓冲区]
 ```
+
+![流程图：情节保存管道](docs/flowchart.png)
 
 ---
 
