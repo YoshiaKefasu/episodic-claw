@@ -38,7 +38,7 @@
 ## 📋 Missing Steps & Considerations
 
 - **Phase 5.5〜5.9 のテスト未完了なのに「Production-Ready」断言（LOW）:**
-  Phase 5.5 の ingest / assemble / compact テスト、Phase 5.7 の Sleep Consolidation テスト、Phase 5.8 の Rebuild / Pebble 削除テスト、Phase 5.9 の CJK 実環境テストがいずれも `[ ]`（未完了）のままである。`docs/phase_5_integration_test_report.md` も未作成。Section 15.3 / 17.3 での「Production-Ready の境地に到達」という宣言はテストエビデンスで裏付けられておらず、言明と実態に乖離がある。Phase 6（公開準備）着手前に E2E サインオフを正式に発行すべきである。
+  Phase 5.5 の ingest / assemble / compact テスト、Phase 5.7 の Sleep Consolidation テスト、Phase 5.8 の Rebuild / Pebble 削除テスト、Phase 5.9 の CJK 実環境テストがいずれも `[ ]`（未完了）のままである。`docs/pre_release_implementation/phase_5_integration_test_report.md` も未作成。Section 15.3 / 17.3 での「Production-Ready の境地に到達」という宣言はテストエビデンスで裏付けられておらず、言明と実態に乖離がある。Phase 6（公開準備）着手前に E2E サインオフを正式に発行すべきである。
 
 - **`handleIndexerRebuild` の部分的失敗が呼び出し元に不透明（MED）:**
   `vstore.Add` 失敗時はログ出力のみで、RPC レスポンスの `"Total embedded: N"` に失敗件数が含まれない。運用者が Rebuild の部分的失敗を検知できない。

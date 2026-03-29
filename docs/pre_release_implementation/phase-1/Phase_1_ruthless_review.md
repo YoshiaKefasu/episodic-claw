@@ -13,7 +13,7 @@
 ## 🚫 致命的な設計ミス (P0 レベル)
 
 ### 1. IPC（プロセス間通信）の脆さ
-**問題:** [Phase_1_implementation_plan.md](file:///d:/GitHub/OpenClaw%20Related%20Repos/episodic-claw/docs/Phase_1_implementation_plan.md) に書かれている、`stdio`（標準入出力）を使ったJSON-RPC通信。これは最悪の選択だ。
+**問題:** [Phase_1_implementation_plan.md](file:///d:/GitHub/OpenClaw%20Related%20Repos/episodic-claw/docs/pre_release_implementation/Phase_1_implementation_plan.md) に書かれている、`stdio`（標準入出力）を使ったJSON-RPC通信。これは最悪の選択だ。
 Go側で意図せずパニックが起きたり、サードパーティの依存ライブラリが警告を吐いて `stdout` にログが混ざった瞬間、TS側のパーサーは死ぬ。JSONストリームの汚染は防ぎきれない。また、プランには「or localhost TCP」とあるが、これもポート競合やローカルファイアウォールの問題を引き起こす。
 **解決策:** `stdio` は今すぐ捨てろ。Unix Domain Sockets（WindowsならNamed Pipes）を使え。ログ出力とコントロールプレーン（RPC通信）は物理的に分離するのが、信頼できるインフラ設計の基本だ。
 ✅ **[FIXED]** `main.go` と `rpc-client.ts` をTCP Sockets（Windowsネイティブ互換）およびUnix Domain Sockets（POSIX用）に切り替え。stdio通信を完全に廃止しました。
