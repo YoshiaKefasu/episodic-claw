@@ -634,7 +634,7 @@ client.on('end', () => {
 
 ## 次のステップ
 
-1. **Phase 6 計画** — 長期メモリ（D2 以上）、semantic graph 可視化、マルチエージェント対応（`docs/phase_6_topics_plan.md` 参照）
+1. **Phase 6 計画** — 長期メモリ（D2 以上）、semantic graph 可視化、マルチエージェント対応（`docs/semantic_topics_plan.md` 参照）
 2. **Rate Limit 負荷テスト** — 429 実発生テスト（Circuit Breaker トリップ確認）は Phase 6 初期で実施予定
 3. **Debounce /stop 改善** — TC-STOP-1 で判明した「`/stop` 後即時再送が debounce でブロックされる」問題を Phase 6 で解消予定（`/stop` イベント受信時に debounce キャッシュをリセットする）
 4. **Gateway スキーマ拡張** — `plugins.entries.episodic-claw` に `maxBufferChars` 等の設定キーを追加できるよう Gateway 側の `additionalProperties` 制約を解除するリクエスト
@@ -661,8 +661,8 @@ client.on('end', () => {
 | `docs/session_boundary_gap_report.md` | セッション境界ギャップ対策（TC-1〜3） |
 | `docs/model_fallback_impact_report.md` | モデルフォールバック対策（TC-FB-1〜4）|
 | `docs/buffer_config_plan.md` | バッファサイズ設定化（TC-BUF-1〜2） |
-| `docs/Implementation/issue_tpm_embed_truncation.md` | TPM 超過問題の根本原因分析・Layer 1/2/3 実装詳細 |
-| `docs/Implementation/issue_api_429_resilience_audit.md` | 429 耐性監査レポート（Circuit Breaker 設計） |
+| `docs/pre_release_implementati../issues/issue_tpm_embed_truncation.md` | TPM 超過問題の根本原因分析・Layer 1/2/3 実装詳細 |
+| `docs/pre_release_implementati../issues/issue_api_429_resilience_audit.md` | 429 耐性監査レポート（Circuit Breaker 設計） |
 | `go/internal/vector/consolidation.go` | Sleep Consolidation + RefineSemanticEdges 実装 |
 | `go/internal/ai/google_studio.go` | Gemini API プロバイダー（EmbedContentBatch 含む） |
 | `src/rpc-client.ts` | TypeScript → Go RPC ブリッジ（tempfile socket sharing） |

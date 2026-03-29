@@ -558,7 +558,7 @@ grep "ai.recall\|Calculated surprise" /tmp/openclaw/openclaw-$(date +%Y-%m-%d).l
 ## 次のステップ（Phase 5.9 完了後）
 
 1. **全件 PASS 後** → `phase_5_integration_test_report.md` の Phase 5.9 セクションに結果を追記
-2. **Phase 6 計画** → `phase_6_topics_plan.md` を参照（長期メモリ D2、semantic graph 可視化、マルチエージェント対応）
+2. **Phase 6 計画** → `semantic_topics_plan.md` を参照（長期メモリ D2、semantic graph 可視化、マルチエージェント対応）
 3. **Rate Limit 負荷テスト** → TC-5.9-CB で保留した 429 実発生テストを Phase 6 初期で実施
 
 ---
@@ -569,8 +569,8 @@ grep "ai.recall\|Calculated surprise" /tmp/openclaw/openclaw-$(date +%Y-%m-%d).l
 |---|---|
 | `docs/phase_5.8_test_plan.md` | Phase 5.8 テストプラン（先行フェーズ） |
 | `docs/phase_5_integration_test_report.md` | Phase 5.5〜5.9 統合テストレポート |
-| `docs/Implementation/issue_tpm_embed_truncation.md` | TPM 超過問題の根本原因分析・実装詳細 |
-| `docs/Implementation/issue_api_429_resilience_audit.md` | 429 耐性監査レポート（Circuit Breaker 設計） |
+| `docs/pre_release_implementati../issues/issue_tpm_embed_truncation.md` | TPM 超過問題の根本原因分析・実装詳細 |
+| `docs/pre_release_implementati../issues/issue_api_429_resilience_audit.md` | 429 耐性監査レポート（Circuit Breaker 設計） |
 | `go/main.go` | `runAutoRebuild`（sequential batch loop + CB）、`tpmLimiter`、`RunAsyncHealingWorker` |
 | `go/internal/ai/google_studio.go` | `EmbedContentBatch`（Layer 3 実装） |
 | `src/segmenter.ts` | `maxBufferChars` 動的設定、dedup フィルター |

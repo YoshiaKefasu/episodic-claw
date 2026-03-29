@@ -341,4 +341,4 @@ ls -lt /root/.openclaw/workspace-keruvim/episodes/$(date +%Y)/$(date +%m)/$(date
 - `go/internal/vector/consolidation.go` — Sleep Consolidation 実装
 - `go/internal/ai/provider.go` — Decorator パターン（`RetryLLM` / `RetryEmbedder` / `NewRetryPair`）
 - `go/internal/ai/google_studio.go` — Gemini API プロバイダー（純粋 HTTP クライアント、`*APIError` 返却）
-- `docs/phase_6_topics_plan.md` — Phase 5.7 テスト中に発見した `tags` vs `topics` 設計課題への対応プラン。D1 frontmatter に `topics:` フィールドを追加し CJK 多言語コンテンツタグを `tags`（システム管理）から分離する方針を定義。
+- `docs/semantic_topics_plan.md` — Phase 5.7 テスト中に発見した `tags` vs `topics` 設計課題への対応プラン。D1 frontmatter に `topics:` フィールドを追加し CJK 多言語コンテンツタグを `tags`（システム管理）から分離する方針を定義。

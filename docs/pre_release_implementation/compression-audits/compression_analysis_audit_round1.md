@@ -38,7 +38,7 @@
 ## 📋 Missing Steps & Considerations
 
 - **Phase 5.5〜5.9 のテスト未完了なのに「Production-Ready」断言（LOW）:**
-  Phase 5.5 の ingest / assemble / compact テスト、Phase 5.7 の Sleep Consolidation テスト、Phase 5.8 の Rebuild / Pebble 削除テスト、Phase 5.9 の CJK 実環境テストがいずれも `[ ]`（未完了）のままである。`docs/Implementation/phase_5_integration_test_report.md` も未作成。Section 15.3 / 17.3 での「Production-Ready の境地に到達」という宣言はテストエビデンスで裏付けられておらず、言明と実態に乖離がある。Phase 6（公開準備）着手前に E2E サインオフを正式に発行すべきである。
+  Phase 5.5 の ingest / assemble / compact テスト、Phase 5.7 の Sleep Consolidation テスト、Phase 5.8 の Rebuild / Pebble 削除テスト、Phase 5.9 の CJK 実環境テストがいずれも `[ ]`（未完了）のままである。`docs/pre_release_implementation/phase_5_integration_test_report.md` も未作成。Section 15.3 / 17.3 での「Production-Ready の境地に到達」という宣言はテストエビデンスで裏付けられておらず、言明と実態に乖離がある。Phase 6（公開準備）着手前に E2E サインオフを正式に発行すべきである。
 
 - **`handleIndexerRebuild` の部分的失敗が呼び出し元に不透明（MED）:**
   `vstore.Add` 失敗時はログ出力のみで、RPC レスポンスの `"Total embedded: N"` に失敗件数が含まれない。運用者が Rebuild の部分的失敗を検知できない。
@@ -189,8 +189,8 @@ embedCancel()
 | 問題 | 状態 | 対応方針 / 解決内容 |
 |------|------|-------------------|
 | Phase 5.5〜5.9 テスト未完了 | **未対応** | Phase 6 着手前に E2E テストを実施し `phase_5_integration_test_report.md` を作成してサインオフ |
-| `handleWatcherStart` 競合 | **(解決済 2026-03-25)** | `globalWatcherMu sync.Mutex` 追加、`watcher.Start()` をロック外実行、`handleConnection` defer で接続別クリーンアップ実装 → [issue_global_watcher_no_mutex.md](./Implementation/issues/issue_global_watcher_no_mutex.md) 参照 |
-| `RunConsolidation` タイムアウト | **(解決済 2026-03-25)** | `context.WithTimeout(ctx, 10*time.Minute)` でタイムアウト伝播、非同期 `go func()` 化、`defer atomic.StoreInt32` でフラグリセット保証 → [issue_run_consolidation_no_timeout.md](./Implementation/issues/issue_run_consolidation_no_timeout.md) 参照 |
+| `handleWatcherStart` 競合 | **(解決済 2026-03-25)** | `globalWatcherMu sync.Mutex` 追加、`watcher.Start()` をロック外実行、`handleConnection` defer で接続別クリーンアップ実装 → [issue_global_watcher_no_mutex.md](../issues/issue_global_watcher_no_mutex.md) 参照 |
+| `RunConsolidation` タイムアウト | **(解決済 2026-03-25)** | `context.WithTimeout(ctx, 10*time.Minute)` でタイムアウト伝播、非同期 `go func()` 化、`defer atomic.StoreInt32` でフラグリセット保証 → [issue_run_consolidation_no_timeout.md](../issues/issue_run_consolidation_no_timeout.md) 参照 |
 
 ---
 
@@ -240,9 +240,9 @@ Antigravity エージェントにより以下の課題が解決済み（2026-03-
 
 | 課題 | 解決方法 | 詳細 |
 |------|----------|------|
-| `Surprise` omitempty 設計問題 | Self-Healing DB Phase A-D: `omitempty` タグを `store.go`・`frontmatter.go` から根絶、`Count()` ヘルパー・DB破損隔離・Auto-Rebuild 実装 | [issue_surprise_omitempty_design.md](./Implementation/issues/issue_surprise_omitempty_design.md) |
-| genesis-archive Surprise 欠落 | `prevVector` チャンクキャッシュ + `vector.CosineDistance` (utils.go) | [issue_genesis_archive_surprise_missing.md](./Implementation/issues/issue_genesis_archive_surprise_missing.md) |
-| `RunConsolidation` タイムアウトなし | `context.WithTimeout(10*time.Minute)` + 非同期化 + defer フラグリセット | [issue_run_consolidation_no_timeout.md](./Implementation/issues/issue_run_consolidation_no_timeout.md) |
-| `globalWatcher` ミューテックスなし | `globalWatcherMu sync.Mutex` + `handleConnection` defer cleanup | [issue_global_watcher_no_mutex.md](./Implementation/issues/issue_global_watcher_no_mutex.md) |
+| `Surprise` omitempty 設計問題 | Self-Healing DB Phase A-D: `omitempty` タグを `store.go`・`frontmatter.go` から根絶、`Count()` ヘルパー・DB破損隔離・Auto-Rebuild 実装 | [issue_surprise_omitempty_design.md](../issues/issue_surprise_omitempty_design.md) |
+| genesis-archive Surprise 欠落 | `prevVector` チャンクキャッシュ + `vector.CosineDistance` (utils.go) | [issue_genesis_archive_surprise_missing.md](../issues/issue_genesis_archive_surprise_missing.md) |
+| `RunConsolidation` タイムアウトなし | `context.WithTimeout(10*time.Minute)` + 非同期化 + defer フラグリセット | [issue_run_consolidation_no_timeout.md](../issues/issue_run_consolidation_no_timeout.md) |
+| `globalWatcher` ミューテックスなし | `globalWatcherMu sync.Mutex` + `handleConnection` defer cleanup | [issue_global_watcher_no_mutex.md](../issues/issue_global_watcher_no_mutex.md) |
 
 **継続中の未対応課題**: Phase 5.5〜5.9 E2E テスト未完了のみ残存。
