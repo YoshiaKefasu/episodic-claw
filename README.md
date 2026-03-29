@@ -96,8 +96,6 @@ Every time the Surprise Score crosses a threshold, the current conversation buff
 
 ### D1 — Summarized Long-Term Memory (Sleep Consolidation)
 
-*(Planned — Phase 3)*
-
 Over time, groups of D0 episodes get compressed into D1 summaries by the LLM. Inspired by how human brains consolidate memories during sleep — the gist survives, the noise fades.
 
 - D1 nodes link back to their source D0 episodes
@@ -312,7 +310,6 @@ I built this because I think AI agents deserve better memory than a rolling cont
 Keeping this going requires a Claude or OpenAI Codex subscription — that's what writes the code. If you're finding this useful, even $5/month genuinely helps.
 
 **Planned future updates:**
-- **D1 Sleep Consolidation** — nightly LLM summarization pass over old episodes
 - **Cross-agent recall** — share memory across multiple agents
 - **Memory decay** — low-relevance old episodes fade automatically
 - **Web UI** — browse and edit your agent's memory visually
