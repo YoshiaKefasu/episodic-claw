@@ -1,120 +1,172 @@
 # episodic-claw
 
-**OpenClaw AI 智能体的长期情节记忆插件。**
+这是给 OpenClaw 智能体用的长期情节记忆插件。
 
-> [🇺🇸 English](./README.md) · [🇯🇵 日本語](./README.ja.md) · 🇨🇳 中文
+> [English](./README.md) | [日本語](./README.ja.md) | 中文
 
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
-自动把对话保存在本地，按“意思”而不是按关键词找回相关记忆，并在模型回复前把合适的内容放回提示词里。这样 OpenClaw 就更不容易忘记重要上下文。
+`episodic-claw` 会把对话保存在本地，再按“语义”而不是按关键词找回过去的记忆，并在模型回复之前把真正相关的部分放回提示词里。
+这样 OpenClaw 就更不容易忘记之前的决定、偏好和失败经验。
 
-v0.2.0 文档： [v0.2.0 bundle](./docs/v0.2.0/README.md)
+如果你第一次接触这种系统，可以先这样理解：
 
----
+- 普通上下文窗口像短期记忆
+- `episodic-claw` 给智能体补上长期记忆
+- 它不会把所有旧内容都塞回提示词
+- 它会尽量只拿回跟当前对话真的有关的记忆
 
-## 为什么用 TypeScript + Go 两种语言？
+这个发布线的文档入口在这里: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
-大多数插件只用一种语言。这个插件故意用了两种。
+## v0.2.0 带来了什么
+
+v0.2.0 不再只是“保存 + 搜索”。
+它开始更像一条完整的记忆流水线。
+
+- D0 和 D1 都有了 `topics` 元数据
+- 会话分段不再只靠固定阈值，还加入了 Bayesian segmentation
+- D1 聚合不再只是简单相似度，而是更看重上下文和边界
+- 加入 replay scheduling，可以回头强化更重要的记忆
+- 加入 recall calibration，降低检索结果被噪音带偏的概率
+- 加入更完整的 telemetry 和 observability，便于排查 recall / replay 问题
+
+简单说，智能体现在更会判断：
+
+- 一段经历什么时候算结束
+- 哪些片段应该合并成长期记忆
+- 哪些记忆值得反复保留
+- 当前问题最该唤回哪一类记忆
+
+## 架构总览
+
+这个插件故意拆成两部分。
+
+- TypeScript 负责和 OpenClaw 对接
+- Go 负责真正的记忆引擎
+- Pebble DB 负责存储
+- HNSW 负责快速语义检索
 
 可以把它想成一家店：
 
-**TypeScript 是前台。** 它和 OpenClaw 交流，负责工具注册、Hook 连接和 JSON 传递。
-
-**Go 是后场。** 它负责向量化、搜索和 Pebble DB 存储，把重活从 Node.js 里拿出去。
-
-**结果就是：TypeScript 管流程，Go 管重活，智能体不会被卡住。**
-
----
-
-## 工作原理（架构）
-
-> **简而言之：** 你发送的每条消息都会触发记忆搜索。相关的历史情节会在模型回复前自动加入上下文。
-
-**第 1 步 — 你发送一条消息。**
-
-**第 2 步 — `assemble()` 触发。** 插件取最近 5 条消息，构建搜索查询。
-
-**第 3 步 — Go sidecar 将查询向量化。** 调用 Gemini Embedding API 将文本转换为 768 维向量（用数字表示语义）。
-
-**第 4 步 — HNSW 返回最相似的 K 条历史情节。** HNSW 是"极速找最相似内容"算法，即使有上千条记忆也能在毫秒级返回结果。
-
-**第 5 步 — 匹配的情节注入系统提示词。** AI 在读你的消息之前就看到了历史记忆，所以回复自然包含历史背景。
-
-```mermaid
-sequenceDiagram
-    participant User as 你
-    participant OpenClaw
-    participant TS as 插件 (TypeScript)
-    participant Go as Go Sidecar
-    participant DB as Pebble DB + HNSW
-
-    User->>OpenClaw: 发送消息
-    OpenClaw->>TS: assemble() 触发
-    TS->>TS: 从最近5条消息构建查询
-    TS->>Go: RPC: recall(query, k=5)
-    Go->>Go: Gemini Embedding API 向量化
-    Go->>DB: 向量搜索，前K条情节
-    DB-->>Go: 匹配的情节内容
-    Go-->>TS: 返回结果
-    TS->>OpenClaw: 将情节注入系统提示词
-    OpenClaw->>User: AI 结合历史背景进行回复
-```
-
-![序列图：情节召回流程](docs/sequenceDiagram.png)
-
-与此同时，新的情节在后台持续保存：
-
-**步骤 A — Surprise Score 检测话题转换。** 每轮对话后，插件检测"对话是否发生了重大转变"。若是，则封存当前缓冲区并保存为一个情节。
-
-**步骤 B — 文本分块 → Go sidecar → Gemini Embedding → 存入 Pebble DB。** 情节文本附带向量存储，可在未来任何对话中被检索。
+- TypeScript 是前台
+- Go 是后厨
+- Pebble DB 是仓库
+- HNSW 是仓库里的快速索引图
 
 ```mermaid
 flowchart LR
-    A[新消息到达] --> B[EventSegmenter 计算 Surprise Score]
-    B -->|得分超过0.2 或 缓冲区超过7200字符| C[检测到情节边界]
-    C --> D[缓冲区分块]
-    D --> E[Go Sidecar: Gemini Embedding 向量化]
-    E --> F[Pebble DB 存储情节\nHNSW 更新索引]
-    B -->|得分较低| G[继续追加到缓冲区]
+    A["OpenClaw agent"] --> B["TypeScript plugin"]
+    B --> C["Go sidecar"]
+    C --> D["Pebble DB"]
+    C --> E["HNSW index"]
+    C --> F["Replay state"]
+    C --> G["D0 and D1 memories"]
 ```
 
-![流程图：情节保存管道](docs/flowchart.png)
+## 一条消息怎样走完整个系统
 
----
+新消息到来时，插件会同时做两件事。
 
-## 记忆两层结构（D0 / D1）
+### 1. 在模型回答前先回忆
 
-> **简而言之：** D0 是原始日记，D1 是日记的精炼摘要。
+OpenClaw 把最终提示词发给模型之前，会走这条链路：
 
-### D0 — 原始情节（Raw Episodes）
+1. TypeScript 层读取最近几轮对话
+2. 生成 recall 查询
+3. Go sidecar 把查询向量化
+4. HNSW 找出语义最接近的旧记忆
+5. 对候选结果做再排序
+6. 把最合适的记忆注入到提示词里
 
-每次 Surprise Score 超过阈值，当前对话缓冲区原样保存为 D0 情节。逐字记录，带时间戳。
+所以模型是在“已经想起一些事情”的状态下回答。
 
-- 附带完整向量嵌入存储在 Pebble DB 中
-- 自动标签：`auto-segmented`、`surprise-boundary`、`size-limit`
-- 可通过 HNSW 向量搜索随时召回
+### 2. 把当前对话变成未来可用的记忆
 
-### D1 — LLM 摘要长期记忆（Sleep Consolidation）
+同时，系统也在观察当前对话缓冲区。
 
-随着时间推移，多个 D0 情节会由 LLM 压缩为 D1 摘要，模拟人类睡眠中的记忆整合——保留精华，过滤噪音。
+1. 判断对话是否已经明显转向
+2. 如果转向，就把当前片段收尾
+3. 把它保存成 raw episode
+4. 之后后台 consolidation 可能把多个 raw episode 再整理成摘要记忆
 
-- D1 节点保留指向源 D0 情节的链接
-- 用 `ep-expand` 从 D1 摘要向下展开到原始 D0 情节
-- 在减少 token 消耗的同时，保持跨长时间轴的语义一致性
+所以它不是一个手工笔记工具。
+它更像一个一直在后台听、切段、保存、整理的记忆系统。
 
-### Surprise Score 是什么？
+## 记忆模型: D0 和 D1
 
-通过比较新消息与当前缓冲区的向量来计算**贝叶斯惊讶度**。得分超过 `0.2` 意味着："对话语境发生了明显转变——封存当前情节，开启新情节。"
+最容易理解的说法是：
 
-```
-缓冲区：    "用 React 搭个 Todo 应用吧"
-新消息：    "数据库索引设计最佳实践是什么？"
-→ Surprise: 高 → 情节边界 → 保存前一个情节
-```
+- D0 是原始记忆
+- D1 是整理后的记忆
 
----
+### D0
+
+D0 是直接从对话里切出来的原始片段。
+更像一篇日记原文。
+
+里面会保留：
+
+- 原始文本
+- 时间信息
+- segmentation / surprise 信号
+- topics
+- 检索用 embedding
+
+### D1
+
+D1 是多个 D0 整理后的总结记忆。
+更像“这一段经历真正重要的内容是什么”。
+
+里面会保留：
+
+- 多个 D0 的核心含义
+- 指向原始 D0 的链接
+- topics 和 summary metadata
+- 用来强化记忆的 replay state
+
+这很重要，因为智能体不能每次都把整段历史原文拿出来重读。
+成本太高，也太慢。
+它需要的是压缩过、但仍然保留重点的记忆。
+
+## v0.2.0 对记忆质量的改变
+
+更早的版本已经能用，但 v0.2.0 开始更认真地处理“什么算记忆”和“记忆怎样长期保持有用”。
+
+- segmentation 更自适应
+  不再只靠死板阈值切段
+- consolidation 更像人在整理经历
+  D1 的形成会考虑上下文和边界，而不是只看相似度
+- replay 变成独立层
+  replay 状态不再和 episode 正文混在一起
+- recall 不再那么“傻搜”
+  topics、usefulness、surprise、replay signal 都能帮助排序
+
+这不代表它真的变成了“人脑”。
+更准确地说，是它开始借用一些记忆研究里的好思路，而不再把记忆当成一张平的搜索表。
+
+## 三个工具
+
+插件还提供了三个可以主动调用的记忆工具。
+
+### `ep-recall`
+
+主动搜索记忆。
+
+当自动注入不够，或者你想明确让智能体“去想一想之前有没有相关内容”时使用。
+
+### `ep-save`
+
+立刻保存一条重要记忆。
+
+适合保存偏好、约束、决策、事实，不必等自动分段。
+
+### `ep-expand`
+
+把摘要记忆展开成更细的原始内容。
+
+当 D1 摘要有用但太短时，可以往下看到 D0 细节。
 
 ## 安装
 
@@ -122,201 +174,137 @@ flowchart LR
 openclaw plugins install clawhub:episodic-claw
 ```
 
-就这一行。插件在启动时自动挂载 Hook——不需要修改配置文件，不需要单独设置 API key（Go sidecar 直接使用 OpenClaw 环境中已配置的 Gemini API key）。
+然后重启 gateway：
+
+```bash
+openclaw gateway restart
+```
+
+安装后会发生这些事：
+
+- npm package 安装 TypeScript 插件部分
+- `postinstall` 从 GitHub Release assets 下载对应平台的 Go sidecar
+- OpenClaw 在加载插件时启动 sidecar
+
+Go sidecar 会直接使用 OpenClaw 环境里已经配置好的 Gemini API key。
+
+## Agent Install Prompt
+
+如果你想让另一个智能体把安装工作整套做完，可以直接给它下面这段 prompt。
+
+这不是介绍文本。
+这是让智能体真正去执行安装、改配置、重启和验收的技术指令。
+
+```text
+请把 `episodic-claw` 安装到我的 OpenClaw 环境里，并完成从安装到验收的整套技术工作。
+
+不要只解释步骤，请直接执行。
+
+必须完成这些步骤:
+
+1. 先执行:
+   `openclaw plugins install clawhub:episodic-claw`
+
+2. 确认插件已经正常安装:
+   `openclaw plugins list`
+
+3. 打开 OpenClaw 配置文件，必要时直接修改，让 `episodic-claw` 处于启用状态。
+   常见配置文件路径是 `~/.openclaw/openclaw.json`。
+
+4. 确认 OpenClaw 运行环境里可以拿到所需的 Gemini API key。
+   如果插件依赖 `GEMINI_API_KEY`，请确认 OpenClaw 运行时能直接读取它。
+
+5. 在重启 OpenClaw 之前，先用自然一点的话明确告诉用户下面这件事:
+   “接下来需要重启 OpenClaw gateway。我会在重启前先等 6 分钟。现在安装还没有完全验收，而重启发生时，我当前的工作上下文可能会中断。重启完成后，请给我发一条消息把我叫醒，这样我才能继续完成验证。”
+
+6. 发完这条通知后，故意等待 6 分钟。
+   不要只停一下，是真的要做一次完整的 sleep / wait。
+
+7. 重启 OpenClaw 让插件真正加载:
+   `openclaw gateway restart`
+
+8. 重启后确认插件确实已经生效。
+   请检查 plugin status、启动日志，以及 memory plugin 是否处于 loaded 状态。
+
+9. 如果这个插件会在安装时下载平台相关的 sidecar binary，请确认 binary 已经正确下载并存在于插件目录中。
+
+10. 最后给我一份简短报告:
+   - 你改了什么
+   - 插件是否已经 loaded
+   - 还有哪些 warning 或需要我手动处理的事
+
+重要:
+- 不要只说“应该怎么改”，请直接修改真实配置。
+- 如果中途失败，请继续排查，直到插件真的跑起来，或者发现一个明确的 blocker。
+- 不要在安装完成后就停下，还要完成验证。
+```
+
+## 最重要的配置项
+
+多数人其实不用改配置。
+但下面这些参数值得知道。
+
+| Key | 默认值 | 作用 |
+|---|---:|---|
+| `reserveTokens` | `6144` | 记忆注入最多能占多少提示词空间 |
+| `recentKeep` | `30` | compact 时保留多少最近对话轮次 |
+| `maxBufferChars` | `7200` | 缓冲区多大时强制切成一个 episode |
+| `maxCharsPerChunk` | `9000` | 每个存储块的最大字符数 |
+| `dedupWindow` | `5` | 去重窗口，防止 fallback 重复文本污染记忆 |
+
+v0.2.0 还加入了 segmentation 和 recall 的更多调参项。
+不过在没有明确问题之前，建议先保持默认值。
+
+## 隐私和存储
+
+核心存储是本地的。
+
+- 记忆保存在你自己的机器上
+- Pebble DB 存记录
+- HNSW 存检索图
+- 不需要额外的云端 memory 数据库
+
+但 embedding 生成还是会走你配置的 embedding provider。
+默认方案里一般是 Gemini。
+
+## 目前还没有的部分
+
+v0.2.0 已经很扎实，但还不是终局版本。
+
+- `importance_score` 还没正式启用
+- 自动 pruning / tombstone disposal 还没做
+- 多智能体共享记忆还是后续计划
+
+所以更准确的理解是：
+这已经是一个很像样的本地 episodic memory engine，但还不是全部路线图的终点。
+
+## 为什么要做这个项目
+
+很多智能体所谓的“记忆”，本质上只是当前提示词里还塞得下的那一部分内容。
+做短任务没问题。
+做长项目就不够了。
+
+`episodic-claw` 想解决的是这些问题：
+
+- 智能体能记住之前定下来的方向
+- 能回忆起之前失败过的尝试
+- 能长期保留项目偏好和限制条件
+- 能压缩旧经历，但不丢掉真正重要的部分
+
+这就是它存在的理由。
+
+## License
+
+[Mozilla Public License 2.0 (MPL-2.0)](./LICENSE)
+
+为什么用 MPL 而不是 MIT？
+
+- 你可以用它做产品
+- 你可以和自己的代码一起使用
+- 但如果你修改了这个插件里的文件，这些修改后的文件应该继续保持开放
+
+这样做是为了避免对 `episodic-claw` 本体的改进完全消失在闭源分支里。
 
 ---
 
-## 智能体安装提示词
-
-下面有两段提示词。**第一段**：交给智能体（Claude Code 等）让它自动完成安装配置。**第二段**：粘贴到智能体系统提示词，教它如何使用自己的记忆。
-
-### 第一部分 — 安装（交给智能体执行）
-
-```
-请为我的 OpenClaw 智能体安装并配置 episodic-claw 记忆插件。
-请按顺序执行以下步骤：
-
-Step 1 — 通过 OpenClaw 插件管理器安装:
-  openclaw plugins install clawhub:episodic-claw
-
-Step 2 — 确认插件出现在插件列表中:
-  openclaw plugins list
-
-Step 3 — 检查 OpenClaw 配置文件（openclaw.config.json 等）中是否已注册 episodic-claw。
-  最小配置条目如下:
-  {
-    "plugins": [
-      { "id": "episodic-claw" }
-    ]
-  }
-  如果已存在 "plugins" 数组，直接追加 { "id": "episodic-claw" } 即可。
-
-Step 4 — 插件使用 OpenClaw 环境中已配置的 Gemini API key。
-  如果 GEMINI_API_KEY 未设置，请现在设置:
-  export GEMINI_API_KEY="your-key-here"
-  （免费 key 获取地址: https://aistudio.google.com/app/apikey）
-
-Step 5 — 重启 OpenClaw 网关以应用更改:
-  openclaw gateway restart
-  （使用 GUI 的话，重启 OpenClaw 桌面应用）
-
-Step 6 — 确认网关日志中出现以下内容:
-  [Episodic Memory] Plugin registered.
-  [Episodic Memory] Gateway started.
-
-至此插件已在运行，无需更多配置。
-```
-
-### 第二部分 — 系统提示词（粘贴到智能体系统提示词）
-
-```
-You have long-term episodic memory powered by the episodic-claw plugin.
-
-Your memory tools:
-- ep-recall <query>   — Search your memory for anything relevant to a topic
-- ep-save <content>   — Save something important that you want to remember later
-- ep-expand <slug>    — Expand a memory summary to read its full contents
-
-How to use them well:
-- Before answering questions that might benefit from past context, run ep-recall first.
-- After completing something meaningful (a key decision, a fix, a preference learned),
-  run ep-save to make sure it sticks.
-- When a recalled memory summary is too brief and you need more detail, run ep-expand.
-- You also have automatic memory: relevant past episodes are already injected at the top
-  of every system prompt under "--- My Memory ---". Read those first before calling
-  ep-recall manually.
-- Your memory is stored locally and privately — it never leaves the machine.
-
-The episodic-claw plugin runs silently in the background. You don't need to manage it.
-Just use the tools when they make sense.
-```
-
----
-
-## 三个记忆工具
-
-### `ep-recall` — 手动搜索记忆
-
-> 按主题或关键词检索特定记忆。
-
-当自动召回没能找到正确上下文，或者你明确想让 AI 回忆某件事时使用。
-
-```
-你：  "你还记得上周我们定的数据库结构吗？"
-AI：  [调用 ep-recall → 查询: "数据库结构决策"]
-AI：  "记得——[日期]我们决定用规范化结构，users 表..."
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `query` | string | 是 | 要搜索的内容 |
-| `k` | number | 否 | 返回的情节数量（默认: 3） |
-
----
-
-### `ep-save` — 手动保存记忆
-
-> 告诉 AI "记住这个"，它立刻保存。
-
-```
-你：  "记住，这个项目用的是 PostgreSQL，不是 SQLite。"
-AI：  [调用 ep-save]
-AI：  "收到，已经记下来了。"
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `content` | string | 是 | 要保存的内容（自然语言，最多约 3600 字符） |
-| `tags` | string[] | 否 | 可选标签，如 `["决策", "数据库"]` |
-
----
-
-### `ep-expand` — 展开摘要查看完整内容
-
-> 当压缩摘要不够用，想看原始对话时使用。
-
-```
-你：  "那次调试鉴权 bug 的详细过程是什么？"
-AI：  [找到摘要 → 调用 ep-expand 获取完整情节]
-AI：  "当时的完整过程是这样的: ..."
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `slug` | string | 是 | 要展开的摘要情节的 ID/slug |
-
----
-
-## 配置项
-
-所有配置项均为可选。
-
-| 配置键 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `enabled` | boolean | `true` | 启用或禁用插件 |
-| `reserveTokens` | integer | `6144` | 系统提示词中为注入记忆预留的最大 token 数 |
-| `recentKeep` | integer | `30` | 压缩时保留的最近对话轮数 |
-| `dedupWindow` | integer | `5` | 重复消息去重窗口大小。高频回退环境建议设为 10 以上 |
-| `maxBufferChars` | integer | `7200` | 强制触发情节保存的缓冲区字符数上限 |
-| `maxCharsPerChunk` | integer | `9000` | 每个情节块的最大字符数。小于 `maxBufferChars` 时，一次 flush 会分成多个情节 |
-| `sharedEpisodesDir` | string | — | *(计划中 — Phase 6)* 多智能体共享情节目录路径。当前版本无效 |
-| `allowCrossAgentRecall` | boolean | — | *(计划中 — Phase 6)* 是否在召回结果中包含其他智能体的情节。当前版本无效 |
-
----
-
-## 研究基础
-
-本插件的设计基于真实的 AI 记忆研究：
-
-- **EM-LLM** — 面向无限上下文 LLM 的类人情节记忆
-  Watson et al., 2024 · [arXiv:2407.09450](https://arxiv.org/abs/2407.09450)
-  情节分割的灵感来源。EM-LLM 用贝叶斯惊讶度和时间连续性形成类人的记忆边界。
-
-- **MemGPT** — 将 LLM 作为操作系统
-  Packer et al., 2023 · [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
-  智能体应拥有分层记忆体系，并能通过函数调用主动管理记忆。ep-recall、ep-save、ep-expand 正是这一理念的 OpenClaw 实现。
-
-- **立场论文** — 智能体记忆系统综述
-  2025 · [arXiv:2502.06975](https://arxiv.org/abs/2502.06975)
-  覆盖情节记忆、语义记忆、程序性记忆的综合调研，影响了 D0/D1 层级设计。
-
----
-
-## 关于作者
-
-我是一个自学成才的 AI 爱好者，正在过着充实的 NEET 生活——没有公司支持，没有团队，只有我、一个 AI 伙伴，还有深夜打开的几十个浏览器标签页。
-
-episodic-claw 是 **100% 氛围编码（vibe coded）** 的产物。我描述我想要的东西，AI 写代码，写错了我纠正，反复迭代直到能用。架构是真实的，研究是真实的，bug 也是真实痛苦的。
-
-我做这个，是因为我觉得 AI 智能体值得拥有比滚动上下文窗口压缩更好的记忆。
-
-### 赞助
-
-维持项目运转需要 Claude 或 OpenAI Codex 订阅——那就是写代码的 AI 的 token 费用。如果这个插件对你有用，哪怕每月 $5 也是真心的帮助。
-
-**计划中的未来更新：**
-- **跨智能体召回** — 多个智能体共享记忆
-- **记忆衰减** — 低相关度的旧情节自动淡出
-- **Web UI** — 在浏览器中浏览和编辑智能体记忆
-
-👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
-
-没有压力。插件永远是 MPL-2.0 许可证，永久免费。
-
----
-
-## 许可证
-
-[Mozilla Public License 2.0 (MPL-2.0)](LICENSE) © 2026 YoshiaKefasu
-
-**为什么选择 MPL 2.0 而不是 MIT？**
-
-MIT 许可证允许任何人改进这份代码，然后将改进封闭起来，不回馈社区。对于工具库来说这没问题，但对于一个人们会构建真实工作流的记忆插件，我希望 fork 保持开源。
-
-MPL 2.0 是文件级别的 Copyleft：如果你修改了本仓库中的 `.ts` 或 `.go` 源文件，这些被修改的文件必须保持 MPL 协议开源。但你可以自由地将 episodic-claw 与你自己的专有代码结合使用——Copyleft 不会扩散到你的代码库。你可以用 episodic-claw 构建商业产品；但你不能悄悄地改进插件本身却不开源这些改进。
-
-目标很简单：**对 episodic-claw 的改进回馈给开源社区。**
-
----
-
-*Built with OpenClaw · Powered by Gemini Embeddings · Stored with HNSW + Pebble DB*
+Built with OpenClaw, Gemini embeddings, Pebble DB, and HNSW.

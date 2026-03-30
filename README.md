@@ -1,120 +1,164 @@
 # episodic-claw
 
-**Long-term episodic memory for OpenClaw agents.**
+Long-term episodic memory for OpenClaw agents.
 
-> 🇺🇸 English · [🇯🇵 日本語](./README.ja.md) · [🇨🇳 中文](./README.zh.md)
+> English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
-This plugin saves conversations locally, finds related memories by meaning, and adds the right ones back into the prompt before the model answers. That helps OpenClaw remember useful context without extra commands or manual cleanup.
+`episodic-claw` lets an OpenClaw agent remember past conversations in a way that feels closer to memory than to plain search.
+It saves conversations locally, turns them into vectors, finds related past episodes by meaning, and puts the useful ones back into the prompt before the model replies.
 
-Release docs: [v0.2.0 bundle](./docs/v0.2.0/README.md)
+If you are new to this kind of system, the simplest way to think about it is:
 
----
+- The normal context window is short-term memory.
+- `episodic-claw` adds long-term memory.
+- It does not dump everything back into the prompt.
+- It tries to bring back only the memories that fit the current situation.
 
-## Why TypeScript + Go?
+Release docs for this line: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
-Most plugins are written in one language. This one uses two on purpose.
+## What v0.2.0 adds
 
-Think of it like a store with a front desk and a back room.
+v0.2.0 is the release where the memory system stops being "save and search" and becomes a more complete memory pipeline.
 
-**TypeScript is the front desk.** It talks to OpenClaw, registers tools, connects hooks, and keeps the plugin wiring simple.
+- `topics` metadata for both raw memories and summarized memories
+- adaptive Bayesian segmentation instead of only fixed boundaries
+- D1 clustering that cares about context and boundaries, not just simple grouping
+- replay scheduling so important memories can be revisited and reinforced
+- recall calibration so search quality is less likely to drift toward noisy results
+- release-readiness telemetry for debugging recall and replay behavior
 
-**Go is the back room.** It handles the heavy work: embeddings, vector search, and Pebble DB storage. That keeps the slow part away from Node.js, so the agent stays responsive.
+In plain language: the agent now gets better at deciding where one experience ends, what should be grouped together, what should stay memorable, and what should come back during recall.
 
-So the rule is simple: **TypeScript coordinates, Go does the heavy lifting, and the agent does not have to wait around.**
+## Architecture at a glance
 
----
+The plugin is split on purpose:
 
-## How It Works
+- TypeScript is the OpenClaw-facing layer.
+- Go is the memory engine.
+- Pebble DB stores memory records.
+- HNSW makes semantic search fast.
 
-> **TL;DR:** Every message triggers a memory check. Relevant past episodes are added to the prompt before the model replies.
+Think of it like a restaurant:
 
-**Step 1 — You send a message.**
-
-**Step 2 — `assemble()` fires.** The plugin takes the last 5 messages and builds a search query from them.
-
-**Step 3 — The Go sidecar embeds that query.** It calls the Gemini Embedding API to turn text into a 768-dimensional vector (a list of numbers that captures meaning).
-
-**Step 4 — HNSW finds the top-K most similar past episodes.** HNSW is a fast approximate nearest-neighbor algorithm — think of it as a "find me the most similar thing" engine that works in milliseconds, even over thousands of memories.
-
-**Step 5 — Matching episodes are injected into the system prompt.** The AI sees them before reading your message, so the reply naturally includes historical context.
-
-```mermaid
-sequenceDiagram
-    participant You
-    participant OpenClaw
-    participant TS as Plugin (TypeScript)
-    participant Go as Go Sidecar
-    participant DB as Pebble DB + HNSW
-
-    You->>OpenClaw: Send a message
-    OpenClaw->>TS: assemble() fires
-    TS->>TS: Build query from last 5 messages
-    TS->>Go: RPC: recall(query, k=5)
-    Go->>Go: Gemini Embedding API
-    Go->>DB: Vector search, top-K episodes
-    DB-->>Go: Matching episode bodies
-    Go-->>TS: Results
-    TS->>OpenClaw: Prepend episodes to system prompt
-    OpenClaw->>You: AI replies with full historical context
-```
-
-![Sequence diagram: episodic recall flow](docs/sequenceDiagram.png)
-
-And in the background, new episodes are being saved:
-
-**Step A — Surprise Score detects a topic change.** After each turn, the plugin checks: did the conversation just shift to a new topic? If yes, the current buffer is sealed and saved as an episode.
-
-**Step B — Text chunks → Go sidecar → Gemini Embedding → Pebble DB.** The episode text is embedded and stored with its vector, ready to be retrieved in future conversations.
+- TypeScript is the waiter taking the order and talking to the customer.
+- Go is the kitchen doing the heavy work.
+- Pebble DB is the pantry.
+- HNSW is the fast shelf map that tells the kitchen where similar ingredients are.
 
 ```mermaid
 flowchart LR
-    A[New messages arrive] --> B[EventSegmenter checks Surprise Score]
-    B -->|Score above 0.2 OR buffer above 7200 chars| C[Episode boundary detected]
-    C --> D[Buffer split into chunks]
-    D --> E[Go sidecar: Gemini Embedding]
-    E --> F[Pebble DB stores episode\nHNSW indexes the vector]
-    B -->|Score low| G[Keep buffering messages]
+    A["OpenClaw agent"] --> B["TypeScript plugin"]
+    B --> C["Go sidecar"]
+    C --> D["Pebble DB"]
+    C --> E["HNSW index"]
+    C --> F["Replay state"]
+    C --> G["D0 and D1 memories"]
 ```
 
-![Flowchart: episode save pipeline](docs/flowchart.png)
+## How one message moves through the system
 
----
+When a new message arrives, the plugin does two jobs at the same time.
 
-## Memory Hierarchy (D0 / D1)
+### 1. Recall before the model answers
 
-> **TL;DR:** D0 is a raw diary entry. D1 is the book summary you'd read instead of the whole diary.
+Before OpenClaw sends the final prompt to the model:
 
-### D0 — Raw Episodes
+1. the TypeScript plugin looks at the latest conversation turns
+2. it builds a recall query
+3. the Go sidecar embeds that query
+4. HNSW searches for nearby memories
+5. the best memories are reranked
+6. the selected memories are injected into the prompt
 
-Every time the Surprise Score crosses a threshold, the current conversation buffer is saved as a D0 episode. These are verbatim conversation logs — detailed and timestamped.
+So the model answers with memory already in view.
 
-- Stored in Pebble DB with a full vector embedding
-- Auto-tagged: `auto-segmented`, `surprise-boundary`, or `size-limit`
-- Instantly retrievable via HNSW vector search
+### 2. Save the current conversation as a future memory
 
-### D1 — Summarized Long-Term Memory (Sleep Consolidation)
+At the same time, the plugin watches the live conversation buffer.
 
-Over time, groups of D0 episodes get compressed into D1 summaries by the LLM. Inspired by how human brains consolidate memories during sleep — the gist survives, the noise fades.
+1. it measures whether the conversation has shifted enough to form a new episode
+2. if yes, it closes the current chunk
+3. it stores that chunk as a raw episode
+4. later, background consolidation may merge several raw episodes into a cleaner summary
 
-- D1 nodes link back to their source D0 episodes
-- Use `ep-expand` to drill from a D1 summary back to raw D0 episodes
-- Reduces token usage while preserving semantic meaning across long time horizons
+This is why the plugin feels more like memory than like a manual notes tool. It is always listening, segmenting, storing, and later reorganizing.
 
-### What is Surprise Score?
+## The memory model: D0 and D1
 
-The plugin computes a **Bayesian Surprise** metric by comparing the embedding of incoming messages against the current buffer. A score above `0.2` means: "this conversation has meaningfully shifted — seal this episode and start a new one."
+The easiest mental model is this:
 
-```
-Buffer:   "let's build a todo app in React"
-Incoming: "what's the best approach to database indexing?"
-→ Surprise: HIGH → episode boundary → save previous episode
-```
+- D0 is the raw memory
+- D1 is the cleaned-up memory
 
----
+### D0
+
+D0 memories are the direct conversation slices.
+They are closer to a diary entry.
+
+They keep:
+
+- the original text
+- timestamps
+- surprise and segmentation signals
+- topics
+- embeddings for search
+
+### D1
+
+D1 memories are summaries built from groups of D0 memories.
+They are closer to "what mattered in this stretch of experience."
+
+They keep:
+
+- the main meaning of several D0 episodes
+- links back to the source episodes
+- topics and summary metadata
+- replay state for reinforcement
+
+This is important because agents do not just need raw logs.
+They need compressed meaning they can reuse without paying a huge token cost every time.
+
+## What changed in memory quality with v0.2.0
+
+Earlier versions were already useful, but v0.2.0 is more disciplined about what counts as a memory and how that memory stays useful.
+
+- Segmentation is more adaptive.
+  It now uses Bayesian tuning so episode boundaries are less arbitrary.
+- Consolidation is more human-like.
+  D1 grouping pays attention to context and boundaries, not just rough similarity.
+- Replay exists as its own layer.
+  The system can reinforce important memories without mixing replay state into the episode body itself.
+- Recall is less naive.
+  Topics, usefulness, surprise, and replay signals can help rerank candidates.
+
+That does not mean the plugin "thinks like a human brain."
+It means the architecture now borrows a few useful ideas from memory research instead of treating memory like a flat search index.
+
+## The three tools
+
+The plugin also exposes three direct memory tools.
+
+### `ep-recall`
+
+Ask for a memory on purpose.
+
+Use it when auto-injected memory is not enough and you want the agent to search more explicitly.
+
+### `ep-save`
+
+Force something important into memory now.
+
+Use it for preferences, decisions, constraints, or facts that should not wait for automatic segmentation.
+
+### `ep-expand`
+
+Open a summarized memory and inspect its source details.
+
+Use it when a D1 summary is useful but too short and you need the underlying D0 history.
 
 ## Install
 
@@ -122,218 +166,135 @@ Incoming: "what's the best approach to database indexing?"
 openclaw plugins install clawhub:episodic-claw
 ```
 
-That's it. The plugin auto-wires on startup — no config file to edit, no API keys to set (the Go sidecar uses the Gemini API key already configured in your OpenClaw environment).
+Then restart the gateway:
 
----
+```bash
+openclaw gateway restart
+```
+
+What to expect after install:
+
+- the npm package installs the TypeScript plugin
+- `postinstall` fetches the platform-specific Go sidecar from the GitHub release assets
+- the sidecar starts when OpenClaw loads the plugin
+
+The Go sidecar uses the Gemini API key already available in your OpenClaw environment.
 
 ## Agent Install Prompt
 
-Two prompts below. **First**: give this to an agent (Claude Code, Codex, etc.) to have it install and configure episodic-claw automatically. **Second**: paste into the agent's system prompt so it knows how to use its memory.
+If you want another agent to handle the installation for you, give it a prompt like this.
 
-### Part 1 — Installation (give this to an agent to run)
+This is not a product description.
+It is a technical task prompt that tells the agent to do the real install work step by step.
 
-```
-Please install and configure the episodic-claw memory plugin for my OpenClaw agent.
-Follow these steps exactly:
+```text
+Install `episodic-claw` into my OpenClaw setup and finish the full technical setup for me.
 
-Step 1 — Install the plugin via OpenClaw plugin manager:
-  openclaw plugins install clawhub:episodic-claw
+Do the work, do not just explain it.
 
-Step 2 — Verify the plugin appears in the plugin list:
-  openclaw plugins list
+Required steps:
 
-Step 3 — If OpenClaw uses a config file (openclaw.config.json or similar),
-  make sure episodic-claw is registered. The minimal config entry is:
-  {
-    "plugins": [
-      { "id": "episodic-claw" }
-    ]
-  }
-  If a "plugins" array already exists, just add { "id": "episodic-claw" } to it.
+1. Run:
+   `openclaw plugins install clawhub:episodic-claw`
 
-Step 4 — The plugin uses the Gemini API key already set in the OpenClaw environment.
-  If GEMINI_API_KEY is not set, set it now:
-  export GEMINI_API_KEY="your-key-here"
-  (Get a free key at https://aistudio.google.com/app/apikey)
+2. Check whether the plugin installed cleanly:
+   `openclaw plugins list`
 
-Step 5 — Restart the OpenClaw gateway to apply changes:
-  openclaw gateway restart
-  (or restart the OpenClaw desktop app if you're using the GUI)
+3. Open my OpenClaw config file and make sure `episodic-claw` is enabled.
+   The usual file is `~/.openclaw/openclaw.json`.
+   If needed, update the plugin config so OpenClaw can load `episodic-claw`.
 
-Step 6 — Confirm the plugin is active by checking gateway logs for:
-  [Episodic Memory] Plugin registered.
-  [Episodic Memory] Gateway started.
+4. Confirm the required Gemini API key exists in the OpenClaw environment.
+   If the plugin depends on `GEMINI_API_KEY`, verify that it is already available where OpenClaw runs.
 
-The plugin is now running. No further configuration is needed.
-```
+5. Before restarting OpenClaw, send the user this notice in your own natural wording:
+   "I need to restart the OpenClaw gateway next. I will wait 6 minutes before restarting it. The install is not fully verified yet, and when the restart happens my current working context may cut off. Please send me a message after the restart to wake me back up so I can finish the verification."
 
-### Part 2 — System Prompt (paste into the agent's system prompt)
+6. After sending that notice, wait 6 minutes on purpose.
+   Use a real sleep/wait, not just a short pause.
 
-```
-You have long-term episodic memory powered by the episodic-claw plugin.
+7. Restart OpenClaw so the plugin is actually loaded:
+   `openclaw gateway restart`
 
-Your memory tools:
-- ep-recall <query>   — Search your memory for anything relevant to a topic
-- ep-save <content>   — Save something important that you want to remember later
-- ep-expand <slug>    — Expand a memory summary to read its full contents
+8. Verify that the plugin is active after restart.
+   Check plugin status, startup logs, and whether the memory plugin is loaded without errors.
 
-How to use them well:
-- Before answering questions that might benefit from past context, run ep-recall first.
-- After completing something meaningful (a key decision, a fix, a preference learned),
-  run ep-save to make sure it sticks.
-- When a recalled memory summary is too brief and you need more detail, run ep-expand.
-- You also have automatic memory: relevant past episodes are already injected at the top
-  of every system prompt under "--- My Memory ---". Read those first before calling
-  ep-recall manually.
-- Your memory is stored locally and privately — it never leaves the machine.
+9. If the install pulls a platform-specific sidecar binary, confirm that it downloaded correctly and is present in the plugin directory.
 
-The episodic-claw plugin runs silently in the background. You don't need to manage it.
-Just use the tools when they make sense.
+10. At the end, give me a short report with:
+   - what changed
+   - whether the plugin is loaded
+   - any warnings or manual follow-up I still need
+
+Important:
+- Prefer editing the real config instead of only describing what should be changed.
+- If something fails, debug it and keep going until the plugin is either working or clearly blocked by a concrete missing dependency.
+- Do not stop after installation alone. Finish verification too.
 ```
 
----
+## Important config knobs
 
-## The 3 Memory Tools
+Most users do not need to change anything, but these are the knobs that matter most.
 
-### `ep-recall` — Manual memory search
+| Key | Default | What it controls |
+|---|---:|---|
+| `reserveTokens` | `6144` | how much prompt space memory injection can use |
+| `recentKeep` | `30` | how many recent turns survive compaction |
+| `maxBufferChars` | `7200` | when the live buffer is forced into a saved episode |
+| `maxCharsPerChunk` | `9000` | max size of each stored chunk |
+| `dedupWindow` | `5` | how aggressively repeated fallback text is deduplicated |
 
-> Ask the AI to dig up a specific memory by topic or keyword.
+v0.2.0 also adds calibration knobs for segmentation and recall.
+Those are useful if you want to tune behavior, but most people should leave them at default until they have a real reason to change them.
 
-The AI uses this when auto-retrieval isn't surfacing the right context, or when you explicitly ask it to remember something.
+## Privacy and storage
 
-```
-You:  "Do you remember the database schema we agreed on last week?"
-AI:   [calls ep-recall → query: "database schema decision"]
-AI:   "Yes — on [date] we settled on a normalized schema with a users table..."
-```
+The core storage is local.
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `query` | string | Yes | What to search for |
-| `k` | number | No | How many episodes to return (default: 3) |
+- memories are stored on your machine
+- Pebble DB holds the records
+- HNSW holds the vector search graph
+- the plugin does not need a cloud memory database
 
----
+Embedding requests still go through the configured embedding provider, which in the default setup is Gemini.
 
-### `ep-save` — Manual memory save
+## Limits
 
-> Tell the AI "remember this" and it saves it immediately.
+v0.2.0 is strong, but it is not pretending to be finished.
 
-```
-You:  "Remember that we're using PostgreSQL for this project, not SQLite."
-AI:   [calls ep-save]
-AI:   "Got it — filed that away."
-```
+- `importance_score` is not enabled yet
+- automatic pruning and tombstone disposal are not enabled yet
+- cross-agent shared memory is still planned work
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `content` | string | Yes | What to save (natural language, up to ~3600 chars) |
-| `tags` | string[] | No | Optional tags like `["decision", "database"]` |
+So this release is best understood as a solid local episodic memory engine, not the final form of the project.
 
----
+## Why this project exists
 
-### `ep-expand` — Expand a summary to raw episodes
+Most agents can only "remember" what still fits inside the current prompt.
+That is fine for short tasks.
+It breaks down on long-running work.
 
-> When the AI has a compressed summary but needs full details, this fetches them.
+`episodic-claw` exists because an agent should be able to:
 
-```
-You:  "What exactly happened during the auth debugging session?"
-AI:   [finds a summary, calls ep-expand to retrieve the full episode]
-AI:   "Here's the full breakdown: ..."
-```
+- remember earlier decisions
+- recall what failed before
+- keep project preferences over time
+- compress old experience without losing the important part
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `slug` | string | Yes | The ID/slug of the summary episode to expand |
-
----
-
-## Configuration
-
-All keys are optional. Defaults work well for most agents.
-
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | boolean | `true` | Enable or disable the plugin entirely |
-| `reserveTokens` | integer | `6144` | Max tokens reserved for injected memories in the system prompt |
-| `recentKeep` | integer | `30` | Recent turns to keep during context compaction |
-| `dedupWindow` | integer | `5` | Dedup window for fallback-repeated messages. Increase to 10+ in high-fallback environments |
-| `maxBufferChars` | integer | `7200` | Character threshold that forces an episode save regardless of Surprise Score |
-| `maxCharsPerChunk` | integer | `9000` | Max chars per episode chunk. Setting this below `maxBufferChars` splits one flush into multiple episodes |
-| `sharedEpisodesDir` | string | — | *(Planned — Phase 6)* Shared episodes dir across multiple agents. No effect yet |
-| `allowCrossAgentRecall` | boolean | — | *(Planned — Phase 6)* Include other agents' episodes in recall. No effect yet |
-
-**Example config:**
-
-```json
-{
-  "plugins": [
-    {
-      "id": "episodic-claw",
-      "config": {
-        "reserveTokens": 4096,
-        "recentKeep": 20,
-        "maxBufferChars": 5000
-      }
-    }
-  ]
-}
-```
-
----
-
-## Research Foundation
-
-This plugin is built on top of real AI memory research. If you want to go deeper:
-
-- **EM-LLM** — Human-Like Episodic Memory for Infinite Context LLMs
-  Watson et al., 2024 · [arXiv:2407.09450](https://arxiv.org/abs/2407.09450)
-  The inspiration for surprise-based episode segmentation. EM-LLM uses Bayesian surprise and contiguity to form human-like memory boundaries.
-
-- **MemGPT** — Towards LLMs as Operating Systems
-  Packer et al., 2023 · [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
-  The idea that an agent should have tiered memory and be able to manage it via explicit function calls. ep-recall, ep-save, ep-expand are this concept implemented as an OpenClaw plugin.
-
-- **Position Paper** — Agent Memory Systems
-  2025 · [arXiv:2502.06975](https://arxiv.org/abs/2502.06975)
-  A survey of agent memory architectures covering episodic, semantic, and procedural memory. Informed the D0/D1 hierarchy design.
-
----
-
-## About
-
-I'm a self-taught AI nerd, currently living my best NEET life — no corporate team, no funding, just me, an AI co-pilot, and too many browser tabs open at 2am.
-
-episodic-claw is **100% vibe coded**. I described what I wanted to an AI, argued when it was wrong, and kept iterating until it worked. The architecture is real, the research is real, the bugs were painfully real.
-
-I built this because I think AI agents deserve better memory than a rolling context window. If episodic-claw makes your agent noticeably smarter, that's the whole point.
-
-### Sponsor
-
-Keeping this going requires a Claude or OpenAI Codex subscription — that's what writes the code. If you're finding this useful, even $5/month genuinely helps.
-
-**Planned future updates:**
-- **Cross-agent recall** — share memory across multiple agents
-- **Memory decay** — low-relevance old episodes fade automatically
-- **Web UI** — browse and edit your agent's memory visually
-
-👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
-
-No pressure. The plugin will always be MPL-2.0 licensed and free.
-
----
+That is the whole idea.
 
 ## License
 
-[Mozilla Public License 2.0 (MPL-2.0)](LICENSE) © 2026 YoshiaKefasu
+[Mozilla Public License 2.0 (MPL-2.0)](./LICENSE)
 
-**Why MPL 2.0 and not MIT?**
+Why MPL instead of MIT?
 
-MIT lets anyone take this code, improve it, and never give those improvements back. That's fine for libraries, but for a memory plugin that people will build real workflows on top of, I'd rather forks stay open.
+- You can build products with it.
+- You can mix it with your own code.
+- But if you modify files from this plugin, those modified files should stay open.
 
-MPL 2.0 is a file-level copyleft: if you modify any `.ts` or `.go` source file in this repo, those modified files must stay open source under MPL. But you can freely combine episodic-claw with your own proprietary code — the copyleft doesn't spread to your codebase. You can build a commercial product using episodic-claw; you just can't silently improve the plugin itself and close the source.
-
-The goal is simple: **improvements to episodic-claw come back to the community.**
+That keeps improvements to the memory engine from disappearing into closed forks.
 
 ---
 
-*Built with OpenClaw · Powered by Gemini Embeddings · Stored with HNSW + Pebble DB*
+Built with OpenClaw, Gemini embeddings, Pebble DB, and HNSW.
