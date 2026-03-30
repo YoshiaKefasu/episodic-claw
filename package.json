@@ -20,7 +20,7 @@
     "build:go:linux": "cross-env GOOS=linux GOARCH=amd64 go build -C go -o ../dist/episodic-core .",
     "build:go:win": "cross-env GOOS=windows GOARCH=amd64 go build -C go -o ../dist/episodic-core.exe .",
     "build:go": "npm-run-all build:go:linux build:go:win",
-    "postinstall": "node scripts/postinstall.js",
+    "postinstall": "node scripts/postinstall.cjs",
     "test": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase4_5.ts",
     "test:old": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase3.ts",
     "prepublishOnly": "npm run build"
@@ -29,7 +29,7 @@
     "dist/**/*.js",
     "!dist/runner_hardcoded.js",
     "!dist/runner.js",
-    "scripts/postinstall.js",
+    "scripts/postinstall.cjs",
     "openclaw.plugin.json",
     "CHANGELOG.md"
   ],
