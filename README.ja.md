@@ -4,11 +4,13 @@
 
 > [🇺🇸 English](./README.md) · 🇯🇵 日本語 · [🇨🇳 中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
-会話を自動でローカルのベクトルDBに保存して、必要なときにキーワードではなく「意味」で検索し、関連する記憶をシステムプロンプトに注入してくれます。設定不要、コマンド不要、インストールするだけで動きます。
+会話をローカルに保存して、必要なときにキーワードではなく「意味」で探し、合う記憶だけをプロンプトに戻すプラグインです。OpenClaw が前に話したことを忘れにくくなります。
+
+v0.2.0 のドキュメント: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
 ---
 
@@ -16,19 +18,19 @@
 
 ほとんどのプラグインは1言語で書かれていますが、これはあえて2言語を使っています。
 
-ホテルで例えるとわかりやすいです。
+店にたとえるとわかりやすいです。
 
-**TypeScriptはフロントデスク。** OpenClawのプラグインAPIと話すのが得意で、ツール登録、フック配線、JSONのパース、エージェントとの接続など「窓口業務」を担当します。TypeScriptはこれが得意 — 柔軟で、npmで何でも揃う。
+**TypeScriptは受付。** OpenClaw と会話し、ツール登録やフック配線、JSONの受け渡しを担当します。
 
-**GoはバックヤードのS倉庫作業員。** 会話をベクトルにして保存・検索する処理が来たら、TypeScriptはコンパイル済みのGoバイナリ（サイドカー）に仕事を渡します。GoはGemini Embedding APIへの並行リクエスト、HNSWベクトルインデックスの維持、Pebble DBへの読み書きを担当 — 高速で、メモリ安全で、Node.jsのシングルスレッド制約を受けない。
+**Goは奥の作業場。** 会話の埋め込み、ベクトル検索、Pebble DB への保存を担当します。重い処理を奥に分けるので、Node.js 側が詰まりにくくなります。
 
-**この分担のおかげでエージェントは待たされない。** 保存はfire-and-forget（発火して忘れる）で動き、検索は1回の非同期ラウンドトリップで終わります。
+**つまり、TypeScript が全体をまとめて、Go が重い仕事をこなし、エージェントは待たずに動けます。**
 
 ---
 
 ## どうやって動くの？（アーキテクチャ）
 
-> **TL;DR:** メッセージを送るたびに記憶の検索が走る。関連する過去のエピソードがAIのシステムプロンプトに自動注入される。
+> **TL;DR:** メッセージを送るたびに記憶の検索が走る。関連する過去のエピソードがモデルの返答前に自動で入る。
 
 **Step 1 — あなたがメッセージを送る。**
 

@@ -1,8 +1,8 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.1.1",
-  "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — no setup required.",
+  "version": "0.2.0",
+  "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
   "author": {
@@ -48,6 +48,58 @@
         "type": "integer",
         "minimum": 500,
         "description": "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
+      },
+      "segmentationLambda": {
+        "type": "number",
+        "description": "Adaptive segmentation: threshold = mean + lambda * std."
+      },
+      "segmentationWarmupCount": {
+        "type": "integer",
+        "description": "Adaptive segmentation: number of observations needed before dynamic scoring."
+      },
+      "segmentationMinRawSurprise": {
+        "type": "number",
+        "description": "Adaptive segmentation: raw surprise floor below which boundaries are not cut."
+      },
+      "segmentationCooldownTurns": {
+        "type": "integer",
+        "description": "Adaptive segmentation: cooldown turns after a detected boundary."
+      },
+      "segmentationStdFloor": {
+        "type": "number",
+        "description": "Adaptive segmentation: minimum std floor to avoid over-sensitive scoring."
+      },
+      "segmentationFallbackThreshold": {
+        "type": "number",
+        "description": "Adaptive segmentation: fixed threshold used during fallback or warmup."
+      },
+      "recallSemanticFloor": {
+        "type": "number",
+        "description": "Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay."
+      },
+      "recallUsefulnessClamp": {
+        "type": "number",
+        "description": "Recall calibration: cap usefulness posterior contribution so it stays a correction term."
+      },
+      "recallReplayTieBreakMaxBoost": {
+        "type": "number",
+        "description": "Recall calibration: maximum replay-state tie-break boost."
+      },
+      "recallReplayLowRetrievabilityBonus": {
+        "type": "number",
+        "description": "Recall calibration: tiny extra boost when a replay candidate is clearly getting stale."
+      },
+      "recallTopicsMatchBoost": {
+        "type": "number",
+        "description": "Recall calibration: bonus per matched topic."
+      },
+      "recallTopicsMismatchPenalty": {
+        "type": "number",
+        "description": "Recall calibration: penalty when topics exist but none match."
+      },
+      "recallTopicsMissingPenalty": {
+        "type": "number",
+        "description": "Recall calibration: penalty when the record has no topics at all. Usually zero."
       },
       "sharedEpisodesDir": {
         "type": "string",

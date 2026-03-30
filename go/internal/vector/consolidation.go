@@ -14,8 +14,6 @@ import (
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/time/rate"
 )
 
@@ -25,53 +23,15 @@ import (
 func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore *Store, gemmaLimiter *rate.Limiter, embedLimiter *rate.Limiter) error {
 	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Starting Consolidation Job...\n")
 
-	// 1. Fetch all raw episodes (D0), assuming "archived" tag is missing.
-	// In our system, typical episodes have "auto-record" or "gap-compacted" or "genesis-archive".
-
-	var d0Nodes []EpisodeRecord
-	// Since we only added "ListByTag", but we need "All without 'archived' tag"
-	// Let's do a full scan of prefixEp and filter.
-	vstore.mutex.RLock()
-	iter, err := vstore.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefixEp,
-		UpperBound: []byte("ep;"),
-	})
+	d0Nodes, err := collectActiveD0Nodes(vstore)
 	if err != nil {
-		vstore.mutex.RUnlock()
-		return fmt.Errorf("failed to iter unarchived nodes: %w", err)
+		return err
 	}
-	defer iter.Close()
-	
-	for iter.First(); iter.Valid(); iter.Next() {
-		var rec EpisodeRecord
-		if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil {
-			isArchived := false
-			isD1 := false
-			for _, t := range rec.Tags {
-				if t == "archived" {
-					isArchived = true
-				}
-				if t == "d1-summary" {
-					isD1 = true
-				}
-			}
-			if !isArchived && !isD1 {
-				d0Nodes = append(d0Nodes, rec)
-			}
-		}
-	}
-	iter.Close()
-	vstore.mutex.RUnlock()
 
 	if len(d0Nodes) == 0 {
 		fmt.Fprintf(os.Stderr, "[SleepConsolidation] No unarchived D0 nodes found. Exiting.\n")
 		return nil
 	}
-
-	// Sort chronologically
-	sort.Slice(d0Nodes, func(i, j int) bool {
-		return d0Nodes[i].Timestamp.Before(d0Nodes[j].Timestamp)
-	})
 
 	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Found %d unarchived D0 nodes to process.\n", len(d0Nodes))
 
@@ -82,14 +42,21 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 	// Retry handles transient 429/5xx; limiters prevent exceeding RPM quota.
 	llm, embed := ai.NewRetryPair(llmRaw, embedRaw, gemmaLimiter, embedLimiter)
 
-	// Cluster into chunks of up to 10 (basic temporal clustering)
-	// TODO: Future enhancement: employ HNSW Cosine distance clustering.
-	chunkSize := 10
-	for i := 0; i < len(d0Nodes); i += chunkSize {
-		end := min(i+chunkSize, len(d0Nodes))
-		cluster := d0Nodes[i:end]
+	now := time.Now()
+	cfg := defaultD1ClusterConfig()
+	clusters, err := buildD1Clusters(d0Nodes, now, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to build consolidation clusters: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Built %d consolidation cluster(s).\n", len(clusters))
 
-		if err := processCluster(ctx, cluster, agentWs, vstore, llm, embed); err != nil {
+	existingKeys, err := loadExistingConsolidationKeys(vstore)
+	if err != nil {
+		return fmt.Errorf("failed to load existing consolidation keys: %w", err)
+	}
+
+	for _, cluster := range clusters {
+		if err := processCluster(ctx, cluster, agentWs, vstore, llm, embed, cfg, existingKeys); err != nil {
 			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error processing cluster: %v\n", err)
 		}
 	}
@@ -105,39 +72,43 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 
 func processCluster(
 	ctx context.Context,
-	cluster []EpisodeRecord,
+	cluster d1ConsolidationCluster,
 	agentWs string,
 	vstore *Store,
 	llm ai.LLMProvider,
 	embed ai.EmbeddingProvider,
+	cfg d1ClusterConfig,
+	existingKeys map[string]string,
 ) error {
-
-	var clusterDocs []string
-	var childrenIDs []string
-
-	for _, d0 := range cluster {
-		doc, err := frontmatter.Parse(d0.SourcePath)
-		if err == nil {
-			clusterDocs = append(clusterDocs, fmt.Sprintf("ID: %s\n%s", d0.ID, doc.Body))
-			childrenIDs = append(childrenIDs, d0.ID)
+	if existingID := strings.TrimSpace(existingKeys[cluster.Fingerprint]); existingID != "" {
+		fmt.Fprintf(os.Stderr, "[SleepConsolidation] Reusing existing D1 %s for fingerprint %s\n", existingID, cluster.Fingerprint)
+		_, selectedRecords, _, err := prepareClusterInputs(cluster, cfg, vstore)
+		if err != nil {
+			return err
 		}
+		childIDs := make([]string, 0, len(selectedRecords))
+		for _, rec := range selectedRecords {
+			childIDs = append(childIDs, rec.ID)
+		}
+		_ = vstore.PromoteReplayStateToParent(childIDs, existingID, time.Now())
+		return linkClusterChildren(selectedRecords, existingID, vstore)
 	}
 
-	if len(clusterDocs) == 0 {
-		return fmt.Errorf("cluster has no readable docs")
+	clusterDocs, selectedRecords, d1Topics, err := prepareClusterInputs(cluster, cfg, vstore)
+	if err != nil {
+		return err
+	}
+	if len(clusterDocs) == 0 || len(selectedRecords) == 0 {
+		return fmt.Errorf("cluster has no readable non-empty docs")
+	}
+	childrenIDs := make([]string, 0, len(selectedRecords))
+	for _, rec := range selectedRecords {
+		childrenIDs = append(childrenIDs, rec.ID)
 	}
 
 	clusterText := strings.Join(clusterDocs, "\n---\n")
 
-	prompt := fmt.Sprintf(`Analyze the following episodic memory logs (D0) representing detailed chronological events.
-Extract the overarching rules, facts, high-level summaries, and abstract concepts to form a long-term semantic memory (D1).
-Do not simply repeat the conversation. Synthesize it.
-Return ONLY the summary/rules markdown text without additional conversational filler.
-
----
-%s
----
-`, clusterText)
+	prompt := buildConsolidationPrompt(clusterText, len(selectedRecords) == 1)
 
 	// Rate limiting and retry are handled by the RetryLLM/RetryEmbedder decorators.
 	// No manual limiter.Wait() needed here.
@@ -145,6 +116,10 @@ Return ONLY the summary/rules markdown text without additional conversational fi
 	d1Body, err := llm.GenerateText(ctx, prompt)
 	if err != nil {
 		return fmt.Errorf("LLM generation failed: %w", err)
+	}
+
+	if strings.TrimSpace(d1Body) == "" {
+		return fmt.Errorf("generated empty D1 body")
 	}
 
 	slugPrompt := fmt.Sprintf("Generate a very short, url-safe identifier (using hyphens, max 4 words) representing this topic:\n%s", d1Body[:min(len(d1Body), 300)])
@@ -160,28 +135,30 @@ Return ONLY the summary/rules markdown text without additional conversational fi
 	}
 
 	now := time.Now()
-	dirPath := filepath.Join(agentWs, 
-		fmt.Sprintf("%04d", now.Year()), 
-		fmt.Sprintf("%02d", now.Month()), 
+	dirPath := filepath.Join(agentWs,
+		fmt.Sprintf("%04d", now.Year()),
+		fmt.Sprintf("%02d", now.Month()),
 		fmt.Sprintf("%02d", now.Day()))
-	
+
 	os.MkdirAll(dirPath, 0755)
 	outFilePath := filepath.Join(dirPath, d1Slug+".md")
 
 	edgeList := []frontmatter.Edge{}
 	for _, cid := range childrenIDs {
 		edgeList = append(edgeList, frontmatter.Edge{
-			ID:     cid,
-			Type:   "child",
+			ID:   cid,
+			Type: "child",
 		})
 	}
 
 	fm := frontmatter.EpisodeMetadata{
-		ID:        d1Slug,
-		Title:     "Semantic Consolidation: " + strings.ReplaceAll(d1Slug, "-", " "),
-		Tags:      []string{"d1-summary"},
-		SavedBy:   "auto",
-		RelatedTo: edgeList,       // Link to D0 children
+		ID:               d1Slug,
+		Title:            "Semantic Consolidation: " + strings.ReplaceAll(d1Slug, "-", " "),
+		Tags:             []string{"d1-summary"},
+		Topics:           d1Topics,
+		SavedBy:          "auto",
+		ConsolidationKey: cluster.Fingerprint,
+		RelatedTo:        edgeList, // Link to D0 children
 	}
 
 	doc := &frontmatter.MarkdownDocument{
@@ -197,6 +174,7 @@ Return ONLY the summary/rules markdown text without additional conversational fi
 		ID:         d1Slug,
 		Title:      fm.Title,
 		Tags:       fm.Tags,
+		Topics:     fm.Topics,
 		Timestamp:  now,
 		Vector:     emb,
 		SourcePath: outFilePath,
@@ -204,65 +182,246 @@ Return ONLY the summary/rules markdown text without additional conversational fi
 	}); err != nil {
 		return fmt.Errorf("failed to add D1 to vector store: %w", err)
 	}
+	_ = vstore.PromoteReplayStateToParent(childrenIDs, d1Slug, now)
+	existingKeys[cluster.Fingerprint] = d1Slug
 
 	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Generated D1: %s\n", d1Slug)
+	return linkClusterChildren(selectedRecords, d1Slug, vstore)
+}
 
-	// P1-F FIX: Move file I/O out of the UpdateRecord callback.
-	// UpdateRecord holds a Write lock on the Vector Store. Doing Parse/Serialize inside it
-	// blocks all other operations (Recall, Ingest) for the duration of the disk I/O.
-	for _, cid := range childrenIDs {
-		// 1. Get current metadata to find the file path
+func buildConsolidationPrompt(clusterText string, singleton bool) string {
+	if singleton {
+		return fmt.Sprintf(`Analyze the following episodic memory log (D0) as a single high-salience event.
+Keep the D1 summary narrow, concrete, and local to this one episode.
+Do not over-generalize beyond the event itself.
+Return ONLY the summary/rules markdown text without additional conversational filler.
+
+---
+%s
+---
+`, clusterText)
+	}
+
+	return fmt.Sprintf(`Analyze the following episodic memory logs (D0) representing detailed chronological events.
+Extract the overarching rules, facts, high-level summaries, and abstract concepts to form a long-term semantic memory (D1).
+Do not simply repeat the conversation. Synthesize it.
+Return ONLY the summary/rules markdown text without additional conversational filler.
+
+---
+%s
+---
+`, clusterText)
+}
+
+func prepareClusterInputs(cluster d1ConsolidationCluster, cfg d1ClusterConfig, vstore *Store) ([]string, []EpisodeRecord, []string, error) {
+	clusterRecords := make([]EpisodeRecord, 0, len(cluster.Nodes))
+	clusterDocs := make([]string, 0, len(cluster.Nodes))
+	remainingTokens := cfg.MaxClusterTokens
+
+	for _, node := range cluster.Nodes {
+		rec := node.Record
+		doc, err := frontmatter.Parse(rec.SourcePath)
+		if err != nil {
+			quarantineConsolidationRecord(vstore, rec, fmt.Sprintf("parse failed: %v", err))
+			continue
+		}
+		body := strings.TrimSpace(doc.Body)
+		if body == "" {
+			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Skipping empty D0 body for %s\n", rec.ID)
+			quarantineConsolidationRecord(vstore, rec, "empty body")
+			continue
+		}
+		cappedBody := trimBodyToTokenLimit(body, min(cfg.PerNodeTokenCap, remainingTokens))
+		bodyTokens := frontmatter.EstimateTokens(cappedBody)
+		if bodyTokens <= 0 {
+			quarantineConsolidationRecord(vstore, rec, "token cap trimmed body to empty")
+			continue
+		}
+		clusterDocs = append(clusterDocs, fmt.Sprintf("ID: %s\n%s", rec.ID, cappedBody))
+		clusterRecords = append(clusterRecords, rec)
+		remainingTokens -= bodyTokens
+		if remainingTokens <= 0 {
+			break
+		}
+	}
+
+	if len(clusterDocs) == 0 {
+		return nil, nil, nil, fmt.Errorf("cluster has no readable non-empty docs")
+	}
+	return clusterDocs, clusterRecords, aggregateClusterTopics(clusterRecords), nil
+}
+
+func trimBodyToTokenLimit(body string, tokenLimit int) string {
+	body = strings.TrimSpace(body)
+	if body == "" || tokenLimit <= 0 {
+		return ""
+	}
+	if frontmatter.EstimateTokens(body) <= tokenLimit {
+		return body
+	}
+	runes := []rune(body)
+	if len(runes) == 0 {
+		return ""
+	}
+	maxRunes := max(1, tokenLimit*3)
+	if maxRunes >= len(runes) {
+		return body
+	}
+	return strings.TrimSpace(string(runes[:maxRunes])) + "\n\n[truncated for consolidation budget]"
+}
+
+func linkClusterChildren(children []EpisodeRecord, parentID string, vstore *Store) error {
+	for _, child := range children {
+		cid := child.ID
 		sourcePath := ""
 		if rec, err := vstore.Get(cid); err == nil {
 			sourcePath = rec.SourcePath
 		}
 
 		newEdge := frontmatter.Edge{
-			ID:   d1Slug,
+			ID:   parentID,
 			Type: "parent",
 		}
 
-		// 2. Perform file I/O BEFORE taking the lock
 		alreadyArchived := false
 		if sourcePath != "" {
 			d0Doc, d0Err := frontmatter.Parse(sourcePath)
 			if d0Err == nil {
-				// Check status
 				alreadyArchived = slices.Contains(d0Doc.Metadata.Tags, "archived")
-
 				if !alreadyArchived {
 					d0Doc.Metadata.Tags = append(d0Doc.Metadata.Tags, "archived")
 				}
-				d0Doc.Metadata.RelatedTo = append(d0Doc.Metadata.RelatedTo, newEdge)
-
-				// 3. Serialize BEFORE or AFTER the Vector store update.
-				// Here we do it before to be safe (if it fails, we might not want to update state).
+				if len(d0Doc.Metadata.Topics) == 0 {
+					d0Doc.Metadata.Topics = LegacyTopicsFromTags(d0Doc.Metadata.Tags)
+				}
+				if !hasRelatedEdge(d0Doc.Metadata.RelatedTo, newEdge) {
+					d0Doc.Metadata.RelatedTo = append(d0Doc.Metadata.RelatedTo, newEdge)
+				}
 				if err := frontmatter.Serialize(sourcePath, d0Doc); err != nil {
 					fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error serializing D0 node %s: %v\n", sourcePath, err)
 				}
 			}
 		}
 
-		// 4. Finally, update the Vector Store (In-memory/Pebble) with the Write lock
 		if err := vstore.UpdateRecord(cid, func(rec *EpisodeRecord) error {
-			if !alreadyArchived {
+			if !alreadyArchived && !hasTag(rec.Tags, "archived") {
 				rec.Tags = append(rec.Tags, "archived")
 			}
-			rec.Edges = append(rec.Edges, newEdge)
+			if !hasRelatedEdge(rec.Edges, newEdge) {
+				rec.Edges = append(rec.Edges, newEdge)
+			}
 			return nil
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error updating D0 node %s: %v\n", cid, err)
 		}
 	}
-
 	return nil
+}
+
+func hasRelatedEdge(edges []frontmatter.Edge, target frontmatter.Edge) bool {
+	for _, edge := range edges {
+		if edge.ID == target.ID && edge.Type == target.Type {
+			return true
+		}
+	}
+	return false
+}
+
+type clusterTopicStat struct {
+	Topic     string
+	Count     int
+	CoveredBy map[string]struct{}
+}
+
+func aggregateClusterTopics(cluster []EpisodeRecord) []string {
+	if len(cluster) == 0 {
+		return nil
+	}
+
+	stats := make(map[string]*clusterTopicStat)
+	totalChildren := len(cluster)
+
+	for _, d0 := range cluster {
+		topics, _ := ValidateTopics(d0.Topics)
+		if len(topics) == 0 {
+			topics = LegacyTopicsFromTags(d0.Tags)
+		}
+		if len(topics) == 0 {
+			continue
+		}
+		seen := make(map[string]struct{})
+		for _, topic := range topics {
+			key := topicKey(topic)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			stat := stats[key]
+			if stat == nil {
+				stat = &clusterTopicStat{
+					Topic:     topic,
+					CoveredBy: make(map[string]struct{}),
+				}
+				stats[key] = stat
+			}
+			stat.Count++
+			stat.CoveredBy[d0.ID] = struct{}{}
+		}
+	}
+
+	if len(stats) == 0 {
+		return nil
+	}
+
+	type scoredTopic struct {
+		topic    string
+		count    int
+		coverage float64
+		runes    int
+	}
+	scored := make([]scoredTopic, 0, len(stats))
+	for _, stat := range stats {
+		coverage := 0.0
+		if totalChildren > 0 {
+			coverage = float64(len(stat.CoveredBy)) / float64(totalChildren)
+		}
+		scored = append(scored, scoredTopic{
+			topic:    stat.Topic,
+			count:    stat.Count,
+			coverage: coverage,
+			runes:    len([]rune(stat.Topic)),
+		})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].count != scored[j].count {
+			return scored[i].count > scored[j].count
+		}
+		if scored[i].coverage != scored[j].coverage {
+			return scored[i].coverage > scored[j].coverage
+		}
+		if scored[i].runes != scored[j].runes {
+			return scored[i].runes < scored[j].runes
+		}
+		return scored[i].topic < scored[j].topic
+	})
+
+	limit := min(len(scored), 10)
+	topics := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		topics = append(topics, scored[i].topic)
+	}
+	return topics
 }
 
 // RefineSemanticEdges finds pairs of D1 nodes that are close in vector space
 // and links them with a "semantic" edge.
 func RefineSemanticEdges(agentWs string, vstore *Store) error {
 	fmt.Fprintf(os.Stderr, "[RefineSemantic] Checking semantic associations...\n")
-	
+
 	d1Nodes, err := vstore.ListByTag("d1-summary")
 	if err != nil {
 		return err
@@ -282,7 +441,7 @@ func RefineSemanticEdges(agentWs string, vstore *Store) error {
 			if cand.ID == 0 {
 				continue
 			}
-			
+
 			dist := cand.Dist
 			// Guard against NaN: NaN < 0.85 == false (IEEE 754), so NaN would slip through the filter.
 			if math.IsNaN(float64(dist)) {
@@ -359,4 +518,3 @@ func RefineSemanticEdges(agentWs string, vstore *Store) error {
 
 	return nil
 }
-

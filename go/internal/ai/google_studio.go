@@ -77,12 +77,10 @@ type generateContentResponse struct {
 const MaxEmbedRunes = 8000
 
 func (p *GoogleStudioProvider) EmbedContent(ctx context.Context, text string) ([]float32, error) {
-	// TPM optimization: truncate to model's effective input limit before sending.
-	// Byte slicing (text[:N]) is UNSAFE for UTF-8 — Japanese chars are 3-4 bytes and would be
-	// split mid-character. Rune conversion ensures valid UTF-8 output.
-	runes := []rune(text)
-	if len(runes) > MaxEmbedRunes {
-		text = string(runes[:MaxEmbedRunes])
+	var err error
+	text, err = normalizeEmbedText(text)
+	if err != nil {
+		return nil, err
 	}
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s", p.Model, p.APIKey)
@@ -180,9 +178,10 @@ func (p *GoogleStudioProvider) GenerateText(ctx context.Context, prompt string) 
 func (p *GoogleStudioProvider) EmbedContentBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	reqs := make([]embedContentRequest, len(texts))
 	for i, text := range texts {
-		runes := []rune(text)
-		if len(runes) > MaxEmbedRunes {
-			text = string(runes[:MaxEmbedRunes])
+		var err error
+		text, err = normalizeEmbedText(text)
+		if err != nil {
+			return nil, fmt.Errorf("batch embed: empty text at index %d: %w", i, err)
 		}
 		reqs[i] = embedContentRequest{
 			Model:   "models/" + p.Model,

@@ -3,7 +3,7 @@ import * as os from "os";
 import * as fs from "fs";
 import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient } from "./rpc-client";
-import { loadConfig } from "./config";
+import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever } from "./retriever";
 import { Compactor } from "./compactor";
@@ -41,6 +41,100 @@ function extractAgentId(ctx: any): string {
   return "auto";
 }
 
+function normalizeTopics(rawTopics: unknown): string[] {
+  if (!Array.isArray(rawTopics)) return [];
+
+  const seen = new Set<string>();
+  const topics: string[] = [];
+
+  for (const raw of rawTopics) {
+    if (typeof raw !== "string") continue;
+    const normalized = raw.normalize("NFKC").trim();
+    if (!normalized) continue;
+
+    const clipped = Array.from(normalized).slice(0, 50).join("");
+    const dedupeKey = clipped.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    topics.push(clipped);
+
+    if (topics.length >= 10) break;
+  }
+
+  return topics;
+}
+
+const PluginConfigSchema = Type.Object(
+  {
+    enabled: Type.Optional(Type.Boolean({
+      description: "Enable or disable the plugin (default true)."
+    })),
+    reserveTokens: Type.Optional(Type.Integer({
+      description: "Max tokens reserved for injected episode memories in the system prompt (default 6144)."
+    })),
+    recentKeep: Type.Optional(Type.Integer({
+      description: "Number of recent turns to retain during compaction (default 30)."
+    })),
+    dedupWindow: Type.Optional(Type.Integer({
+      description: "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
+    })),
+    maxBufferChars: Type.Optional(Type.Integer({
+      minimum: 500,
+      description: "Character threshold that triggers a forced buffer flush regardless of surprise score (default 7200). Must be >= 500."
+    })),
+    maxCharsPerChunk: Type.Optional(Type.Integer({
+      minimum: 500,
+      description: "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
+    })),
+    sharedEpisodesDir: Type.Optional(Type.String({
+      description: "(Planned — Phase 6) Path to a shared episodes directory across multiple agents. Has no effect in current version."
+    })),
+    allowCrossAgentRecall: Type.Optional(Type.Boolean({
+      description: "(Planned — Phase 6) Whether to include other agents' episodes in recall results. Has no effect in current version."
+    })),
+    segmentationLambda: Type.Optional(Type.Number({
+      description: "Adaptive segmentation: threshold = mean + lambda * std."
+    })),
+    segmentationWarmupCount: Type.Optional(Type.Integer({
+      description: "Adaptive segmentation: number of observations needed before dynamic scoring."
+    })),
+    segmentationMinRawSurprise: Type.Optional(Type.Number({
+      description: "Adaptive segmentation: raw surprise floor below which boundaries are not cut."
+    })),
+    segmentationCooldownTurns: Type.Optional(Type.Integer({
+      description: "Adaptive segmentation: cooldown turns after a detected boundary."
+    })),
+    segmentationStdFloor: Type.Optional(Type.Number({
+      description: "Adaptive segmentation: minimum std floor to avoid over-sensitive scoring."
+    })),
+    segmentationFallbackThreshold: Type.Optional(Type.Number({
+      description: "Adaptive segmentation: fixed threshold used during fallback or warmup."
+    })),
+    recallSemanticFloor: Type.Optional(Type.Number({
+      description: "Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay."
+    })),
+    recallUsefulnessClamp: Type.Optional(Type.Number({
+      description: "Recall calibration: cap usefulness posterior contribution so it stays a correction term."
+    })),
+    recallReplayTieBreakMaxBoost: Type.Optional(Type.Number({
+      description: "Recall calibration: maximum replay-state tie-break boost."
+    })),
+    recallReplayLowRetrievabilityBonus: Type.Optional(Type.Number({
+      description: "Recall calibration: tiny extra boost when a replay candidate is clearly getting stale."
+    })),
+    recallTopicsMatchBoost: Type.Optional(Type.Number({
+      description: "Recall calibration: bonus per matched topic."
+    })),
+    recallTopicsMismatchPenalty: Type.Optional(Type.Number({
+      description: "Recall calibration: penalty when topics exist but none match."
+    })),
+    recallTopicsMissingPenalty: Type.Optional(Type.Number({
+      description: "Recall calibration: penalty when the record has no topics at all. Usually zero."
+    })),
+  },
+  { additionalProperties: false }
+);
+
 // ─── プロセスレベルのシングルトン（BUG-1 修正 v2）──────────────────────────────
 // モジュールレベル変数（let _singleton）はモジュールキャッシュが無効な場合に
 // 毎回 null にリセットされる。global に保存することで同一 Node.js プロセス内の
@@ -66,11 +160,7 @@ const episodicClawPlugin = {
   name: "Episodic Memory",
   description: "D0/D1 hierarchical contextual memory and event stream for OpenClaw.",
   kind: "memory",
-  configSchema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {}
-  },
+  configSchema: PluginConfigSchema,
   register(api: OpenClawPluginApi) {
     try {
       console.log("[Episodic Memory] Registering plugin...");
@@ -96,10 +186,19 @@ const episodicClawPlugin = {
           rpcClient,
           cfg.dedupWindow,
           cfg.maxBufferChars,
-          cfg.maxCharsPerChunk
+          cfg.maxCharsPerChunk,
+          {
+            lambda: cfg.segmentationLambda,
+            warmupCount: cfg.segmentationWarmupCount,
+            minRawSurprise: cfg.segmentationMinRawSurprise,
+            cooldownTurns: cfg.segmentationCooldownTurns,
+            stdFloor: cfg.segmentationStdFloor,
+            fallbackThreshold: cfg.segmentationFallbackThreshold,
+          }
         );
-        const retriever = new EpisodicRetriever(rpcClient);
+        const retriever = new EpisodicRetriever(rpcClient, cfg);
         const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
+        const recallCalibration = buildRecallCalibration(cfg);
         _singleton = {
           rpcClient,
           segmenter,
@@ -120,6 +219,7 @@ const episodicClawPlugin = {
       }
 
       const { rpcClient, segmenter, retriever, compactor, cfg } = _singleton;
+      const recallCalibration = buildRecallCalibration(cfg);
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
 
@@ -300,7 +400,13 @@ const episodicClawPlugin = {
 
       const EpRecallSchema = Type.Object({
         query: Type.String({ description: "Search explicitly within the agent's Episodic Memory for a given topic or keyword" }),
-        k: Type.Optional(Type.Number({ description: "Number of episodes to return (default 3)" }))
+        k: Type.Optional(Type.Number({ description: "Number of episodes to return (default 3)" })),
+        topics: Type.Optional(Type.Array(Type.String(), {
+          description: "Optional semantic topics filter (e.g. ['go-language', 'concurrency'])"
+        })),
+        strictTopics: Type.Optional(Type.Boolean({
+          description: "When true, topics acts as a strict facet filter. When false, topics is only used as a soft rerank hint."
+        })),
       });
 
       api.registerTool((ctx: any) => ({
@@ -314,8 +420,20 @@ const episodicClawPlugin = {
           }
           const p = (params || {}) as Record<string, unknown>;
           const k = typeof p.k === "number" ? p.k : 3;
+          const topics = Array.isArray(p.topics)
+            ? p.topics.filter((item): item is string => typeof item === "string")
+            : [];
+          // For ep-recall (explicit facet search), default to strict filtering when not specified.
+          const strictTopics = typeof (p as any).strictTopics === "boolean" ? ((p as any).strictTopics as boolean) : true;
           try {
-            const results = await rpcClient.recall(p.query as string || "", k, _singleton!.resolvedAgentWs);
+            const results = await rpcClient.recall(
+              p.query as string || "",
+              k,
+              _singleton!.resolvedAgentWs,
+              topics,
+              strictTopics,
+              recallCalibration
+            );
             if (!results || results.length === 0) {
               return { content: [{ type: "text", text: "Nothing came back. I don't have any memories matching that." }] };
             }
@@ -334,8 +452,11 @@ const episodicClawPlugin = {
           description: "The content to save. Write freely in natural language. Paragraphs and line breaks are supported. Maximum 3600 characters.",
           maxLength: 3600
         }),
+        topics: Type.Optional(Type.Array(Type.String(), {
+          description: "Optional semantic topics for this memory (e.g. ['goroutine', 'concurrency'])"
+        })),
         tags: Type.Optional(Type.Array(Type.String(), {
-          description: "Optional tags to categorize this memory (e.g. ['bug', 'decision', 'user-preference'])"
+          description: "Deprecated alias for topics. Keep only for one release window."
         }))
       });
 
@@ -359,7 +480,19 @@ const episodicClawPlugin = {
 
             const runes = Array.from(raw);
             const content = runes.length > 3600 ? runes.slice(0, 3600).join("") + "\n...(truncated)" : raw;
-            const slugRes = await rpcClient.generateEpisodeSlug(content, (p.tags as string[]) || [], [], _singleton!.resolvedAgentWs, agentId);
+            const topicSource = Array.isArray(p.topics) && p.topics.length > 0 ? p.topics : p.tags;
+            const topics = normalizeTopics(topicSource);
+            if (Array.isArray(p.tags) && p.tags.length > 0 && (!Array.isArray(p.topics) || p.topics.length === 0)) {
+              console.warn("[Episodic Memory] ep-save: 'tags' is deprecated; use 'topics' instead.");
+            }
+            const slugRes = await rpcClient.generateEpisodeSlug({
+              summary: content,
+              agentWs: _singleton!.resolvedAgentWs,
+              topics,
+              tags: ["manual-save"],
+              edges: [],
+              savedBy: agentId
+            });
 
             return {
               content: [{ type: "text", text: `Got it — filed that away at ${slugRes.path}` }],

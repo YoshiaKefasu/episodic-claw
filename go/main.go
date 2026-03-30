@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,12 +27,12 @@ import (
 	"golang.org/x/time/rate"
 )
 
-
 var (
-	storeMutex       sync.Mutex
-	isConsolidating  int32
-	writeMu          sync.Mutex // Atomize writes to net.Conn
-	vectorStores     = make(map[string]*vector.Store)
+	storeMutex      sync.Mutex
+	isConsolidating int32
+	isReplaying     int32
+	writeMu         sync.Mutex // Atomize writes to net.Conn
+	vectorStores    = make(map[string]*vector.Store)
 
 	// Global rate limiters to respect Google AI Studio quotas across all handlers
 	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 1)  // 15 RPM
@@ -151,7 +152,7 @@ var logMu sync.Mutex
 
 func EmitLog(format string, a ...interface{}) {
 	msg := fmt.Sprintf("[Episodic-Core] "+format, a...)
-	
+
 	// Always write to stderr so TS can intercept or print
 	fmt.Fprintln(os.Stderr, msg)
 
@@ -232,7 +233,7 @@ func handleWatcherStart(conn net.Conn, req RPCRequest) {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{-32000, "Failed to watch dir: " + err.Error()}, ID: req.ID})
 		return
 	}
-	
+
 	globalWatcherMu.Unlock()
 
 	// Eagerly initialize the vector store so the AsyncHealingWorker starts up immediately
@@ -270,8 +271,8 @@ func handleFrontmatterParse(conn net.Conn, req RPCRequest) {
 // RebuildResult is the structured result of a runAutoRebuild call.
 // Returned both in the RPC response (handleIndexerRebuild) and for internal callers.
 type RebuildResult struct {
-	Processed     int  `json:"processed"`      // files successfully embedded and indexed
-	Failed        int  `json:"failed"`         // files that failed for any reason
+	Processed      int  `json:"processed"`       // files successfully embedded and indexed
+	Failed         int  `json:"failed"`          // files that failed for any reason
 	CircuitTripped bool `json:"circuit_tripped"` // true if Circuit Breaker opened (3 consecutive 429s)
 	DelegatedCount int  `json:"delegated_count"` // estimated number of skipped files delegated to HealingWorker
 }
@@ -313,14 +314,14 @@ func handleIndexerRebuild(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 }
 
-
 // runAutoRebuild performs the background reconstruction of the HNSW index from local markdown files.
 // Used both by the manual indexer rebuild RPC, and optionally as a Self-Healing DB fallback.
 //
 // ⚠️  P2 ARCHITECTURE: Sequential batch processing (no goroutines in main loop).
-//     Files are processed in groups of batchSize via EmbedContentBatch (1 HTTP request per group).
-//     Circuit Breaker trips after circuitThreshold consecutive 429 batch responses.
-//     Worst case wasted API calls = circuitThreshold × batchSize before circuit trips.
+//
+//	Files are processed in groups of batchSize via EmbedContentBatch (1 HTTP request per group).
+//	Circuit Breaker trips after circuitThreshold consecutive 429 batch responses.
+//	Worst case wasted API calls = circuitThreshold × batchSize before circuit trips.
 //
 // OPERATIONAL NOTE: embedLimiter (100 RPM) is shared with handleIngest, handleBatchIngest,
 // handleRecall, and RunConsolidation. During active conversation sessions, rebuild throughput
@@ -423,12 +424,27 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 			continue
 		}
 
+		embedItems := make([]batchItem, 0, len(items))
+		texts := make([]string, 0, len(items))
+		for _, item := range items {
+			if strings.TrimSpace(item.doc.Body) == "" {
+				EmitLog("Rebuild: skipped empty body for %s", item.path)
+				failed++
+				continue
+			}
+			embedItems = append(embedItems, item)
+			texts = append(texts, item.doc.Body)
+		}
+		if len(embedItems) == 0 {
+			continue
+		}
+
 		// embedLimiter: 1 token = 1 HTTP request (batch counts as 1 RPM).
 		embedCtx, embedCancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := embedLimiter.Wait(embedCtx); err != nil {
 			embedCancel()
-			EmitLog("Rebuild: embedLimiter timeout for batch[%d], skipping %d items: %v", i-len(items), len(items), err)
-			failed += len(items)
+			EmitLog("Rebuild: embedLimiter timeout for batch[%d], skipping %d items: %v", i-len(items), len(embedItems), err)
+			failed += len(embedItems)
 			continue
 		}
 		embedCancel()
@@ -437,12 +453,12 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 		// burst=15K ≥ MaxEmbedRunes=8K so each WaitN(ctx, MaxEmbedRunes) fits in one burst.
 		// recall is intentionally excluded — queries are short and user-latency-sensitive.
 		tpmOK := true
-		for _, item := range items {
+		for _, item := range embedItems {
 			tpmCtx, tpmCancel := context.WithTimeout(ctx, 60*time.Second)
 			if err := tpmLimiter.WaitN(tpmCtx, ai.MaxEmbedRunes); err != nil {
 				tpmCancel()
 				EmitLog("Rebuild: tpmLimiter timeout for %s in batch, skipping batch: %v", item.path, err)
-				failed += len(items)
+				failed += len(embedItems)
 				tpmOK = false
 				break
 			}
@@ -453,13 +469,9 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 		}
 
 		// Batch embed: 1 HTTP request for all items in this batch.
-		texts := make([]string, len(items))
-		for j, item := range items {
-			texts[j] = item.doc.Body
-		}
 		embs, err := provider.EmbedContentBatch(ctx, texts)
 		if err != nil {
-			failed += len(items)
+			failed += len(embedItems)
 			if ai.IsRateLimitError(err) {
 				// 429 / RESOURCE_EXHAUSTED: count toward circuit threshold.
 				consecutiveFails429++
@@ -476,16 +488,18 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 		}
 
 		// Store results — guard against short API response.
-		if len(embs) != len(items) {
-			EmitLog("Rebuild: batch response length mismatch (got %d, want %d), skipping batch", len(embs), len(items))
-			failed += len(items)
+		if len(embs) != len(embedItems) {
+			EmitLog("Rebuild: batch response length mismatch (got %d, want %d), skipping batch", len(embs), len(embedItems))
+			failed += len(embedItems)
 			continue
 		}
-		for j, item := range items {
+		for j, item := range embedItems {
+			topics := topicsForRecord(item.doc.Metadata.Topics, item.doc.Metadata.Tags)
 			if err := vstore.Add(ctx, vector.EpisodeRecord{
 				ID:         item.doc.Metadata.ID,
 				Title:      item.doc.Metadata.Title,
 				Tags:       item.doc.Metadata.Tags,
+				Topics:     topics,
 				Timestamp:  item.modTime,
 				Edges:      item.doc.Metadata.RelatedTo,
 				Vector:     embs[j],
@@ -515,8 +529,8 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 	}
 
 	return RebuildResult{
-		Processed:     processed,
-		Failed:        failed,
+		Processed:      processed,
+		Failed:         failed,
 		CircuitTripped: circuitTripped,
 		DelegatedCount: delegatedCount,
 	}
@@ -534,13 +548,18 @@ func handleSurprise(conn net.Conn, req RPCRequest) {
 		return
 	}
 
+	if strings.TrimSpace(params.Text1) == "" || strings.TrimSpace(params.Text2) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "text1/text2 must not be empty"}, ID: req.ID})
+		return
+	}
+
 	apiKey := params.APIKey
 	if apiKey == "" {
 		apiKey = os.Getenv("GEMINI_API_KEY")
 	}
 
 	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
-	
+
 	ctx := context.Background()
 	emb1, err := provider.EmbedContent(ctx, params.Text1)
 	if err != nil {
@@ -557,6 +576,177 @@ func handleSurprise(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]float32{"surprise": dist}, ID: req.ID})
 }
 
+func handleSegmentScore(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs           string  `json:"agentWs"`
+		AgentId           string  `json:"agentId"`
+		Turn              int     `json:"turn"`
+		Text1             string  `json:"text1"`
+		Text2             string  `json:"text2"`
+		Lambda            float64 `json:"lambda"`
+		WarmupCount       int     `json:"warmupCount"`
+		MinRawSurprise    float64 `json:"minRawSurprise"`
+		CooldownTurns     int     `json:"cooldownTurns"`
+		StdFloor          float64 `json:"stdFloor"`
+		FallbackThreshold float64 `json:"fallbackThreshold"`
+		APIKey            string  `json:"apiKey"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if strings.TrimSpace(params.AgentWs) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "agentWs must not be empty"}, ID: req.ID})
+		return
+	}
+	if strings.TrimSpace(params.Text1) == "" || strings.TrimSpace(params.Text2) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "text1/text2 must not be empty"}, ID: req.ID})
+		return
+	}
+
+	apiKey := params.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("GEMINI_API_KEY")
+	}
+
+	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
+	ctx := context.Background()
+	emb1, err := provider.EmbedContent(ctx, params.Text1)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed text1 embed: " + err.Error()}, ID: req.ID})
+		return
+	}
+	emb2, err := provider.EmbedContent(ctx, params.Text2)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed text2 embed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	raw := float64(vector.CosineDistance(emb1, emb2))
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed to open store: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	st, _ := vstore.GetSegmentationState(params.AgentId)
+
+	// Decision uses the current state (pre-update).
+	fallback := params.FallbackThreshold
+	if fallback <= 0 {
+		fallback = 0.2
+	}
+	lambda := params.Lambda
+	if lambda <= 0 {
+		lambda = 2.0
+	}
+	warmup := params.WarmupCount
+	if warmup <= 0 {
+		warmup = 20
+	}
+	minRaw := params.MinRawSurprise
+	if minRaw <= 0 {
+		minRaw = 0.05
+	}
+	cooldown := params.CooldownTurns
+	if cooldown < 0 {
+		cooldown = 0
+	}
+
+	mean := st.Mean
+	stdFloor := params.StdFloor
+	if stdFloor <= 0 {
+		stdFloor = 0.01
+	}
+	varFloor := stdFloor * stdFloor
+	if varFloor < 1e-8 {
+		varFloor = 1e-8
+	}
+	variance := st.Variance
+	if variance < varFloor {
+		variance = varFloor
+	}
+	std := math.Sqrt(variance)
+
+	threshold := fallback
+	reason := "warmup"
+	inWarmup := st.Count < warmup
+	if !inWarmup {
+		threshold = mean + (lambda * std)
+		if threshold < fallback {
+			threshold = fallback
+		}
+		reason = "surprise-z"
+	}
+
+	z := 0.0
+	if std > 0 {
+		z = (raw - mean) / std
+	}
+
+	isBoundary := false
+	if !inWarmup {
+		isBoundary = raw >= minRaw && raw > threshold
+		if isBoundary && cooldown > 0 && st.LastBoundaryTurn > 0 && params.Turn > 0 {
+			if params.Turn-st.LastBoundaryTurn <= cooldown {
+				isBoundary = false
+				reason = "cooldown"
+			}
+		}
+		if !isBoundary && reason == "surprise-z" {
+			reason = "below-threshold"
+		}
+	}
+
+	// Update state (EMA-ish) after the decision, then persist.
+	// This is intentionally lightweight (O(1)) and tolerant to restarts.
+	update := func(prev vector.SegmentationState, x float64) vector.SegmentationState {
+		// Effective window for adaptation (small enough to track per-conversation drift).
+		const win = 50
+		prev.Count++
+		if prev.Count <= 1 {
+			prev.Mean = x
+			prev.Variance = 0
+			return prev
+		}
+		eff := prev.Count
+		if eff > win {
+			eff = win
+		}
+		alpha := 2.0 / float64(eff+1)
+		delta := x - prev.Mean
+		prev.Mean += alpha * delta
+		// EW variance update. Clamp at 0 to avoid tiny negative drift.
+		prev.Variance = (1 - alpha) * (prev.Variance + (alpha * delta * delta))
+		if prev.Variance < 0 {
+			prev.Variance = 0
+		}
+		return prev
+	}
+
+	st = update(st, raw)
+	if isBoundary && params.Turn > 0 {
+		st.LastBoundaryTurn = params.Turn
+	}
+	_ = vstore.PutSegmentationState(params.AgentId, st)
+
+	sendResponse(conn, RPCResponse{
+		JSONRPC: "2.0",
+		Result: map[string]any{
+			"rawSurprise": raw,
+			"mean":        mean,
+			"std":         std,
+			"threshold":   threshold,
+			"z":           z,
+			"isBoundary":  isBoundary,
+			"reason":      reason,
+		},
+		ID: req.ID,
+	})
+}
+
 func ensureSavedBy(in string) string {
 	if in == "" {
 		return "auto"
@@ -564,10 +754,19 @@ func ensureSavedBy(in string) string {
 	return in
 }
 
+func topicsForRecord(topics []string, legacyTags []string) []string {
+	clean, _ := vector.ValidateTopics(topics)
+	if len(clean) > 0 {
+		return clean
+	}
+	return vector.LegacyTopicsFromTags(legacyTags)
+}
+
 func handleIngest(conn net.Conn, req RPCRequest) {
 	var params struct {
 		Summary  string             `json:"summary"`
 		Tags     []string           `json:"tags"`
+		Topics   []string           `json:"topics"`
 		Edges    []frontmatter.Edge `json:"edges"`
 		AgentWs  string             `json:"agentWs"`
 		APIKey   string             `json:"apiKey"`
@@ -598,7 +797,7 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	savedBy := ensureSavedBy(params.SavedBy)
 
 	ctx := context.Background()
-	
+
 	// Safe Phase 1: Skip Gemma generation, immediately use MD5 slug for safe queueing
 	// Fix CRITICAL-1: Use full 128-bit MD5 to avoid birthday paradox collisions
 	hash := md5.Sum([]byte(params.Summary))
@@ -607,23 +806,25 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 
 	// Build the path YYYY/MM/DD
 	now := time.Now()
-	dirPath := filepath.Join(params.AgentWs, 
-		fmt.Sprintf("%04d", now.Year()), 
-		fmt.Sprintf("%02d", now.Month()), 
+	dirPath := filepath.Join(params.AgentWs,
+		fmt.Sprintf("%04d", now.Year()),
+		fmt.Sprintf("%02d", now.Month()),
 		fmt.Sprintf("%02d", now.Day()))
-	
+
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Mkdir failed: " + err.Error()}, ID: req.ID})
 		return
 	}
 
 	filePath := filepath.Join(dirPath, slug+".md")
+	topics := topicsForRecord(params.Topics, params.Tags)
 
 	fm := frontmatter.EpisodeMetadata{
 		ID:        slug,
 		Title:     slug,
 		Created:   now,
 		Tags:      params.Tags,
+		Topics:    topics,
 		SavedBy:   savedBy,
 		Surprise:  params.Surprise,
 		Depth:     params.Depth,
@@ -673,7 +874,6 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	}
 	cancel() // release context immediately
 
-
 	// Only serialize AFTER embedding logic completes (success or fail - Survival First)
 	if err := frontmatter.Serialize(filePath, doc); err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Serialize failed: " + err.Error()}, ID: req.ID})
@@ -686,22 +886,23 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 		// Only add to vector store if embedding was successful
 		if embedErr == nil && emb != nil {
 			vstore.Add(ctx, vector.EpisodeRecord{
-				ID:        slug,
-				Title:     slug,
-				Tags:      params.Tags,
-				Timestamp: now,
-				Edges:     params.Edges,
-				Vector:    emb,
+				ID:         slug,
+				Title:      slug,
+				Tags:       params.Tags,
+				Topics:     topics,
+				Timestamp:  now,
+				Edges:      params.Edges,
+				Vector:     emb,
 				SourcePath: filePath,
-				Depth:     params.Depth,
-				Tokens:    frontmatter.EstimateTokens(params.Summary),
-				Surprise:  params.Surprise,
+				Depth:      params.Depth,
+				Tokens:     frontmatter.EstimateTokens(params.Summary),
+				Surprise:   params.Surprise,
 			})
 		} else {
 			EmitLog("Ingest: Skipping vector store add due to embedding failure or timeout. Triggering healing.")
 			triggerHealing() // Wake up background worker to heal
 		}
-		
+
 		// Update last_activity for Sleep Timer
 		vstore.SetMeta("last_activity", []byte(fmt.Sprintf("%d", now.Unix())))
 	}
@@ -744,6 +945,7 @@ func auditEpisodeQuality(slug string) error {
 type BatchIngestItem struct {
 	Summary  string             `json:"summary"`
 	Tags     []string           `json:"tags"`
+	Topics   []string           `json:"topics,omitempty"`
 	Edges    []frontmatter.Edge `json:"edges"`
 	Surprise float64            `json:"surprise,omitempty"`
 	Depth    int                `json:"depth,omitempty"`
@@ -753,10 +955,10 @@ type BatchIngestItem struct {
 
 func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	var params struct {
-		Items   []BatchIngestItem  `json:"items"`
-		AgentWs string             `json:"agentWs"`
-		APIKey  string             `json:"apiKey"`
-		SavedBy string             `json:"savedBy"`
+		Items   []BatchIngestItem `json:"items"`
+		AgentWs string            `json:"agentWs"`
+		APIKey  string            `json:"apiKey"`
+		SavedBy string            `json:"savedBy"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
@@ -789,6 +991,11 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 		wg.Add(1)
 		go func(it BatchIngestItem) {
 			defer wg.Done()
+			if strings.TrimSpace(it.Summary) == "" {
+				EmitLog("BatchIngest: skipped empty summary item")
+				return
+			}
+
 			// P2-E FIX: Lower semaphore per user's recommendation to reduce burst 429
 			// sem := make(chan struct{}, 2) // already changed above, waiting on the channel
 			sem <- struct{}{}
@@ -803,7 +1010,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			// P1-E FIX: Embed FIRST before writing Markdown to disk.
 			// We only sync-wait a max of 5 seconds to avoid RPC timeout (WARNING-3)
 			embedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			
+
 			var emb []float32
 			var embErr error
 			if waitErr := embedLimiter.Wait(embedCtx); waitErr != nil {
@@ -828,12 +1035,14 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 
 			os.MkdirAll(dirPath, 0755)
 			filePath := filepath.Join(dirPath, slug+".md")
+			topics := topicsForRecord(it.Topics, it.Tags)
 
 			fm := frontmatter.EpisodeMetadata{
 				ID:        slug,
 				Title:     slug,
 				Created:   now,
 				Tags:      it.Tags,
+				Topics:    topics,
 				SavedBy:   savedBy,
 				Surprise:  it.Surprise,
 				Depth:     it.Depth,
@@ -857,6 +1066,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 					ID:         slug,
 					Title:      slug,
 					Tags:       it.Tags,
+					Topics:     topics,
 					Timestamp:  now,
 					Edges:      it.Edges,
 					Vector:     emb,
@@ -941,13 +1151,12 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		}
 	}
 
-
 	filepath.WalkDir(agentWs, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		name := d.Name()
-		
+
 		if d.IsDir() {
 			if name == "node_modules" || name == ".git" {
 				return filepath.SkipDir
@@ -959,7 +1168,7 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		if !strings.HasPrefix(name, "episode-") || !strings.HasSuffix(name, ".md") {
 			return nil
 		}
-		
+
 		l := len(name)
 		if l < 19 || l > 43 {
 			return nil
@@ -976,202 +1185,213 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		}
 
 		info, iErr := d.Info()
-			if iErr != nil {
+		if iErr != nil {
+			return nil
+		}
+		if time.Since(info.ModTime()) < 5*time.Minute {
+			// Wait 5 minutes before repairing to prevent ingest race conditions.
+			return nil
+		}
+		doc, parseErr := frontmatter.Parse(path)
+		if parseErr != nil {
+			EmitLog("HealingWorker: Failed to parse %s: %v", path, parseErr)
+			return nil
+		}
+
+		if doc.Metadata.RefineFailed {
+			return nil // Skip this poison pill
+		}
+
+		existingRec, vErr := vstore.Get(slug)
+		isHealed := false
+
+		// ----------------------------------------------------
+		// Pass 1: Healing (Embedding Generation for Ghost Files)
+		// ----------------------------------------------------
+		if vErr != nil || existingRec == nil {
+			// Skip Pass 1 if heal429 backoff is active
+			if h429.Count >= heal429Threshold {
+				EmitLog("HealingWorker: [Pass 1] Skipping %s — heal_429 backoff active.", slug)
 				return nil
 			}
-			if time.Since(info.ModTime()) < 5 * time.Minute {
-				// Wait 5 minutes before repairing to prevent ingest race conditions.
+
+			EmitLog("HealingWorker: [Pass 1] %s not in DB. Generating embedding.", slug)
+
+			if strings.TrimSpace(doc.Body) == "" {
+				EmitLog("HealingWorker: skipped empty body for %s", slug)
 				return nil
 			}
-			doc, parseErr := frontmatter.Parse(path)
-			if parseErr != nil {
-				EmitLog("HealingWorker: Failed to parse %s: %v", path, parseErr)
-				return nil
-			}
 
-			if doc.Metadata.RefineFailed {
-				return nil // Skip this poison pill
-			}
-
-			existingRec, vErr := vstore.Get(slug)
-			isHealed := false
-
-			// ----------------------------------------------------
-			// Pass 1: Healing (Embedding Generation for Ghost Files)
-			// ----------------------------------------------------
-			if vErr != nil || existingRec == nil {
-				// Skip Pass 1 if heal429 backoff is active
-				if h429.Count >= heal429Threshold {
-					EmitLog("HealingWorker: [Pass 1] Skipping %s — heal_429 backoff active.", slug)
-					return nil
-				}
-
-				EmitLog("HealingWorker: [Pass 1] %s not in DB. Generating embedding.", slug)
-				
-				embedCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				if wErr := healEmbedLimiter.Wait(embedCtx); wErr != nil {
-					EmitLog("HealingWorker: healEmbedLimiter timeout, skipping Pass 1 for now.")
-					cancel()
-					return nil
-				}
-
-				// TPM guard: same fixed cost as rebuild — worst-case Japanese token count.
-				tpmHealCtx, tpmHealCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				if wErr := tpmLimiter.WaitN(tpmHealCtx, ai.MaxEmbedRunes); wErr != nil {
-					EmitLog("HealingWorker: tpmLimiter timeout, skipping Pass 1 for %s.", slug)
-					tpmHealCancel()
-					cancel()
-					return nil
-				}
-				tpmHealCancel()
-
-				emb, embErr := embedProv.EmbedContent(context.Background(), doc.Body)
+			embedCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if wErr := healEmbedLimiter.Wait(embedCtx); wErr != nil {
+				EmitLog("HealingWorker: healEmbedLimiter timeout, skipping Pass 1 for now.")
 				cancel()
-				
-				if embErr != nil {
-					if ai.IsRateLimitError(embErr) {
-						// 429: increment heal_429 counter
-						if h429.Count == 0 {
-							h429.Since = time.Now()
-						}
-						h429.Count++
-						saveH429()
-						EmitLog("HealingWorker: 429 for %s (heal_429 count=%d/%d, since=%s)",
-							slug, h429.Count, heal429Threshold, h429.Since.Format(time.RFC3339))
-					} else {
-						// Non-429 error (parse/timeout/network): API is alive, reset counter
-						h429 = heal429State{}
-						saveH429()
-						EmitLog("HealingWorker: Non-429 error for %s (heal_429 reset): %v", slug, embErr)
-					}
-					return nil
-				}
-				// Embed succeeded: full reset
-				h429 = heal429State{}
-				saveH429()
-
-				newRec := vector.EpisodeRecord{
-					ID:         slug,
-					Title:      slug,
-					Tags:       doc.Metadata.Tags,
-					Timestamp:  info.ModTime(),
-					Edges:      doc.Metadata.RelatedTo,
-					Vector:     emb,
-					SourcePath: path,
-					Depth:      doc.Metadata.Depth,
-					Tokens:     doc.Metadata.Tokens,
-					Surprise:   doc.Metadata.Surprise,
-				}
-				if addErr := vstore.Add(context.Background(), newRec); addErr != nil {
-					EmitLog("HealingWorker: Failed to add healed record %s: %v", slug, addErr)
-					return nil
-				}
-				EmitLog("HealingWorker: Successfully healed (Pass 1) for %s", slug)
-				existingRec = &newRec
-				isHealed = true
-			}
-
-			// ----------------------------------------------------
-			// Pass 2: Refining (Gemma Rename for valid MD5 files)
-			// ----------------------------------------------------
-			// If we just healed it and wait limits apply, or it was already in DB.
-			EmitLog("HealingWorker: [Pass 2] Refining slug for %s", slug)
-
-			gemmaCtx, gemmaCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if waitErr := gemmaLimiter.Wait(gemmaCtx); waitErr != nil {
-				gemmaCancel()
-				EmitLog("HealingWorker: gemmaLimiter wait timeout for Pass 2, skipping slug refine for %s", slug)
 				return nil
 			}
-			gemmaCancel()
 
-			bodyText := doc.Body
-			ru := []rune(bodyText)
-			if len(ru) > 4000 {
-				bodyText = string(ru[:4000]) + "\n... (truncated for slug generation)"
+			// TPM guard: same fixed cost as rebuild — worst-case Japanese token count.
+			tpmHealCtx, tpmHealCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			if wErr := tpmLimiter.WaitN(tpmHealCtx, ai.MaxEmbedRunes); wErr != nil {
+				EmitLog("HealingWorker: tpmLimiter timeout, skipping Pass 1 for %s.", slug)
+				tpmHealCancel()
+				cancel()
+				return nil
 			}
+			tpmHealCancel()
 
-			prompt := "You are a helpful assistant. Generate a 2 to 5 word lowercase kebab-case slug (using English words only, no Japanese or other non-ASCII characters) representing the topic of this context summary. IMPORTANT: Your response MUST be in English only. Output nothing but the slug itself (e.g., 'system-architecture-update').\n\nSummary: " + bodyText
+			emb, embErr := embedProv.EmbedContent(context.Background(), doc.Body)
+			cancel()
 
-			var newSlug string
-			for attempt := 0; attempt < 3; attempt++ {
-				if attempt > 0 {
-					time.Sleep(10 * time.Second)
-					retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					if waitErr := gemmaLimiter.Wait(retryCtx); waitErr != nil {
-						retryCancel()
-						EmitLog("HealingWorker: gemmaLimiter retry timeout, aborting Pass 2 for %s", slug)
-						break
+			if embErr != nil {
+				if ai.IsRateLimitError(embErr) {
+					// 429: increment heal_429 counter
+					if h429.Count == 0 {
+						h429.Since = time.Now()
 					}
+					h429.Count++
+					saveH429()
+					EmitLog("HealingWorker: 429 for %s (heal_429 count=%d/%d, since=%s)",
+						slug, h429.Count, heal429Threshold, h429.Since.Format(time.RFC3339))
+				} else {
+					// Non-429 error (parse/timeout/network): API is alive, reset counter
+					h429 = heal429State{}
+					saveH429()
+					EmitLog("HealingWorker: Non-429 error for %s (heal_429 reset): %v", slug, embErr)
+				}
+				return nil
+			}
+			// Embed succeeded: full reset
+			h429 = heal429State{}
+			saveH429()
+
+			newRec := vector.EpisodeRecord{
+				ID:         slug,
+				Title:      slug,
+				Tags:       doc.Metadata.Tags,
+				Topics:     topicsForRecord(doc.Metadata.Topics, doc.Metadata.Tags),
+				Timestamp:  info.ModTime(),
+				Edges:      doc.Metadata.RelatedTo,
+				Vector:     emb,
+				SourcePath: path,
+				Depth:      doc.Metadata.Depth,
+				Tokens:     doc.Metadata.Tokens,
+				Surprise:   doc.Metadata.Surprise,
+			}
+			if addErr := vstore.Add(context.Background(), newRec); addErr != nil {
+				EmitLog("HealingWorker: Failed to add healed record %s: %v", slug, addErr)
+				return nil
+			}
+			EmitLog("HealingWorker: Successfully healed (Pass 1) for %s", slug)
+			existingRec = &newRec
+			isHealed = true
+		}
+
+		// ----------------------------------------------------
+		// Pass 2: Refining (Gemma Rename for valid MD5 files)
+		// ----------------------------------------------------
+		// If we just healed it and wait limits apply, or it was already in DB.
+		EmitLog("HealingWorker: [Pass 2] Refining slug for %s", slug)
+
+		gemmaCtx, gemmaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if waitErr := gemmaLimiter.Wait(gemmaCtx); waitErr != nil {
+			gemmaCancel()
+			EmitLog("HealingWorker: gemmaLimiter wait timeout for Pass 2, skipping slug refine for %s", slug)
+			return nil
+		}
+		gemmaCancel()
+
+		bodyText := doc.Body
+		ru := []rune(bodyText)
+		if len(ru) > 4000 {
+			bodyText = string(ru[:4000]) + "\n... (truncated for slug generation)"
+		}
+
+		prompt := "You are a helpful assistant. Generate a 2 to 5 word lowercase kebab-case slug (using English words only, no Japanese or other non-ASCII characters) representing the topic of this context summary. IMPORTANT: Your response MUST be in English only. Output nothing but the slug itself (e.g., 'system-architecture-update').\n\nSummary: " + bodyText
+
+		var newSlug string
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(10 * time.Second)
+				retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if waitErr := gemmaLimiter.Wait(retryCtx); waitErr != nil {
 					retryCancel()
-				}
-				slugGen, genErr := gemmaProv.GenerateText(context.Background(), prompt)
-				if genErr != nil {
-					continue
-				}
-				slugGen = strings.TrimSpace(strings.ToLower(strings.Trim(slugGen, "`")))
-				if auditEpisodeQuality(slugGen) == nil {
-					newSlug = slugGen
+					EmitLog("HealingWorker: gemmaLimiter retry timeout, aborting Pass 2 for %s", slug)
 					break
 				}
+				retryCancel()
 			}
+			slugGen, genErr := gemmaProv.GenerateText(context.Background(), prompt)
+			if genErr != nil {
+				continue
+			}
+			slugGen = strings.TrimSpace(strings.ToLower(strings.Trim(slugGen, "`")))
+			if auditEpisodeQuality(slugGen) == nil {
+				newSlug = slugGen
+				break
+			}
+		}
 
-			if newSlug == "" {
-				EmitLog("HealingWorker: Could not generate valid slug for %s (Poison Pill), marking as refine_failed.", slug)
-				doc.Metadata.RefineFailed = true
-				if writeErr := frontmatter.Serialize(path, doc); writeErr != nil {
-					EmitLog("HealingWorker: Failed to write refine_failed flag to %s: %v", path, writeErr)
-				}
-				return nil
+		if newSlug == "" {
+			EmitLog("HealingWorker: Could not generate valid slug for %s (Poison Pill), marking as refine_failed.", slug)
+			doc.Metadata.RefineFailed = true
+			if writeErr := frontmatter.Serialize(path, doc); writeErr != nil {
+				EmitLog("HealingWorker: Failed to write refine_failed flag to %s: %v", path, writeErr)
 			}
+			return nil
+		}
 
-			// 1. Rewrite the file to a new path
-			dirPath := filepath.Dir(path)
-			newPath := filepath.Join(dirPath, newSlug+".md")
-			
-			doc.Metadata.ID = newSlug
-			doc.Metadata.Title = newSlug
+		// 1. Rewrite the file to a new path
+		dirPath := filepath.Dir(path)
+		newPath := filepath.Join(dirPath, newSlug+".md")
 
-			if writeErr := frontmatter.Serialize(newPath, doc); writeErr != nil {
-				EmitLog("HealingWorker: Failed to write new file %s: %v", newPath, writeErr)
-				return nil
-			}
+		doc.Metadata.ID = newSlug
+		doc.Metadata.Title = newSlug
+		doc.Metadata.Topics = topicsForRecord(doc.Metadata.Topics, doc.Metadata.Tags)
 
-			// 2. Add new record derived from existingRec (healed or original)
-			newRec := *existingRec
-			newRec.ID = newSlug
-			newRec.Title = newSlug
-			newRec.SourcePath = newPath
-			newRec.Depth = doc.Metadata.Depth
-			newRec.Tokens = doc.Metadata.Tokens
-			newRec.Surprise = doc.Metadata.Surprise
-			if err := vstore.Add(context.Background(), newRec); err != nil {
-				EmitLog("HealingWorker: Failed to add renamed record %s: %v", newSlug, err)
-				os.Remove(newPath) // Rollback file
-				return nil
-			}
-			
-			// 3. Delete old record
-			vstore.Delete(slug)
-			
-			// 4. Delete old local file
-			os.Remove(path)
-			EmitLog("HealingWorker: Successfully refined (Pass 2) %s -> %s", slug, newSlug)
-			
-			// Small breath if we did heavy work
-			if isHealed {
-				time.Sleep(1 * time.Second)
-			}
+		if writeErr := frontmatter.Serialize(newPath, doc); writeErr != nil {
+			EmitLog("HealingWorker: Failed to write new file %s: %v", newPath, writeErr)
+			return nil
+		}
+
+		// 2. Add new record derived from existingRec (healed or original)
+		newRec := *existingRec
+		newRec.ID = newSlug
+		newRec.Title = newSlug
+		newRec.Topics = topicsForRecord(doc.Metadata.Topics, doc.Metadata.Tags)
+		newRec.SourcePath = newPath
+		newRec.Depth = doc.Metadata.Depth
+		newRec.Tokens = doc.Metadata.Tokens
+		newRec.Surprise = doc.Metadata.Surprise
+		if err := vstore.Add(context.Background(), newRec); err != nil {
+			EmitLog("HealingWorker: Failed to add renamed record %s: %v", newSlug, err)
+			os.Remove(newPath) // Rollback file
+			return nil
+		}
+
+		// 3. Delete old record
+		vstore.Delete(slug)
+
+		// 4. Delete old local file
+		os.Remove(path)
+		EmitLog("HealingWorker: Successfully refined (Pass 2) %s -> %s", slug, newSlug)
+
+		// Small breath if we did heavy work
+		if isHealed {
+			time.Sleep(1 * time.Second)
+		}
 		return nil
 	})
 }
 
 func handleRecall(conn net.Conn, req RPCRequest) {
 	var params struct {
-		Query   string `json:"query"`
-		K       int    `json:"k"`
-		AgentWs string `json:"agentWs"`
-		APIKey  string `json:"apiKey"`
+		Query        string                    `json:"query"`
+		K            int                       `json:"k"`
+		Topics       []string                  `json:"topics,omitempty"`
+		StrictTopics *bool                     `json:"strictTopics,omitempty"`
+		Calibration  *vector.RecallCalibration `json:"calibration,omitempty"`
+		AgentWs      string                    `json:"agentWs"`
+		APIKey       string                    `json:"apiKey"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
@@ -1185,6 +1405,11 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 
 	if params.K <= 0 {
 		params.K = 5
+	}
+
+	if strings.TrimSpace(params.Query) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "query must not be empty"}, ID: req.ID})
+		return
 	}
 
 	vstore, err := getStore(params.AgentWs)
@@ -1211,14 +1436,111 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 		return
 	}
 
+	now := time.Now()
+	// Default behavior: topics is a soft hint (boost-only). Use strict facet filtering only when explicitly requested.
+	strictTopics := false
+	if params.StrictTopics != nil {
+		strictTopics = *params.StrictTopics
+	}
 
-	results, err := vstore.Recall(emb, params.K, time.Now())
+	results, err := vstore.RecallWithTopicsMode(emb, params.K, now, params.Topics, strictTopics, params.Calibration)
 	if err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Recall failed: " + err.Error()}, ID: req.ID})
 		return
 	}
 
+	if len(results) > 0 {
+		for idx, res := range results {
+			id := res.Record.ID
+			if id == "" {
+				continue
+			}
+			_ = vstore.RecordRecall(id, now, idx+1)
+		}
+	}
+
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: results, ID: req.ID})
+}
+
+func normalizeStringSlice(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		key := strings.ToLower(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func handleRecallFeedback(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs    string   `json:"agentWs"`
+		FeedbackID string   `json:"feedbackId"`
+		QueryHash  string   `json:"queryHash,omitempty"`
+		Shown      []string `json:"shown,omitempty"`
+		Used       []string `json:"used,omitempty"`
+		Expanded   []string `json:"expanded,omitempty"`
+		Source     string   `json:"source,omitempty"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if strings.TrimSpace(params.AgentWs) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "agentWs must not be empty"}, ID: req.ID})
+		return
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	feedbackID := strings.TrimSpace(params.FeedbackID)
+	if feedbackID != "" {
+		feedbackKey := []byte("meta:recall_feedback:" + feedbackID)
+		if _, closer, metaErr := vstore.GetRawMeta(feedbackKey); metaErr == nil {
+			if closer != nil {
+				closer.Close()
+			}
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]int{"updated": 0, "skipped": 1}, ID: req.ID})
+			return
+		}
+	}
+
+	now := time.Now()
+	stored := map[string]any{
+		"agentWs":    params.AgentWs,
+		"feedbackId": feedbackID,
+		"queryHash":  strings.TrimSpace(params.QueryHash),
+		"shown":      normalizeStringSlice(params.Shown),
+		"used":       normalizeStringSlice(params.Used),
+		"expanded":   normalizeStringSlice(params.Expanded),
+		"source":     strings.TrimSpace(params.Source),
+		"occurredAt": now.UTC().Format(time.RFC3339Nano),
+	}
+	raw, _ := json.Marshal(stored)
+	if feedbackID != "" {
+		_ = vstore.SetMeta("recall_feedback:"+feedbackID, raw)
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]int{
+		"updated":  1,
+		"skipped":  0,
+		"shown":    len(stored["shown"].([]string)),
+		"used":     len(stored["used"].([]string)),
+		"expanded": len(stored["expanded"].([]string)),
+	}, ID: req.ID})
 }
 
 func handleGetWatermark(conn net.Conn, req RPCRequest) {
@@ -1354,6 +1676,48 @@ func startSleepTimer(apiKey string) {
 	}()
 }
 
+func startReplayTimer(apiKey string) {
+	ticker := time.NewTicker(15 * time.Minute)
+	go func() {
+		for range ticker.C {
+			storeMutex.Lock()
+			snapshot := make(map[string]*vector.Store)
+			for k, v := range vectorStores {
+				snapshot[k] = v
+			}
+			storeMutex.Unlock()
+
+			for agentWs, vstore := range snapshot {
+				checkReplayThreshold(agentWs, vstore, apiKey)
+			}
+		}
+	}()
+}
+
+func checkReplayThreshold(agentWs string, vstore *vector.Store, apiKey string) {
+	if apiKey == "" {
+		return
+	}
+
+	if !atomic.CompareAndSwapInt32(&isReplaying, 0, 1) {
+		EmitLog("Skipping Replay Timer for %s, replay already in progress", agentWs)
+		return
+	}
+
+	go func(ws string, vs *vector.Store) {
+		defer atomic.StoreInt32(&isReplaying, 0)
+
+		replayCtx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+		defer cancel()
+
+		if err := vector.RunReplayScheduler(replayCtx, ws, apiKey, vs, gemmaLimiter); err != nil {
+			EmitLog("Replay scheduler error for %s: %v", ws, err)
+			return
+		}
+		_ = vs.SetMeta("last_replay", []byte(fmt.Sprintf("%d", time.Now().Unix())))
+	}(agentWs, vstore)
+}
+
 func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	val, closer, err := vstore.GetRawMeta([]byte("meta:last_activity"))
 	if err != nil || len(val) == 0 {
@@ -1362,7 +1726,7 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 		}
 		return
 	}
-	
+
 	var lastActivity int64
 	fmt.Sscanf(string(val), "%d", &lastActivity)
 	closer.Close()
@@ -1372,7 +1736,7 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	}
 
 	// 3 hours threshold
-	if time.Now().Unix() - lastActivity > 3 * 3600 {
+	if time.Now().Unix()-lastActivity > 3*3600 {
 		// Check if we already consolidated
 		val, closer, err = vstore.GetRawMeta([]byte("meta:last_consolidation"))
 		var lastConsolidation int64
@@ -1387,12 +1751,12 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 
 		if lastConsolidation < lastActivity {
 			EmitLog("Sleep Timer triggered for %s (Idle for >3h)", agentWs)
-			
+
 			// Fire consolidation job
 			if atomic.CompareAndSwapInt32(&isConsolidating, 0, 1) {
 				go func(ws string, vs *vector.Store) {
 					defer atomic.StoreInt32(&isConsolidating, 0)
-					
+
 					consolidationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 					defer cancel()
 
@@ -1420,7 +1784,7 @@ func handleConsolidate(conn net.Conn, req RPCRequest) {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
 		return
 	}
-	
+
 	apiKey := params.APIKey
 	if apiKey == "" {
 		apiKey = os.Getenv("GEMINI_API_KEY")
@@ -1433,14 +1797,14 @@ func handleConsolidate(conn net.Conn, req RPCRequest) {
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Consolidation Job Started", ID: req.ID})
-	
+
 	go func() {
 		if atomic.CompareAndSwapInt32(&isConsolidating, 0, 1) {
 			defer atomic.StoreInt32(&isConsolidating, 0)
-			
+
 			consolidationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			
+
 			err := vector.RunConsolidation(consolidationCtx, params.AgentWs, apiKey, vstore, gemmaLimiter, embedLimiter)
 			if err == nil {
 				vstore.SetMeta("last_consolidation", []byte(fmt.Sprintf("%d", time.Now().Unix())))
@@ -1450,6 +1814,47 @@ func handleConsolidate(conn net.Conn, req RPCRequest) {
 		} else {
 			EmitLog("Consolidation skipped: already running")
 		}
+	}()
+}
+
+func handleReplay(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		APIKey  string `json:"apiKey"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	apiKey := params.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("GEMINI_API_KEY")
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed"}, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Replay Scheduler Started", ID: req.ID})
+
+	go func() {
+		if !atomic.CompareAndSwapInt32(&isReplaying, 0, 1) {
+			EmitLog("Replay skipped: already running")
+			return
+		}
+		defer atomic.StoreInt32(&isReplaying, 0)
+
+		replayCtx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+		defer cancel()
+
+		if err := vector.RunReplayScheduler(replayCtx, params.AgentWs, apiKey, vstore, gemmaLimiter); err != nil {
+			EmitLog("Replay scheduler error (manual): %v", err)
+			return
+		}
+		_ = vstore.SetMeta("last_replay", []byte(fmt.Sprintf("%d", time.Now().Unix())))
 	}()
 }
 
@@ -1496,13 +1901,35 @@ func handleExpand(conn net.Conn, req RPCRequest) {
 		"body":     strings.Join(bodies, "\n---\n"),
 	}
 
+	now := time.Now()
+	_ = vstore.UpdateRecord(params.Slug, func(rec *vector.EpisodeRecord) error {
+		rec.Retrievals++
+		rec.Hits += 2
+		rec.LastRetrievedAt = now
+		rec.LastHitAt = now
+		return nil
+	})
+
+	obsID := fmt.Sprintf("expand:%s:%d", params.Slug, now.UnixNano())
+	if req.ID != nil {
+		obsID = fmt.Sprintf("expand:%s:%d", params.Slug, *req.ID)
+	}
+	_ = vstore.ApplyReplayObservation(vector.ReplayObservation{
+		ObservationID: obsID,
+		WorkspaceID:   params.AgentWs,
+		EpisodeID:     params.Slug,
+		Outcome:       "ExpandedGood",
+		OccurredAt:    now,
+		Source:        "ep-expand",
+	})
+
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 }
 
 func main() {
-    socketPath := flag.String("socket", "", "Path to unix domain socket or named pipe")
-    ppid := flag.Int("ppid", 0, "Parent Process ID to monitor for suicide")
-    flag.Parse()
+	socketPath := flag.String("socket", "", "Path to unix domain socket or named pipe")
+	ppid := flag.Int("ppid", 0, "Parent Process ID to monitor for suicide")
+	flag.Parse()
 
 	if *socketPath == "" {
 		EmitLog("Missing -socket argument")
@@ -1511,47 +1938,48 @@ func main() {
 
 	InitLogger()
 
-    if *ppid != 0 {
+	if *ppid != 0 {
 		// keeping flag for backwards compat, but watchdog now uses Stdin EOF
-        startWatchdog()
-    }
+		startWatchdog()
+	}
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	startSleepTimer(apiKey)
+	startReplayTimer(apiKey)
 
 	EmitLog("Starting Go Sidecar on socket %s", *socketPath)
 
-    // Setup listener depending on OS
-    var listener net.Listener
-    var err error
-    
-    if runtime.GOOS == "windows" {
-        // We will use standard TCP on loopback for Windows to avoid go-winio complexity if possible,
-        // or Named Pipes. For now, TCP localhost is highly reliable and standard.
-        listener, err = net.Listen("tcp", *socketPath)
-    } else {
-        listener, err = net.Listen("unix", *socketPath)
-    }
+	// Setup listener depending on OS
+	var listener net.Listener
+	var err error
 
-    if err != nil {
-        EmitLog("Failed to listen: %v", err)
-        os.Exit(1)
-    }
-    defer listener.Close()
+	if runtime.GOOS == "windows" {
+		// We will use standard TCP on loopback for Windows to avoid go-winio complexity if possible,
+		// or Named Pipes. For now, TCP localhost is highly reliable and standard.
+		listener, err = net.Listen("tcp", *socketPath)
+	} else {
+		listener, err = net.Listen("unix", *socketPath)
+	}
 
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            EmitLog("Failed to accept connection: %v", err)
-            continue
-        }
+	if err != nil {
+		EmitLog("Failed to listen: %v", err)
+		os.Exit(1)
+	}
+	defer listener.Close()
 
-        go handleConnection(conn)
-    }
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			EmitLog("Failed to accept connection: %v", err)
+			continue
+		}
+
+		go handleConnection(conn)
+	}
 }
 
 func handleConnection(conn net.Conn) {
-    defer conn.Close()
+	defer conn.Close()
 	defer func() {
 		globalWatcherMu.Lock()
 		if globalWatcherConn == conn && globalWatcher != nil {
@@ -1562,7 +1990,7 @@ func handleConnection(conn net.Conn) {
 		}
 		globalWatcherMu.Unlock()
 	}()
-    scanner := bufio.NewScanner(conn)
+	scanner := bufio.NewScanner(conn)
 	buf := make([]byte, 0, 1024*1024)
 	scanner.Buffer(buf, 4*1024*1024) // 4MB max
 
@@ -1585,12 +2013,16 @@ func handleConnection(conn net.Conn) {
 			go handleIndexerRebuild(conn, req)
 		case "ai.surprise":
 			go handleSurprise(conn, req)
+		case "ai.segmentScore":
+			go handleSegmentScore(conn, req)
 		case "ai.ingest":
 			go handleIngest(conn, req)
 		case "ai.batchIngest":
 			go handleBatchIngest(conn, req)
 		case "ai.recall":
 			go handleRecall(conn, req)
+		case "ai.recallFeedback":
+			go handleRecallFeedback(conn, req)
 		case "indexer.getWatermark":
 			go handleGetWatermark(conn, req)
 		case "indexer.setWatermark":
@@ -1601,6 +2033,8 @@ func handleConnection(conn net.Conn) {
 			go handleTriggerBackgroundIndex(conn, req)
 		case "ai.consolidate":
 			go handleConsolidate(conn, req)
+		case "ai.replay":
+			go handleReplay(conn, req)
 		case "ai.expand":
 			go handleExpand(conn, req)
 		case "ping":

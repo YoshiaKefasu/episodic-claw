@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -32,6 +33,10 @@ type APIError struct {
 	// Exported (P3) to allow direct field inspection in tests and structured logging.
 	RetryAfterDur time.Duration
 }
+
+// ErrEmptyEmbedInput marks a validation failure, not a transient provider outage.
+// Callers should treat it as non-retryable and skip or reject the request.
+var ErrEmptyEmbedInput = errors.New("embed input is empty")
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, e.Body)
@@ -80,6 +85,11 @@ type RetryEmbedder struct {
 }
 
 func (r *RetryEmbedder) EmbedContent(ctx context.Context, text string) ([]float32, error) {
+	normalized, err := normalizeEmbedText(text)
+	if err != nil {
+		return nil, err
+	}
+
 	backoff := r.BaseDelay
 	for attempt := 0; ; attempt++ {
 		// Coordinate with the caller's rate limiter before each attempt
@@ -92,7 +102,7 @@ func (r *RetryEmbedder) EmbedContent(ctx context.Context, text string) ([]float3
 			cancel()
 		}
 
-		result, err := r.Inner.EmbedContent(ctx, text)
+		result, err := r.Inner.EmbedContent(ctx, normalized)
 		if err == nil {
 			return result, nil
 		}
@@ -191,4 +201,16 @@ func ParseRetryAfterHeader(value string) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	return 0
+}
+
+func normalizeEmbedText(text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", ErrEmptyEmbedInput
+	}
+
+	runes := []rune(text)
+	if len(runes) > MaxEmbedRunes {
+		text = string(runes[:MaxEmbedRunes])
+	}
+	return text, nil
 }

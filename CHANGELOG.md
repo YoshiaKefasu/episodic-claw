@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0] — 2026-03-30
+
+### Added
+- `topics` metadata for D0/D1 and topics-aware recall
+- Bayesian segmentation and D1 consolidation guardrails
+- D1-first replay scheduling with replay state
+- recall calibration guardrails and release-readiness telemetry closure
+
+### Changed
+- Recall now carries score breakdown fields for calibration and future importance analysis
+- Replay scheduler emits structured summaries for health checks
+- Release docs and runbook now point at the v0.2.0 roadmap
+
 ## [0.1.1] — 2026-03-28
 
 ### Fixed

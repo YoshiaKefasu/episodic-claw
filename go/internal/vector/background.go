@@ -72,6 +72,11 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 			sb.WriteString(m.Role + ": " + m.Content + "\n")
 		}
 		summary := sb.String()
+		if strings.TrimSpace(summary) == "" {
+			fmt.Fprintf(os.Stderr, "[Background] Skipping empty chunk %d in %s\n", i, filePath)
+			prevVector = nil
+			continue
+		}
 
 		preview := slugify(summary)
 		if len(preview) > 30 {
