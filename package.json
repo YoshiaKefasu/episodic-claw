@@ -3,15 +3,15 @@
   "version": "0.2.0",
   "description": "Episodic Memory Engine for OpenClaw",
   "license": "MPL-2.0",
-  "main": "index.ts",
+  "main": "./index.ts",
   "type": "module",
   "types": "dist/index.d.ts",
   "openclaw": {
     "extensions": [
-      "index.ts"
+      "./index.ts"
     ],
     "compat": {
-      "pluginApi": "1.0"
+      "pluginApi": ">=2026.3.28 <2026.4.0"
     },
     "build": {
       "openclawVersion": "2026.3.28",
@@ -30,13 +30,25 @@
     "prepublishOnly": "npm run build"
   },
   "files": [
+    "index.ts",
+    "src/**/*.ts",
     "dist/**/*.js",
+    "dist/episodic-core",
+    "dist/episodic-core.exe",
     "!dist/runner_hardcoded.js",
     "!dist/runner.js",
     "scripts/postinstall.cjs",
     "openclaw.plugin.json",
     "CHANGELOG.md"
   ],
+  "peerDependencies": {
+    "openclaw": ">=2026.3.28 <2026.4.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
   "dependencies": {
     "@sinclair/typebox": "^0.34.48",
     "uuid": "^9.0.1"
