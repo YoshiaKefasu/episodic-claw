@@ -33,8 +33,6 @@
     "index.ts",
     "src/**/*.ts",
     "dist/**/*.js",
-    "dist/episodic-core",
-    "dist/episodic-core.exe",
     "!dist/runner_hardcoded.js",
     "!dist/runner.js",
     "scripts/postinstall.cjs",

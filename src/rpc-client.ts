@@ -4,11 +4,13 @@ import * as readline from "readline";
 import * as net from "net";
 import * as os from "os";
 import * as fs from "fs";
+import * as https from "https";
 
 import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration } from "./types";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
 const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
+const RELEASE_REPO = "YoshiaKefasu/episodic-claw";
 
 interface RPCResponse {
   jsonrpc: string;
@@ -44,6 +46,88 @@ export class EpisodicCoreClient {
     });
   }
 
+  private getReleaseBinaryURL(pluginRoot: string, binaryName: string): string {
+    const pkgPath = path.join(pluginRoot, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version?: string };
+    const version = pkg.version || "0.2.0";
+    return `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${binaryName}`;
+  }
+
+  private async downloadBinary(url: string, dest: string, redirectCount = 0): Promise<void> {
+    if (redirectCount > 5) {
+      throw new Error("Too many redirects while downloading episodic-core");
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      https
+        .get(url, { headers: { "User-Agent": "episodic-claw-runtime" } }, (res) => {
+          if ([301, 302, 307, 308].includes(res.statusCode || 0) && res.headers.location) {
+            res.resume();
+            this.downloadBinary(res.headers.location, dest, redirectCount + 1).then(resolve, reject);
+            return;
+          }
+
+          if (res.statusCode !== 200) {
+            res.resume();
+            reject(new Error(`HTTP ${res.statusCode} while downloading episodic-core`));
+            return;
+          }
+
+          const tempPath = `${dest}.tmp`;
+          const file = fs.createWriteStream(tempPath);
+
+          res.pipe(file);
+
+          file.on("finish", () => {
+            file.close(() => {
+              try {
+                fs.renameSync(tempPath, dest);
+                if (os.platform() !== "win32") {
+                  fs.chmodSync(dest, 0o755);
+                }
+                resolve();
+              } catch (err) {
+                reject(err);
+              }
+            });
+          });
+
+          file.on("error", (err) => {
+            try {
+              fs.unlinkSync(tempPath);
+            } catch {}
+            reject(err);
+          });
+        })
+        .on("error", reject);
+    });
+  }
+
+  private async ensureBinaryReady(pluginRoot: string, binaryPath: string, binaryName: string): Promise<boolean> {
+    if (fs.existsSync(binaryPath)) {
+      if (os.platform() !== "win32") {
+        try {
+          fs.chmodSync(binaryPath, 0o755);
+        } catch {}
+      }
+      return true;
+    }
+
+    const distDir = path.dirname(binaryPath);
+    fs.mkdirSync(distDir, { recursive: true });
+
+    const downloadURL = this.getReleaseBinaryURL(pluginRoot, binaryName);
+    console.log(`[Plugin] episodic-core missing. Downloading runtime binary from ${downloadURL}`);
+    try {
+      await this.downloadBinary(downloadURL, binaryPath);
+      console.log(`[Plugin] Runtime binary ready: ${binaryPath}`);
+      return true;
+    } catch (err: any) {
+      console.error(`[Plugin] Failed to download episodic-core: ${err?.message || err}`);
+      return false;
+    }
+  }
+
   async start(): Promise<void> {
     const pluginRoot = path.resolve(__dirname, "..");
     
@@ -70,6 +154,9 @@ export class EpisodicCoreClient {
     const goDir = path.join(pluginRoot, "go");
 
     const forceGoRun = process.env.EPISODIC_USE_GO_RUN === "1";
+    if (!forceGoRun) {
+      await this.ensureBinaryReady(pluginRoot, binaryPath, binaryName);
+    }
     const usePrebuilt = !forceGoRun && fs.existsSync(binaryPath);
 
     console.log(`[Plugin] Spawn Go sidecar ${usePrebuilt ? "(binary)" : "(go run)"} at ${usePrebuilt ? binaryPath : path.join(pluginRoot, "go")} on ${actualAddr}`);
@@ -79,7 +166,9 @@ export class EpisodicCoreClient {
         cwd: pluginRoot
       });
     } else {
-      const goDir = path.join(pluginRoot, "go");
+      if (!fs.existsSync(goDir)) {
+        throw new Error("episodic-core is missing and no Go source tree is packaged. Install the release binary or re-run plugin installation.");
+      }
       this.child = spawn(isWin ? "go.exe" : "go", ["run", ".", "-socket", actualAddr, "-ppid", process.pid.toString()], { 
         cwd: goDir 
       });
