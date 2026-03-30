@@ -5,7 +5,7 @@ import * as net from "net";
 import * as os from "os";
 import * as fs from "fs";
 
-import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem } from "./types";
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration } from "./types";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
 const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
@@ -359,20 +359,82 @@ export class EpisodicCoreClient {
     return this.request<string>("indexer.rebuild", { path: dirPath, agentWs });
   }
 
-  async recall(query: string, k: number, agentWs: string): Promise<any[]> {
-    return this.request<any[]>("ai.recall", { query, k, agentWs });
+  async recall(
+    query: string,
+    k: number,
+    agentWs: string,
+    topics: string[] = [],
+    strictTopics?: boolean,
+    calibration?: RecallCalibration
+  ): Promise<any[]> {
+    return this.request<any[]>("ai.recall", { query, k, agentWs, topics, strictTopics, calibration });
+  }
+
+  async recallFeedback(params: {
+    agentWs: string;
+    feedbackId: string;
+    queryHash?: string;
+    shown?: string[];
+    used?: string[];
+    expanded?: string[];
+    source?: string;
+  }): Promise<{ updated: number; skipped: number }> {
+    return this.request<{ updated: number; skipped: number }>("ai.recallFeedback", {
+      agentWs: params.agentWs,
+      feedbackId: params.feedbackId,
+      queryHash: params.queryHash ?? "",
+      shown: params.shown ?? [],
+      used: params.used ?? [],
+      expanded: params.expanded ?? [],
+      source: params.source ?? "assemble"
+    });
   }
 
   async calculateSurprise(text1: string, text2: string): Promise<{ surprise: number }> {
     return this.request<{ surprise: number }>("ai.surprise", { text1, text2 });
   }
 
-  async generateEpisodeSlug(summary: string, tags: string[], edges: any[], agentWs: string, savedBy: string = "", surprise: number = 0): Promise<{ path: string, slug: string }> {
+  async segmentScore(params: {
+    agentWs: string;
+    agentId: string;
+    turn: number;
+    text1: string;
+    text2: string;
+    lambda: number;
+    warmupCount: number;
+    minRawSurprise: number;
+    cooldownTurns: number;
+    stdFloor: number;
+    fallbackThreshold: number;
+  }): Promise<SegmentScoreResult> {
+    return this.request<SegmentScoreResult>("ai.segmentScore", params);
+  }
+
+  async generateEpisodeSlug(params: {
+    summary: string;
+    agentWs: string;
+    topics?: string[];
+    tags?: string[];
+    edges?: any[];
+    savedBy?: string;
+    surprise?: number;
+  }): Promise<{ path: string, slug: string }> {
     try {
       const traceLog = require("path").join(require("os").tmpdir(), "ep-save-trace.log");
-      require("fs").appendFileSync(traceLog, `\n[rpc-client TRACE 1] generateEpisodeSlug called. summary type=${typeof summary}, length=${summary?.length}\n`);
+      require("fs").appendFileSync(
+        traceLog,
+        `\n[rpc-client TRACE 1] generateEpisodeSlug called. summary type=${typeof params.summary}, length=${params.summary?.length}, topics=${(params.topics ?? []).length}\n`
+      );
     } catch(e) {}
-    return this.request<{ path: string, slug: string }>("ai.ingest", { summary, tags, edges, agentWs, savedBy, surprise });
+    return this.request<{ path: string, slug: string }>("ai.ingest", {
+      summary: params.summary,
+      topics: params.topics ?? [],
+      tags: params.tags ?? [],
+      edges: params.edges ?? [],
+      agentWs: params.agentWs,
+      savedBy: params.savedBy ?? "",
+      surprise: params.surprise ?? 0
+    });
   }
 
   async getWatermark(agentWs: string): Promise<Watermark> {

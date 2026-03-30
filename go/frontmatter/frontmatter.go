@@ -12,17 +12,19 @@ import (
 
 // EpisodeMetadata represents the frontmatter structure of an episode.
 type EpisodeMetadata struct {
-	ID           string    `yaml:"id"`
-	Title        string    `yaml:"title"`
-	Created      time.Time `yaml:"created,omitempty"`
-	Tags         []string  `yaml:"tags,omitempty"`
-	SavedBy      string    `yaml:"saved_by,omitempty"`
-	Surprise     float64   `yaml:"surprise"`
-	Depth        int       `yaml:"depth,omitempty"`
-	Tokens       int       `yaml:"tokens,omitempty"`
-	Sources      []string  `yaml:"sources,omitempty"`
-	RelatedTo    []Edge    `yaml:"related_to,omitempty"`
-	RefineFailed bool      `yaml:"refine_failed,omitempty"`
+	ID               string    `yaml:"id"`
+	Title            string    `yaml:"title"`
+	Created          time.Time `yaml:"created,omitempty"`
+	Tags             []string  `yaml:"tags,omitempty"`
+	Topics           []string  `yaml:"topics,omitempty"`
+	SavedBy          string    `yaml:"saved_by,omitempty"`
+	ConsolidationKey string    `yaml:"consolidation_key,omitempty"`
+	Surprise         float64   `yaml:"surprise"`
+	Depth            int       `yaml:"depth,omitempty"`
+	Tokens           int       `yaml:"tokens,omitempty"`
+	Sources          []string  `yaml:"sources,omitempty"`
+	RelatedTo        []Edge    `yaml:"related_to,omitempty"`
+	RefineFailed     bool      `yaml:"refine_failed,omitempty"`
 }
 
 type Edge struct {
@@ -59,7 +61,7 @@ func Parse(filePath string) (*MarkdownDocument, error) {
 	}
 
 	doc := &MarkdownDocument{}
-	
+
 	// Split at "---"
 	parts := bytes.SplitN(content, []byte("---"), 3)
 	if len(parts) >= 3 && len(bytes.TrimSpace(parts[0])) == 0 {
@@ -80,7 +82,7 @@ func Parse(filePath string) (*MarkdownDocument, error) {
 // Uses an atomic write pattern (.tmp -> rename) to prevent TOCTOU reading issues (P3-D fix).
 func Serialize(filePath string, doc *MarkdownDocument) error {
 	var buf bytes.Buffer
-	
+
 	// Write frontmatter
 	buf.WriteString("---\n")
 	encoder := yaml.NewEncoder(&buf)
@@ -90,16 +92,16 @@ func Serialize(filePath string, doc *MarkdownDocument) error {
 	}
 	buf.WriteString("---\n\n")
 	buf.WriteString(doc.Body)
-	
+
 	tmpPath := filePath + ".tmp"
 	if err := os.WriteFile(tmpPath, buf.Bytes(), 0644); err != nil {
 		return fmt.Errorf("failed to write tmp file: %w", err)
 	}
-	
+
 	if err := os.Rename(tmpPath, filePath); err != nil {
 		os.Remove(tmpPath) // Cleanup on error
 		return fmt.Errorf("failed to rename tmp file: %w", err)
 	}
-	
+
 	return nil
 }

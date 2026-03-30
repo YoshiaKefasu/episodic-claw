@@ -4,11 +4,13 @@
 
 > [🇺🇸 English](./README.md) · [🇯🇵 日本語](./README.ja.md) · 🇨🇳 中文
 
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
-自动将每次对话保存到本地向量数据库。需要时按语义（而非关键词）搜索，并在模型看到你的消息之前，将最相关的记忆注入系统提示词。无需配置，无需额外指令，安装即用。
+自动把对话保存在本地，按“意思”而不是按关键词找回相关记忆，并在模型回复前把合适的内容放回提示词里。这样 OpenClaw 就更不容易忘记重要上下文。
+
+v0.2.0 文档： [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
 ---
 
@@ -16,19 +18,19 @@
 
 大多数插件只用一种语言。这个插件故意用了两种。
 
-用酒店来打个比方：
+可以把它想成一家店：
 
-**TypeScript 是前台接待。** 它负责跟 OpenClaw 插件 API 沟通，处理工具注册、Hook 连接、JSON 解析等所有"前台工作"。TypeScript 很擅长这些——灵活、表达力强，npm 生态什么都有。
+**TypeScript 是前台。** 它和 OpenClaw 交流，负责工具注册、Hook 连接和 JSON 传递。
 
-**Go 是后台仓库工人。** 当对话需要向量化、索引或搜索时，TypeScript 把工作交给一个编译好的 Go 二进制文件（"sidecar"）。Go 负责重活：并发调用 Gemini Embedding API、维护磁盘上的 HNSW 向量索引、读写 Pebble DB——速度快、内存安全，不受 Node.js 单线程事件循环的限制。
+**Go 是后场。** 它负责向量化、搜索和 Pebble DB 存储，把重活从 Node.js 里拿出去。
 
-**这种分工意味着：智能体永远不会被卡住。** 内容存储以 fire-and-forget 方式运行，召回只需一次异步往返。Go sidecar 可以并行处理多个情节——这在 Node.js 里会完全阻塞。
+**结果就是：TypeScript 管流程，Go 管重活，智能体不会被卡住。**
 
 ---
 
 ## 工作原理（架构）
 
-> **简而言之：** 你发送的每条消息都会触发记忆搜索。相关的历史情节会在 AI 回复前自动注入上下文。
+> **简而言之：** 你发送的每条消息都会触发记忆搜索。相关的历史情节会在模型回复前自动加入上下文。
 
 **第 1 步 — 你发送一条消息。**
 

@@ -4,31 +4,33 @@
 
 > 🇺🇸 English · [🇯🇵 日本語](./README.ja.md) · [🇨🇳 中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
-Automatically saves every conversation to a local vector database. When the agent needs something, it searches by *meaning* — not keywords — and injects the most relevant memories into the system prompt before the model even sees your message. No setup, no prompting, just works.
+This plugin saves conversations locally, finds related memories by meaning, and adds the right ones back into the prompt before the model answers. That helps OpenClaw remember useful context without extra commands or manual cleanup.
+
+Release docs: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
 ---
 
 ## Why TypeScript + Go?
 
-Most plugins are written in one language. This one uses two — on purpose.
+Most plugins are written in one language. This one uses two on purpose.
 
-Think of it like a hotel.
+Think of it like a store with a front desk and a back room.
 
-**TypeScript is the front desk.** It speaks the OpenClaw plugin API fluently. It handles tool registration, hook wiring, JSON parsing, and all the plumbing that connects episodic-claw to the agent. TypeScript is great at this — flexible, expressive, and the npm ecosystem has everything you need.
+**TypeScript is the front desk.** It talks to OpenClaw, registers tools, connects hooks, and keeps the plugin wiring simple.
 
-**Go is the warehouse in the back.** When a conversation needs to be embedded, indexed, or searched, TypeScript hands the work off to a compiled Go binary (the "sidecar"). Go handles the heavy lifting: it runs embedding requests to the Gemini API concurrently in goroutines, maintains the HNSW vector index on disk, and reads/writes to Pebble DB — fast, memory-safe, and without Node.js's single-threaded event loop becoming a bottleneck.
+**Go is the back room.** It handles the heavy work: embeddings, vector search, and Pebble DB storage. That keeps the slow part away from Node.js, so the agent stays responsive.
 
-The split means: **the agent never waits.** Ingest runs fire-and-forget. Recall is a single async round-trip. The Go sidecar can process multiple episodes in parallel — something that would block Node.js entirely.
+So the rule is simple: **TypeScript coordinates, Go does the heavy lifting, and the agent does not have to wait around.**
 
 ---
 
 ## How It Works
 
-> **TL;DR:** Every message you send triggers a memory check. Relevant past episodes are silently injected into the AI's context before it replies.
+> **TL;DR:** Every message triggers a memory check. Relevant past episodes are added to the prompt before the model replies.
 
 **Step 1 — You send a message.**
 

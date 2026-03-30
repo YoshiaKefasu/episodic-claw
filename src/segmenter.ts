@@ -33,17 +33,67 @@ export function extractText(content: any): string {
 export class EventSegmenter {
   private buffer: Message[] = [];
   private rpc: EpisodicCoreClient;
-  private surpriseThreshold = 0.2; // Adjustable threshold
   private lastProcessedLength = 0; // Track length to process only new messages
+  private turnSeq = 0;
   private dedupWindow: number;
   private maxBufferChars: number;
   private maxCharsPerChunk: number;
+  private segCount = 0;
+  private segMean = 0;
+  private segM2 = 0;
+  private segCooldownRemaining = 0;
+  private segmentationLambda: number;
+  private segmentationWarmupCount: number;
+  private segmentationMinRawSurprise: number;
+  private segmentationCooldownTurns: number;
+  private segmentationStdFloor: number;
+  private segmentationFallbackThreshold: number;
 
-  constructor(rpc: EpisodicCoreClient, dedupWindow = 5, maxBufferChars = 7200, maxCharsPerChunk = 9000) {
+  constructor(
+    rpc: EpisodicCoreClient,
+    dedupWindow = 5,
+    maxBufferChars = 7200,
+    maxCharsPerChunk = 9000,
+    tuning?: {
+      lambda?: number;
+      warmupCount?: number;
+      minRawSurprise?: number;
+      cooldownTurns?: number;
+      stdFloor?: number;
+      fallbackThreshold?: number;
+    }
+  ) {
     this.rpc = rpc;
     this.dedupWindow = dedupWindow;
     this.maxBufferChars = maxBufferChars;
     this.maxCharsPerChunk = maxCharsPerChunk;
+    this.segmentationLambda = Math.max(0, tuning?.lambda ?? 2.0);
+    this.segmentationWarmupCount = Math.max(0, tuning?.warmupCount ?? 20);
+    this.segmentationMinRawSurprise = Math.max(0, tuning?.minRawSurprise ?? 0.05);
+    this.segmentationCooldownTurns = Math.max(0, tuning?.cooldownTurns ?? 2);
+    this.segmentationStdFloor = Math.max(0.0001, tuning?.stdFloor ?? 0.01);
+    this.segmentationFallbackThreshold = Math.max(0, tuning?.fallbackThreshold ?? 0.2);
+  }
+
+  private updateSegStats(value: number): void {
+    this.segCount += 1;
+    const delta = value - this.segMean;
+    this.segMean += delta / this.segCount;
+    const delta2 = value - this.segMean;
+    this.segM2 += delta * delta2;
+  }
+
+  private getSegStd(): number {
+    if (this.segCount < 2) return this.segmentationStdFloor;
+    const variance = this.segM2 / (this.segCount - 1);
+    return Math.max(Math.sqrt(Math.max(variance, 0)), this.segmentationStdFloor);
+  }
+
+  private shrinkSegStats(): void {
+    if (this.segCount <= 1) return;
+    const shrink = 0.5;
+    this.segCount = Math.max(1, Math.floor(this.segCount * shrink));
+    this.segM2 *= shrink;
   }
 
   /**
@@ -123,13 +173,41 @@ export class EventSegmenter {
     const estimatedChars = this.buffer.reduce((acc, m) => acc + extractText(m.content).length, 0);
 
     try {
-      // 1. Calculate surprise
-      const { surprise } = await this.rpc.calculateSurprise(oldSlice, newSlice);
-      console.log(`[Episodic Memory] Calculated surprise: ${surprise}`);
+      const sizeLimitExceeded = estimatedChars > this.maxBufferChars;
+      this.turnSeq += 1;
 
-      if (surprise > this.surpriseThreshold || estimatedChars > this.maxBufferChars) {
+      const score = await this.rpc.segmentScore({
+        agentWs,
+        agentId: agentId || "auto",
+        turn: this.turnSeq,
+        text1: oldSlice,
+        text2: newSlice,
+        lambda: this.segmentationLambda,
+        warmupCount: this.segmentationWarmupCount,
+        minRawSurprise: this.segmentationMinRawSurprise,
+        cooldownTurns: this.segmentationCooldownTurns,
+        stdFloor: this.segmentationStdFloor,
+        fallbackThreshold: this.segmentationFallbackThreshold,
+      });
+
+      const surprise = score?.rawSurprise ?? 0;
+      const shouldBoundary = sizeLimitExceeded || !!score?.isBoundary;
+
+      if (shouldBoundary || this.turnSeq % 5 === 0) {
+        const mean = (score?.mean ?? 0).toFixed(4);
+        const std = (score?.std ?? 0).toFixed(4);
+        const th = (score?.threshold ?? 0).toFixed(4);
+        const z = (score?.z ?? 0).toFixed(2);
+        console.log(
+          `[Episodic Memory] SegmentScore: raw=${surprise.toFixed(4)} ` +
+          `mean=${mean} std=${std} threshold=${th} z=${z} ` +
+          `boundary=${shouldBoundary} reason=${score?.reason ?? "n/a"}`
+        );
+      }
+
+      if (shouldBoundary) {
         // 2. Boundary crossed or Buffer too large! Trigger ingest for the OLD buffer
-        const reason = surprise > this.surpriseThreshold ? "surprise-boundary" : "size-limit";
+        const reason = sizeLimitExceeded ? "size-limit" : "surprise-boundary";
         console.log(`[Episodic Memory] ${reason} exceeded. Finalizing previous episode...`);
         
         // ==========================================
@@ -196,6 +274,7 @@ export class EventSegmenter {
         items.push({
           summary: summary,
           tags: ["auto-segmented", "chunked", reason],
+          topics: [],
           edges: [],
           surprise: items.length === 0 ? surprise : 0
         });
@@ -216,6 +295,7 @@ export class EventSegmenter {
       items.push({
         summary: summary,
         tags: ["auto-segmented", reason],
+        topics: [],
         edges: [],
         surprise: items.length === 0 ? surprise : 0
       });
