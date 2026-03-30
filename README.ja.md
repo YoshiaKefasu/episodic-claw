@@ -1,20 +1,22 @@
-# episodic-claw
+# <img src="./assets/icons/brain-circuit.svg" width="22" alt="" /> episodic-claw
 
 **OpenClawエージェントのための長期エピソード記憶プラグイン。**
 
-> [🇺🇸 English](./README.md) · 🇯🇵 日本語 · [🇨🇳 中文](./README.zh.md)
+> [English](./README.md) | 日本語 | [中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 会話をローカルに保存して、必要なときにキーワードではなく「意味」で探し、合う記憶だけをプロンプトに戻すプラグインです。OpenClaw が前に話したことを忘れにくくなります。
 
+`v0.2.0` は、topics-aware recall、Bayesian segmentation、より人っぽい D1 consolidation、replay scheduling が揃ってきたリリースです。つまり「保存できる」だけではなく、「どう区切るか」「どうまとめるか」「何を残しやすくするか」が前よりだいぶ整いました。
+
 v0.2.0 のドキュメント: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
 ---
 
-## なぜTypeScriptとGoの2言語？
+## <img src="./assets/icons/cog.svg" width="18" alt="" /> Why TypeScript + Go?
 
 ほとんどのプラグインは1言語で書かれていますが、これはあえて2言語を使っています。
 
@@ -22,25 +24,25 @@ v0.2.0 のドキュメント: [v0.2.0 bundle](./docs/v0.2.0/README.md)
 
 **TypeScriptは受付。** OpenClaw と会話し、ツール登録やフック配線、JSONの受け渡しを担当します。
 
-**Goは奥の作業場。** 会話の埋め込み、ベクトル検索、Pebble DB への保存を担当します。重い処理を奥に分けるので、Node.js 側が詰まりにくくなります。
+**Goは奥の作業場。** 会話の埋め込み、ベクトル検索、replay state、Pebble DB への保存を担当します。重い処理を奥に分けるので、Node.js 側が詰まりにくくなります。
 
-**つまり、TypeScript が全体をまとめて、Go が重い仕事をこなし、エージェントは待たずに動けます。**
+つまり、**TypeScript が全体をまとめて、Go が重い仕事をこなし、エージェントは待たずに動ける**ようにしてあります。
 
 ---
 
-## どうやって動くの？（アーキテクチャ）
+## <img src="./assets/icons/workflow.svg" width="18" alt="" /> どうやって動くの？（アーキテクチャ）
 
 > **TL;DR:** メッセージを送るたびに記憶の検索が走る。関連する過去のエピソードがモデルの返答前に自動で入る。
 
 **Step 1 — あなたがメッセージを送る。**
 
-**Step 2 — `assemble()` が発火する。** プラグインは直近5件のメッセージから検索クエリを構築します。
+**Step 2 — `assemble()` が発火する。** プラグインは直近の会話から検索クエリを組みます。
 
-**Step 3 — Goサイドカーがクエリをベクトルに変換する。** Gemini Embedding APIを使ってテキストを768次元のベクトル（意味を数値化したもの）に変換します。
+**Step 3 — Goサイドカーがクエリをベクトルに変換する。** Gemini Embedding API を使って、テキストを意味ベクトルにします。
 
-**Step 4 — HNSWが最も近い過去エピソードをトップK件で返す。** HNSWは「意味が近いものを爆速で探す」アルゴリズムです。何千件の記憶があってもミリ秒レベルで動きます。
+**Step 4 — HNSW が近い過去エピソードを返す。** HNSW は「意味が近いものを速く探す」ための仕組みです。ここが速いから、記憶が増えても実用速度を保ちやすいです。
 
-**Step 5 — 一致したエピソードがシステムプロンプトに注入される。** AIはあなたのメッセージを読む前に過去の記憶を見るので、返答に自然に過去の文脈が入ります。
+**Step 5 — 候補が再ランキングされて、良いものだけがシステムプロンプトへ入る。** モデルは返答前に過去の文脈を見てから話せます。
 
 ```mermaid
 sequenceDiagram
@@ -52,9 +54,9 @@ sequenceDiagram
 
     User->>OpenClaw: メッセージを送信
     OpenClaw->>TS: assemble() 発火
-    TS->>TS: 直近5件からクエリ構築
+    TS->>TS: 直近の会話からクエリ構築
     TS->>Go: RPC: recall(query, k=5)
-    Go->>Go: Gemini Embedding API でベクトル化
+    Go->>Go: Gemini Embedding API
     Go->>DB: ベクトル検索、トップK件
     DB-->>Go: 一致したエピソード本文
     Go-->>TS: 結果を返す
@@ -64,253 +66,279 @@ sequenceDiagram
 
 ![シーケンス図：エピソード想起フロー](docs/sequenceDiagram.png)
 
-バックグラウンドでは、新しいエピソードが随時保存されています：
+そして裏では、新しいエピソードもずっと作られています。
 
-**Step A — Surprise Scoreがトピックの転換を検出する。** ターンごとに「会話の話題が変わったか？」を判定。変わったと判断したら今のバッファを閉じてエピソードとして保存します。
+**Step A — Surprise Score がトピックの変化を見る。** 会話の流れが十分に変わったら、今のバッファを1つのエピソードとして閉じます。
 
-**Step B — テキストを分割 → Goサイドカー → Gemini Embedding → Pebble DBに保存。** エピソードテキストがベクトル付きで保存され、将来の会話でいつでも検索できます。
+**Step B — テキストを分割して保存する。** その本文は Go サイドカーでベクトル化され、Pebble DB と HNSW に反映されます。
 
 ```mermaid
 flowchart LR
     A[新しいメッセージが届く] --> B[EventSegmenterがSurprise Scoreを計算]
-    B -->|スコア0.2超 OR バッファが7200文字超| C[エピソード境界を検出]
+    B -->|スコア高い or バッファが大きい| C[エピソード境界を検出]
     C --> D[バッファをチャンクに分割]
-    D --> E[Goサイドカー: Gemini Embeddingでベクトル化]
-    E --> F[Pebble DBにエピソード保存\nHNSWがインデックス更新]
-    B -->|スコアが低い| G[バッファに追記し続ける]
+    D --> E[Goサイドカーでベクトル化]
+    E --> F[Pebble DBに保存\nHNSW更新]
+    B -->|まだ同じ流れ| G[バッファに追記]
 ```
 
 ![フローチャート：エピソード保存パイプライン](docs/flowchart.png)
 
 ---
 
-## 記憶の2層構造（D0 / D1）
+## <img src="./assets/icons/layers-3.svg" width="18" alt="" /> 記憶の2層構造（D0 / D1）
 
-> **TL;DR:** D0は生の日記。D1は日記をまとめた「読書メモ」。
+> **TL;DR:** D0は生の日記。D1は日記を読み返したあとに自分で書く「要点メモ」。
 
-### D0 — 生エピソード（Raw Episodes）
+### <img src="./assets/icons/file-text.svg" width="16" alt="" /> D0 — 生エピソード（Raw Episodes）
 
-Surprise Scoreが閾値を超えるたびに、現在の会話バッファをそのままD0エピソードとして保存します。逐語的な会話ログで、詳細かつタイムスタンプ付き。
+会話の区切れ目ごとに保存される、そのままに近い記憶です。逐語ログ寄りで、細かく、時刻も持っています。
 
-- Pebble DBにベクトル埋め込み付きで保存
-- 自動タグ: `auto-segmented`、`surprise-boundary`、`size-limit`
-- HNSWベクトル検索でいつでも取得可能
+- Pebble DBにベクトル付きで保存
+- `auto-segmented`、`surprise-boundary`、`size-limit` などの境界ヒントが付く
+- HNSW ですぐ検索できる
 
-### D1 — LLM要約による長期記憶（Sleep Consolidation）
+### <img src="./assets/icons/moon.svg" width="16" alt="" /> D1 — LLM要約による長期記憶（Sleep Consolidation）
 
-時間が経つと複数のD0エピソードをLLMが「眠りながら記憶を整理する（Sleep Consolidation）」ように圧縮します。本質だけ残って、ノイズは消える。
+時間が経つと複数のD0が整理されて D1 になります。人が眠ったあとに「結局あの期間で大事だったのはこれ」とまとまる感じに少し近いです。
 
-- D1ノードは元のD0エピソードへのリンクを保持
-- `ep-expand` でD1サマリーからD0に掘り下げ可能
-- トークン消費を抑えながら長期的な意味の一貫性を維持
+- D1 ノードは元の D0 へのリンクを持つ
+- `ep-expand` で D1 から D0 に戻れる
+- 長い時間の意味を保ちつつ、トークンコストを抑えられる
 
-### Surprise Scoreって何？
+### <img src="./assets/icons/zap.svg" width="16" alt="" /> Surprise Scoreって何？
 
-直近メッセージのベクトルを現在のバッファのベクトルと比較して**ベイジアン・サプライズ**を計算します。スコアが`0.2`を超えたら「会話の文脈が大きく変わった → 今のエピソードを閉じて新しいエピソードを始めよう」と判断。
+新しく入ってきた内容と、いまの会話バッファがどれだけズレたかを見る信号です。高ければ「もう同じ話の続きじゃない」と判断して、そこで1つの記憶を閉じます。
 
-```
+```text
 バッファ:      "Reactでtodoアプリを作ろう"
 次のメッセージ: "データベースのインデックス設計ってどうすればいい？"
-→ Surprise: 高い → エピソード境界 → 前のエピソードを保存
+結果:          surprise が高い -> 境界を切る -> 前のエピソードを保存
 ```
+
+これがあるから、記憶が何でもかんでも1つの大きな塊になりにくいです。
 
 ---
 
-## インストール
+## <img src="./assets/icons/rocket.svg" width="18" alt="" /> v0.2.0で実際に何が変わったか
+
+前の版でも使えました。でも v0.2.0 では、「覚える」「まとめる」「呼び戻す」の質がかなり上がっています。
+
+- Segmentation が前より適応的になった
+- D1 clustering が単純な近さだけでなく、文脈と境界を見るようになった
+- replay が独立した層として入った
+- recall が topics や usefulness の補助信号を使えるようになった
+
+なのでこの版は、「検索付きメモ帳」よりも「ちゃんと整理される記憶システム」に近づいた版だと思ってもらうと近いです。
+
+---
+
+## <img src="./assets/icons/package.svg" width="18" alt="" /> インストール
 
 ```bash
 openclaw plugins install clawhub:episodic-claw
 ```
 
-これだけです。プラグインは起動時に自動でフックに繋がります。設定ファイルの編集もAPIキーの設定も不要（GoサイドカーはOpenClaw環境に設定済みのGemini APIキーをそのまま使います）。
+入り口はこれです。Go サイドカーは OpenClaw 環境に設定済みの Gemini API key をそのまま使います。
 
 ---
 
-## エージェント向けインストールプロンプト
+## <img src="./assets/icons/bot.svg" width="18" alt="" /> Agent Install Prompt
 
-プロンプトが2つあります。**前半**はエージェント（Claude Code等）に渡してインストールを自動実行させるもの。**後半**はエージェントのシステムプロンプトに貼り付けて記憶の使い方を教えるものです。
+別のエージェントに技術作業を丸ごとやらせたいなら、この prompt を渡してください。
 
-### パート1 — インストール（エージェントに実行させる）
+これは説明文ではなく、**実際に install・設定変更・再起動・確認までやらせるための prompt** です。
 
-```
-episodic-clawメモリプラグインをOpenClawエージェントにインストールして設定してください。
-以下の手順を順番に実行してください：
+```text
+私の OpenClaw 環境に `episodic-claw` をインストールして、動作確認まで全部やってください。
 
-Step 1 — OpenClawのプラグインマネージャーでインストール:
-  openclaw plugins install clawhub:episodic-claw
+説明だけで終わらず、実作業まで進めてください。
 
-Step 2 — プラグインがリストに表示されることを確認:
-  openclaw plugins list
+必須の手順:
 
-Step 3 — OpenClawの設定ファイル（openclaw.config.json等）にepisodic-clawが登録されているか確認。
-  最小限の設定エントリはこちら:
-  {
-    "plugins": [
-      { "id": "episodic-claw" }
-    ]
-  }
-  "plugins"配列がすでにある場合は { "id": "episodic-claw" } を追加するだけでOK。
+1. まずこれを実行:
+   `openclaw plugins install clawhub:episodic-claw`
 
-Step 4 — プラグインはOpenClaw環境に設定済みのGemini APIキーを使用します。
-  GEMINI_API_KEYが未設定の場合は今すぐ設定してください:
-  export GEMINI_API_KEY="your-key-here"
-  （無料キーの取得: https://aistudio.google.com/app/apikey）
+2. プラグインが正常に入ったか確認:
+   `openclaw plugins list`
 
-Step 5 — 変更を適用するためOpenClawゲートウェイを再起動:
-  openclaw gateway restart
-  （GUIアプリを使用中の場合はOpenClawデスクトップアプリを再起動）
+3. OpenClaw の実際の設定ファイルを開いて、`episodic-claw` が有効になるように必要なら編集してください。
+   通常の設定ファイルは `~/.openclaw/openclaw.json` です。
 
-Step 6 — ゲートウェイログに以下が表示されることを確認:
-  [Episodic Memory] Plugin registered.
-  [Episodic Memory] Gateway started.
+4. OpenClaw が動いている環境で、必要な Gemini API key が使える状態か確認してください。
+   `GEMINI_API_KEY` が必要なら、そのまま OpenClaw 実行環境で参照できることを確認してください。
 
-以上でプラグインが稼働しています。追加設定は不要です。
-```
+5. OpenClaw を再起動する前に、必ずユーザーへ次の内容を自然な言い回しで告知してください:
+   「これから OpenClaw gateway の再起動が必要です。再起動の前に6分待ちます。まだインストール確認は完了しておらず、その瞬間に私の現在の作業文脈が切れる可能性があります。再起動後に続きを確認したいので、そのときはメッセージを送って起こしてください。」
 
-### パート2 — システムプロンプト（エージェントのシステムプロンプトに貼り付け）
+6. この告知を送ったあと、意図的に6分待ってください。
+   短い待機ではなく、ちゃんと6分の sleep / wait を入れてください。
 
-```
-You have long-term episodic memory powered by the episodic-claw plugin.
+7. 設定反映のために OpenClaw を再起動:
+   `openclaw gateway restart`
 
-Your memory tools:
-- ep-recall <query>   — Search your memory for anything relevant to a topic
-- ep-save <content>   — Save something important that you want to remember later
-- ep-expand <slug>    — Expand a memory summary to read its full contents
+8. 再起動後、プラグインが本当に読み込まれているか確認してください。
+   plugin status、起動ログ、memory plugin の loaded 状態を確認してください。
 
-How to use them well:
-- Before answering questions that might benefit from past context, run ep-recall first.
-- After completing something meaningful (a key decision, a fix, a preference learned),
-  run ep-save to make sure it sticks.
-- When a recalled memory summary is too brief and you need more detail, run ep-expand.
-- You also have automatic memory: relevant past episodes are already injected at the top
-  of every system prompt under "--- My Memory ---". Read those first before calling
-  ep-recall manually.
-- Your memory is stored locally and privately — it never leaves the machine.
+9. platform ごとの sidecar binary を release から取ってくる構成なら、binary が正しくダウンロードされて plugin directory にあることも確認してください。
 
-The episodic-claw plugin runs silently in the background. You don't need to manage it.
-Just use the tools when they make sense.
+10. 最後に短い報告をください:
+   - 何を変更したか
+   - プラグインは loaded か
+   - まだ残っている warning や手作業があるか
+
+重要:
+- 何をすべきか説明するだけでなく、実際に config を編集してください。
+- 途中で失敗しても、原因を調べて、plugin が動くか明確な blocker が見つかるところまで進めてください。
+- install が終わった時点で止まらず、verification まで終えてください。
 ```
 
 ---
 
-## 3つのメモリツール
+## <img src="./assets/icons/wrench.svg" width="18" alt="" /> 3つのメモリツール
 
 ### `ep-recall` — 記憶の手動検索
 
-> トピックやキーワードで特定の記憶を掘り出す。
+トピックや意味で、意図して記憶を探すツールです。
 
-自動検索では足りないときや「あのとき何を話したっけ？」と明示的に聞くときに使います。
-
-```
-あなた: "先週決めたDBスキーマ覚えてる？"
-AI:     [ep-recall を呼び出す → クエリ: "DBスキーマの決定"]
-AI:     "[日付]に、usersテーブルを正規化で作ることにしましたね。..."
-```
-
-| パラメータ | 型 | 必須 | 説明 |
-|---|---|---|---|
-| `query` | string | Yes | 検索したい内容 |
-| `k` | number | No | 取得するエピソード数（デフォルト: 3） |
-
----
+自動注入だけでは足りないときや、「あの話を思い出して」と明示的に言いたいときに使います。
 
 ### `ep-save` — 記憶の手動保存
 
-> AIに「これを覚えておいて」と言えば、その場で保存される。
+「これを覚えておいて」を即保存するツールです。
 
-```
-あなた: "このプロジェクトはSQLiteじゃなくてPostgreSQLを使ってること、覚えておいて。"
-AI:     [ep-save を呼び出す]
-AI:     "了解、しっかり記録しました。"
-```
+好み、決定事項、制約、覚えておきたい事実に向いています。
 
-| パラメータ | 型 | 必須 | 説明 |
-|---|---|---|---|
-| `content` | string | Yes | 保存する内容（自然言語、最大約3600文字） |
-| `tags` | string[] | No | 任意のタグ（例: `["決定事項", "DB"]`） |
+### `ep-expand` — サマリーから詳細へ戻る
+
+要約記憶だけでは足りないときに、元の細かい流れまで掘るツールです。
 
 ---
 
-### `ep-expand` — サマリーからフル内容を展開
+## <img src="./assets/icons/cog.svg" width="18" alt="" /> 設定一覧
 
-> 圧縮された要約じゃなくて元のやり取りが見たいときに使う。
-
-```
-あなた: "認証バグを直したときの詳細を教えて。"
-AI:     [サマリーを発見 → ep-expand でフル内容を取得]
-AI:     "あのときの全部の流れはこうでした: ..."
-```
-
-| パラメータ | 型 | 必須 | 説明 |
-|---|---|---|---|
-| `slug` | string | Yes | 展開したいサマリーエピソードのID/スラッグ |
-
----
-
-## 設定一覧
-
-すべてのキーは任意項目です。
+すべてのキーは任意です。最初はデフォルトで十分使えます。
 
 | キー | 型 | デフォルト | 説明 |
 |---|---|---|---|
 | `enabled` | boolean | `true` | プラグインの有効/無効 |
-| `reserveTokens` | integer | `6144` | システムプロンプトに注入する記憶の最大トークン数 |
-| `recentKeep` | integer | `30` | コンパクション時に保持する直近の会話ターン数 |
-| `dedupWindow` | integer | `5` | 重複チェックするバッファの件数。フォールバックが多い環境では10以上推奨 |
-| `maxBufferChars` | integer | `7200` | 強制フラッシュのバッファ文字数上限。最小500 |
-| `maxCharsPerChunk` | integer | `9000` | 1チャンクの最大文字数。`maxBufferChars`より小さい値で1フラッシュが複数エピソードに分割される。最小500 |
-| `sharedEpisodesDir` | string | — | *(計画中 — Phase 6)* 複数エージェント間でエピソードを共有するパス。現バージョンでは効果なし |
-| `allowCrossAgentRecall` | boolean | — | *(計画中 — Phase 6)* 他エージェントのエピソードを検索に含めるか。現バージョンでは効果なし |
+| `reserveTokens` | integer | `6144` | 記憶注入に使う最大トークン数 |
+| `recentKeep` | integer | `30` | compaction後も残す直近ターン数 |
+| `dedupWindow` | integer | `5` | fallback重複テキストの去重窓 |
+| `maxBufferChars` | integer | `7200` | 強制保存するバッファ文字数上限 |
+| `maxCharsPerChunk` | integer | `9000` | 1チャンクの最大文字数 |
+| `sharedEpisodesDir` | string | — | 将来の共有エピソード用。現状は効果なし |
+| `allowCrossAgentRecall` | boolean | — | 将来の cross-agent recall 用。現状は効果なし |
+
+理由がない限り、最初は触らない方が安全です。
 
 ---
 
-## 研究的背景
+## <img src="./assets/icons/book-open.svg" width="18" alt="" /> 研究的背景
 
-このプラグインはAI記憶研究の先端をベースに設計されています：
+このプロジェクトは、脳科学っぽい言葉を雰囲気で置いているわけではありません。`v0.2.0` で入った機能ごとに、かなりはっきり参照元があります。
 
-- **EM-LLM** — 人間の記憶機構にインスパイアされた、無限コンテキストLLMのためのエピソード記憶
-  Watson et al., 2024 · [arXiv:2407.09450](https://arxiv.org/abs/2407.09450)
+### 1. エージェント記憶の全体設計
 
-- **MemGPT** — LLMをOSとして動かす発想の論文
-  Packer et al., 2023 · [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)
+- **EM-LLM** — *Human-Like Episodic Memory for Infinite Context LLMs*  
+  Watson et al., 2024 · [arXiv:2407.09450](https://arxiv.org/abs/2407.09450)  
+  「会話をずっと1本のログとして持つ」のではなく、出来事単位の episodic memory として扱う発想に強く効いています。
 
-- **ポジションペーパー** — エージェント記憶システムの総合サーベイ
-  2025 · [arXiv:2502.06975](https://arxiv.org/abs/2502.06975)
+- **MemGPT** — *Towards LLMs as Operating Systems*  
+  Packer et al., 2023 · [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)  
+  エージェントが明示的な memory tool と memory layer を持つ設計にかなり影響しています。
+
+- **Agent Memory Systems** — position paper / survey  
+  2025 · [arXiv:2502.06975](https://arxiv.org/abs/2502.06975)  
+  episodic memory、semantic memory、retrieval policy、long-term memory operation を分けて考える土台になっています。
+
+### 2. Segmentation と境界検出
+
+- **Bayesian Surprise Predicts Human Event Segmentation in Story Listening**  
+  [PMC11654724](https://pmc.ncbi.nlm.nih.gov/articles/PMC11654724/)  
+  `v0.2.0` で固定しきい値から動的な Bayesian segmentation に寄せた理由にいちばん近い論文です。
+
+- **Robust and Scalable Bayesian Online Changepoint Detection**  
+  [arXiv:2302.04759](https://arxiv.org/abs/2302.04759)  
+  会話の最中に軽く更新し続ける、という online 前提の設計に効いています。
+
+### 3. D1 consolidation と文脈つきの記憶統合
+
+- **Human Episodic Memory Retrieval Is Accompanied by a Neural Contiguity Effect**  
+  [PMC5963851](https://pmc.ncbi.nlm.nih.gov/articles/PMC5963851/)  
+  D1 clustering を「意味だけ」ではなく「時間的に近い流れ」でも見る理由の後ろ盾です。
+
+- **Contextual prediction errors reorganize naturalistic episodic memories in time**  
+  [PMC8196002](https://pmc.ncbi.nlm.nih.gov/articles/PMC8196002/)  
+  強い surprise-boundary を、単なる参考値ではなく本物の境界として扱う判断に近いです。
+
+- **Schemas provide a scaffold for neocortical integration of new memories over time**  
+  [PMC9527246](https://pmc.ncbi.nlm.nih.gov/articles/PMC9527246/)  
+  topics や abstraction を後段で強めていく方向、つまり schema 的な記憶へ寄せる考え方に効いています。
+
+### 4. Replay と定着
+
+- **Human hippocampal replay during rest prioritizes weakly learned information**  
+  [PMC6156217](https://pmc.ncbi.nlm.nih.gov/articles/PMC6156217/)  
+  D1-first replay scheduler の発想にかなり近いです。全部を均等に反復するのではなく、弱いが重要な記憶を優先する、という考え方です。
+
+### 5. Recall rerank と不確実性の扱い
+
+- **Dynamic Uncertainty Ranking: Enhancing Retrieval-Augmented In-Context Learning for Long-Tail Knowledge in LLMs**  
+  [ACL Anthology](https://aclanthology.org/2025.naacl-long.453/)  
+  retrieval は単なるベクトル近傍だけでなく、「誤誘導しにくい候補を上げる」べき、という発想の参考になっています。
+
+- **Overcoming Prior Misspecification in Online Learning to Rank**  
+  [arXiv:2301.10651](https://arxiv.org/abs/2301.10651)  
+  recall の重みを固定で決め打ちせず、更新可能なものとして扱う考え方に近いです。
+
+- **An Empirical Evaluation of Thompson Sampling**  
+  [Microsoft Research PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/thompson.pdf)  
+  探索と活用を両立しつつ、重すぎない online choice を入れたいときの実装感覚に効いています。
+
+なので、README に出てくる「人っぽい記憶」「replay」「Bayesian segmentation」みたいな言葉は、飾りではありません。`v0.2.0` はそのへんを実際の実装にかなり寄せた版です。
 
 ---
 
-## 自己紹介
+## <img src="./assets/icons/user.svg" width="18" alt="" /> 自己紹介
 
-AIエージェントに、コンテキストウィンドウの圧縮要約より賢い記憶を持たせたくて作りました。
+独学のAIオタクで、現在NEET生活中。会社のチームも資金もなくて、あるのは自分とAI相棒と深夜2時のブラウザタブくらいです。
 
-独学のAIオタクで、現在NEET生活中 — チームもなし、会社の後ろ盾もなし、ただ深夜に自分が欲しいものを作ってます。このプラグインは **100% バイブコーディング製** です。AIにやりたいことを話して、間違ってたら言い直して、動くまで繰り返す。それだけです。
+`episodic-claw` は **100% バイブコーディング製** です。AIにやりたいことを伝えて、違うと思ったら言い返して、壊れたら直して、また試して、そうやってここまで来ました。アーキテクチャは本物です。研究参照も本物です。バグも本物でした。
 
-### スポンサー
+これを作った理由は単純で、AIエージェントに「流れるコンテキスト」以上の記憶を持たせたかったからです。もし `episodic-claw` でエージェントが少しでも賢く、少しでも落ち着いて、少しでも忘れにくくなるなら、それで十分うれしいです。
 
-続けるにはClaudeかOpenAI Codexのサブスクリプションが必要で、スポンサーシップがそのままAIトークン代になります。役に立ってるなと思ったら、月$5でも本当に助かります。
+### <img src="./assets/icons/heart.svg" width="16" alt="" /> スポンサー
 
-**予定している今後のアップデート:**
-- **Cross-agent recall** — 複数エージェント間での記憶共有
-- **Memory decay** — 低関連度の古いエピソードが自然にフェードアウト
-- **Web UI** — エージェントの記憶をブラウザで閲覧・編集
+続けるには、Claude や OpenAI Codex の課金がそのまま必要です。もし役に立ってるなと思ったら、少額でも本当に助かります。
 
-👉 **[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)**
+今後やりたいこと:
 
-無理しなくていいです。プラグインはMPL-2.0ライセンスで永遠に無料です。
+- cross-agent recall
+- memory decay
+- 記憶を見たり直したりできる web UI
+
+[GitHub Sponsors](https://github.com/sponsors/YoshiaKefasu)
+
+無理はしなくて大丈夫です。プラグインはこれからも MPL-2.0 で無料です。
 
 ---
 
-## ライセンス
+## <img src="./assets/icons/scale.svg" width="18" alt="" /> ライセンス
 
 [Mozilla Public License 2.0 (MPL-2.0)](LICENSE) © 2026 YoshiaKefasu
 
-**なぜ MIT ではなく MPL 2.0 なのか？**
+なぜ MIT ではなく MPL なのか。
 
-MIT ライセンスだと誰でもこのコードを改善して、その改善を非公開のままにできます。ライブラリならそれでいいですが、実際のワークフローの基盤になるメモリプラグインでは、フォークもオープンソースのままでいてほしい。
+理由は、使う自由は残したいけど、このプラグイン自体への改善が完全に閉じて消えていくのは避けたいからです。
 
-MPL 2.0 はファイル単位のコピーレフト：このリポジトリの `.ts` や `.go` ソースファイルを変更したら、その変更されたファイルは MPL のままオープンソースで公開する義務があります。でも自分のプロプライエタリなコードと組み合わせるのは自由 — コピーレフトはあなたのコードベースには広がりません。episodic-claw を使った商用プロダクトを作れる。ただし、プラグイン自体を改善してソースを非公開にすることはできない。
+MPL はその中間にあります。
 
-ゴールはシンプル：**episodic-claw への改善はコミュニティに還元される。**
+- 製品で使える
+- 自分のコードと組み合わせられる
+- でも、このプラグインのファイルを直したなら、その変更ファイルは開いたままでいてほしい
+
+このプロジェクトにはそれが合っていると思っています。
 
 ---
 
