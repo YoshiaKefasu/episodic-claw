@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.4] — 2026-04-01
+
+### Fixed
+- `ep-recall` now returns human-readable episode text instead of raw JSON, and strips embedding vectors from tool output to avoid UI noise.
+
 ## [0.2.2] — 2026-04-01
 
 ### Security

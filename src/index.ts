@@ -447,9 +447,28 @@ const episodicClawPlugin = {
             if (!results || results.length === 0) {
               return { content: [{ type: "text", text: "Nothing came back. I don't have any memories matching that." }] };
             }
+            const safeResults = results.map((res: any) => {
+              const rawRecord = res?.Record ?? res?.record;
+              if (!rawRecord || typeof rawRecord !== "object") {
+                return res;
+              }
+              const { vector, Vector, ...rest } = rawRecord as Record<string, unknown>;
+              return { ...res, Record: rest };
+            });
+            const lines: string[] = [];
+            for (const res of safeResults) {
+              const record = res?.Record ?? res?.record ?? {};
+              const title = record.title || record.id || "Unknown";
+              const date = record.timestamp ? new Date(record.timestamp).toISOString().split("T")[0] : "unknown date";
+              const score = typeof res.Score === "number" ? res.Score.toFixed(3) : "N/A";
+              const bodyText = (res.Body ?? res.body ?? "").toString().trim();
+              lines.push(`[${title} · ${date} · relevance: ${score}]`);
+              lines.push(bodyText.length > 0 ? bodyText : "(nothing stored here)");
+              lines.push("");
+            }
             return {
-              content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-              details: results
+              content: [{ type: "text", text: lines.join("\n").trim() }],
+              details: safeResults
             };
           } catch (e: any) {
             return { content: [{ type: "text", text: `Ran into a snag trying to remember that: ${e.message}` }] };
