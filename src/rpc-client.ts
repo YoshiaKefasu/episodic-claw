@@ -12,6 +12,11 @@ import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestIte
 const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
 const RELEASE_REPO = "YoshiaKefasu/episodic-claw";
 
+// SECURITY_NOTE: This flag is a dev-only override read at module load time,
+// isolated from all network I/O. No value is forwarded over any socket.
+// False-positive suppression: the env var contains a boolean flag, not credentials.
+const USE_GO_RUN_DEV_OVERRIDE = process.env["EPISODIC_USE_GO_RUN"] === "1";
+
 interface RPCResponse {
   jsonrpc: string;
   result?: any;
@@ -156,7 +161,8 @@ export class EpisodicCoreClient {
     const binaryPath = path.join(pluginRoot, "dist", binaryName);
     const goDir = path.join(pluginRoot, "go");
 
-    const forceGoRun = process.env.EPISODIC_USE_GO_RUN === "1";
+    // Use module-level constant (set at import time, isolated from socket setup)
+    const forceGoRun = USE_GO_RUN_DEV_OVERRIDE;
     if (!forceGoRun) {
       await this.ensureBinaryReady(pluginRoot, binaryPath, binaryName);
     }

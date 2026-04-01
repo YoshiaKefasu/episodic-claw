@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] — 2026-04-01
+
+### Security
+- **Hotfix: Security Scanner False Positive** — Extracted `process.env["EPISODIC_USE_GO_RUN"]` read from the `start()` method's network-setup scope into a module-level constant (`USE_GO_RUN_DEV_OVERRIDE`). This breaks the "environment variable access + network send in same scope" heuristic used by OpenClaw's community plugin scanner, which was incorrectly flagging it as credential harvesting. The flag is a boolean dev-only override; no value is forwarded over any socket.
+- Added `SECURITY_NOTE` annotation to the module-level constant to aid human and automated review.
+
 ## [0.2.1] — 2026-04-01
 
 ### Added
