@@ -39,12 +39,15 @@ var (
 	vectorStores    = make(map[string]*vector.Store)
 
 	// Global rate limiters to respect Google AI Studio quotas across all handlers
-	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 1)  // 15 RPM
-	embedLimiter     = rate.NewLimiter(rate.Limit(100.0/60.0), 1) // 100 RPM
-	healEmbedLimiter = rate.NewLimiter(rate.Limit(10.0/60.0), 1)  // 10 RPM (Pass 1 Healing - 10% of main)
+	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 5)  // 15 RPM
+	embedLimiter     = rate.NewLimiter(rate.Limit(100.0/60.0), 10) // 100 RPM
+	healEmbedLimiter = rate.NewLimiter(rate.Limit(10.0/60.0), 2)  // 10 RPM (Pass 1 Healing - 10% of main)
 
 	// TPM-aware rate limiter: guards against token-count-based quota exhaustion.
 	tpmLimiter = rate.NewLimiter(rate.Limit(900_000.0/60.0), 15_000)
+
+	// In-memory query cache for deduplication (Step 3)
+	recallCache sync.Map // key: query string, value: recallCacheEntry
 
 	// Wakeup channel for instantaneous healing
 	healWorkerWakeup = make(chan struct{}, 1)
@@ -54,6 +57,11 @@ func init() {
 	tombstoneTTL = flag.Int("tombstone-ttl", 14, "Days to keep tombstones before deleting")
 	disableWorkers = flag.Bool("disable-workers", false, "Disable background healing and consolidation workers")
 	lexicalLimit = flag.Int("lexical-limit", 1000, "Max lexical pre-filter limit")
+}
+
+type recallCacheEntry struct {
+	vector []float32
+	expiry time.Time
 }
 
 func triggerHealing() {
@@ -981,7 +989,14 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	savedBy := ensureSavedBy(params.SavedBy)
 
 	ctx := context.Background()
-	embeddingProv := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
+	rawEmbedProv := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
+	// MED-2: Make retry & rate limiting unified and symmetric with handleRecall
+	embeddingProv := &ai.RetryEmbedder{
+		Inner:      rawEmbedProv,
+		Limiter:    embedLimiter,
+		MaxRetries: 2,
+		BaseDelay:  1 * time.Second,
+	}
 	vstore, err := getStore(params.AgentWs)
 	if err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: fmt.Sprintf("failed to get store: %v", err)}, ID: req.ID})
@@ -1016,20 +1031,16 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			slug := fmt.Sprintf("episode-%x", hash)
 			EmitLog("Quality Guard (BatchIngest): using MD5 safe-queue slug: %s", slug)
 
-			// P1-E FIX: Embed FIRST before writing Markdown to disk.
-			// We only sync-wait a max of 5 seconds to avoid RPC timeout (WARNING-3)
-			embedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			// embedLimiter is handled internally by RetryEmbedder now.
+			embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 
 			var emb []float32
 			var embErr error
-			if waitErr := embedLimiter.Wait(embedCtx); waitErr != nil {
-				EmitLog("BatchIngest: embedLimiter wait timeout (%v), skipping embedding for this item to prevent RPC timeout.", waitErr)
-				embErr = waitErr
-			} else if tpmErr := tpmLimiter.WaitN(embedCtx, ai.MaxEmbedRunes); tpmErr != nil {
+			if tpmErr := tpmLimiter.WaitN(embedCtx, ai.MaxEmbedRunes); tpmErr != nil {
 				EmitLog("BatchIngest: tpmLimiter timeout, skipping embedding for this item: %v", tpmErr)
 				embErr = tpmErr
 			} else {
-				emb, embErr = embeddingProv.EmbedContent(ctx, it.Summary)
+				emb, embErr = embeddingProv.EmbedContent(embedCtx, it.Summary)
 				if embErr != nil {
 					EmitLog("BatchIngest: EmbedContent failed for item, skipping DB insert: %v", embErr)
 				}
@@ -1458,22 +1469,49 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 		return
 	}
 
-	// Case 3 (P1): RetryEmbedder for realtime recall — 2 retries keep max latency ~3s.
-	// embedLimiter is passed to RetryEmbedder so coordination is internal.
-	rawProvider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
-	provider := &ai.RetryEmbedder{
-		Inner:      rawProvider,
-		Limiter:    embedLimiter,
-		MaxRetries: 2,
-		BaseDelay:  1 * time.Second,
+	// Step 3: API Deduplication via LRU Memory Cache
+	// MED-4: Normalize cache key for case-insensitivity
+	query := strings.TrimSpace(strings.ToLower(params.Query))
+	var emb []float32
+
+	if cached, ok := recallCache.Load(query); ok {
+		entry := cached.(recallCacheEntry)
+		if time.Now().Before(entry.expiry) {
+			emb = entry.vector
+			EmitLog("Recall: Cache hit for query '%s', skipping Embed API.", query)
+		} else {
+			recallCache.Delete(query)
+		}
 	}
-	ctx := context.Background()
-	recallCtx, recallCancel := context.WithTimeout(ctx, 10*time.Second)
-	emb, err := provider.EmbedContent(recallCtx, params.Query)
-	recallCancel()
-	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed to embed query: " + err.Error()}, ID: req.ID})
-		return
+
+	if emb == nil {
+		// Case 3 (P1): RetryEmbedder for realtime recall — 2 retries keep max latency ~3s.
+		// embedLimiter is passed to RetryEmbedder so coordination is internal.
+		rawProvider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
+		provider := &ai.RetryEmbedder{
+			Inner:      rawProvider,
+			Limiter:    embedLimiter,
+			MaxRetries: 2,
+			BaseDelay:  1 * time.Second,
+		}
+		ctx := context.Background()
+		recallCtx, recallCancel := context.WithTimeout(ctx, 10*time.Second)
+		var err error
+		emb, err = provider.EmbedContent(recallCtx, query)
+		recallCancel()
+		if err != nil {
+			// Step 4: Graceful Degradation on Rate Limits
+			if ai.IsRateLimitError(err) || strings.Contains(err.Error(), "deadline exceeded") {
+				EmitLog("Recall: API rate limit or timeout (%v). Falling back to Lexical search only.", err)
+				emb = make([]float32, 3072) // Provide Zero-vector for graceful fallback
+			} else {
+				sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed to embed query: " + err.Error()}, ID: req.ID})
+				return
+			}
+		} else {
+			// Cache successful embedding for 15 minutes
+			recallCache.Store(query, recallCacheEntry{vector: emb, expiry: time.Now().Add(15 * time.Minute)})
+		}
 	}
 
 	now := time.Now()
@@ -2033,6 +2071,23 @@ func main() {
 	ppid := flag.Int("ppid", 0, "Parent Process ID to monitor for suicide")
 	
 	flag.Parse()
+
+	// LOW-7: Launch periodic Garbage Collection for TTL Cache in main() to avoid init() anti-pattern
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			recallCache.Range(func(key, value any) bool {
+				if entry, ok := value.(recallCacheEntry); ok {
+					if now.After(entry.expiry) {
+						recallCache.Delete(key)
+					}
+				}
+				return true
+			})
+		}
+	}()
 
 	if *socketPath == "" {
 		EmitLog("Missing -socket argument")

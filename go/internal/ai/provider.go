@@ -59,7 +59,9 @@ func (e *APIError) RetryAfter() time.Duration {
 func IsRateLimitError(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.StatusCode == http.StatusTooManyRequests // 429
+		// LOW-6 & LOW-8: Support HTTP 429 and gRPC ResourceExhausted using a named constant
+		const grpcResourceExhausted = 8 // gRPC status code (google.rpc.Code)
+		return apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode == grpcResourceExhausted
 	}
 	return false
 }

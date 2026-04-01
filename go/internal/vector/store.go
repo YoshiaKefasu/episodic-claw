@@ -570,10 +570,7 @@ func (s *Store) Clear() error {
 	return nil
 }
 
-func (s *Store) Get(id string) (*EpisodeRecord, error) {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
+func (s *Store) getLocked(id string) (*EpisodeRecord, error) {
 	epKey := append(append([]byte(nil), prefixEp...), []byte(id)...)
 	val, closer, err := s.db.Get(epKey)
 	if err != nil {
@@ -586,6 +583,12 @@ func (s *Store) Get(id string) (*EpisodeRecord, error) {
 		return nil, err
 	}
 	return &rec, nil
+}
+
+func (s *Store) Get(id string) (*EpisodeRecord, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.getLocked(id)
 }
 
 // ListByTag returns all episode records that contain a specific tag.
@@ -627,17 +630,17 @@ func (s *Store) ListByTopic(topic string) ([]EpisodeRecord, error) {
 	key := topicKey(normalized[0])
 
 	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
 	ids := make([]string, 0)
 	if set, ok := s.topicIndex[key]; ok {
 		for id := range set {
 			ids = append(ids, id)
 		}
 	}
-	s.mutex.RUnlock()
 
 	if len(ids) > 0 {
 		results := make([]EpisodeRecord, 0, len(ids))
-		s.mutex.RLock()
 		for _, id := range ids {
 			epKey := append(append([]byte(nil), prefixEp...), []byte(id)...)
 			val, closer, err := s.db.Get(epKey)
@@ -650,14 +653,10 @@ func (s *Store) ListByTopic(topic string) ([]EpisodeRecord, error) {
 			}
 			closer.Close()
 		}
-		s.mutex.RUnlock()
 		return results, nil
 	}
 
 	// Legacy fallback: scan the store when the reverse index has not been hydrated yet.
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefixEp,
 		UpperBound: []byte("ep;"),
@@ -706,7 +705,7 @@ func (s *Store) GetByPath(path string) (*EpisodeRecord, error) {
 	idStr := string(idBytes)
 	closer.Close()
 
-	return s.Get(idStr)
+	return s.getLocked(idStr)
 }
 
 // DeleteByPath removes an episode physically by its SourcePath using the p2i reverse index.
