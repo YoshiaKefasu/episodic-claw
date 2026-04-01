@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
+import { createHash } from "crypto";
 import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
@@ -64,13 +65,121 @@ function normalizeTopics(rawTopics: unknown): string[] {
   return topics;
 }
 
+type WorkspaceResolution = {
+  agentId: string;
+  agentWs: string;
+  defaultAgentId: string;
+  defaultWs: string;
+};
+
+type RecallCacheState = {
+  lastRecallResult: string;
+  lastRecallTime: number;
+  lastRecallFullKey: string;
+};
+
+type AgentRuntimeState = {
+  agentId: string;
+  lastAgentWs: string;
+  segmenter: EventSegmenter;
+  compactor: Compactor;
+  recallCache: RecallCacheState;
+  lastSetMetaTime: number;
+};
+
+const WORKSPACE_CACHE_PREFIX = "episodic-claw-workspace";
+
+function resolveDefaultAgentId(cfgAgents: any): string {
+  let defaultAgentId = "main";
+  if (cfgAgents?.list && Array.isArray(cfgAgents.list) && cfgAgents.list.length > 0) {
+    const defaults = cfgAgents.list.filter((a: any) => a.default);
+    defaultAgentId = (defaults[0] ?? cfgAgents.list[0])?.id?.trim() || "main";
+  }
+  return defaultAgentId;
+}
+
+function resolveUserPath(rawPath: string): string {
+  let wsPath = rawPath;
+  if (wsPath.startsWith("~/") || wsPath.startsWith("~\\")) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    wsPath = path.join(homeDir, wsPath.slice(2));
+  } else if (wsPath === "~") {
+    wsPath = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  }
+  return path.resolve(wsPath);
+}
+
+function resolveWorkspaceRoot(agentId: string, cfgAgents: any): string {
+  let wsPath = "";
+  const targetAgent = cfgAgents?.list?.find((a: any) => a.id === agentId);
+  if (targetAgent && typeof targetAgent.workspace === "string" && targetAgent.workspace.trim() !== "") {
+    wsPath = targetAgent.workspace.trim();
+  } else if (cfgAgents?.defaults?.workspace && typeof cfgAgents.defaults.workspace === "string" && cfgAgents.defaults.workspace.trim() !== "") {
+    wsPath = cfgAgents.defaults.workspace.trim();
+  } else {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const wsDirName = agentId === "main" ? "workspace" : `workspace-${agentId}`;
+    wsPath = path.join(homeDir, ".openclaw", wsDirName);
+  }
+  return resolveUserPath(wsPath);
+}
+
+function workspaceCachePath(agentId: string): string {
+  return path.join(os.tmpdir(), `${WORKSPACE_CACHE_PREFIX}.${agentId}.path`);
+}
+
+function readWorkspaceCache(agentId: string): string | null {
+  try {
+    const cached = fs.readFileSync(workspaceCachePath(agentId), "utf8").trim();
+    return cached || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeWorkspaceCache(agentId: string, agentWs: string): void {
+  try {
+    fs.writeFileSync(workspaceCachePath(agentId), agentWs, "utf8");
+  } catch {}
+}
+
+function resolveAgentWorkspaces(ctx: any, openClawGlobalConfig: any): WorkspaceResolution {
+  const agentId = extractAgentId(ctx);
+  const cfgAgents = openClawGlobalConfig?.agents;
+  const defaultAgentId = resolveDefaultAgentId(cfgAgents);
+  const agentRoot = resolveWorkspaceRoot(agentId, cfgAgents);
+  const defaultRoot = resolveWorkspaceRoot(defaultAgentId, cfgAgents);
+  let agentWs = path.join(agentRoot, "episodes");
+  const cached = readWorkspaceCache(agentId);
+  if (cached && !cfgAgents) {
+    agentWs = cached;
+  }
+  writeWorkspaceCache(agentId, agentWs);
+  const defaultWs = path.join(defaultRoot, "episodes");
+  return { agentId, agentWs, defaultAgentId, defaultWs };
+}
+
+function matchWorkspaceForPath(filePath: string, workspaces: Iterable<string>): string | null {
+  const normalized = path.resolve(filePath);
+  let bestMatch = "";
+  for (const workspace of workspaces) {
+    const normalizedWs = path.resolve(workspace);
+    if (normalized === normalizedWs || normalized.startsWith(`${normalizedWs}${path.sep}`)) {
+      if (normalizedWs.length > bestMatch.length) {
+        bestMatch = normalizedWs;
+      }
+    }
+  }
+  return bestMatch || null;
+}
+
 const PluginConfigSchema = Type.Object(
   {
     enabled: Type.Optional(Type.Boolean({
       description: "Enable or disable the plugin (default true)."
     })),
     reserveTokens: Type.Optional(Type.Integer({
-      description: "Max tokens reserved for injected episode memories in the system prompt (default 6144)."
+      description: "Max tokens reserved for injected episode memories in the system prompt (default 2048)."
     })),
     recentKeep: Type.Optional(Type.Integer({
       description: "Number of recent turns to retain during compaction (default 30)."
@@ -87,10 +196,10 @@ const PluginConfigSchema = Type.Object(
       description: "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
     })),
     sharedEpisodesDir: Type.Optional(Type.String({
-      description: "(Planned — Phase 6) Path to a shared episodes directory across multiple agents. Has no effect in current version."
+      description: "Disabled and ignored. Shared episodes directories are no longer used at runtime."
     })),
     allowCrossAgentRecall: Type.Optional(Type.Boolean({
-      description: "(Planned — Phase 6) Whether to include other agents' episodes in recall results. Has no effect in current version."
+      description: "Disabled and ignored. Cross-agent recall is no longer used at runtime."
     })),
     segmentationLambda: Type.Optional(Type.Number({
       description: "Adaptive segmentation: threshold = mean + lambda * std."
@@ -142,17 +251,13 @@ const PluginConfigSchema = Type.Object(
 const SINGLETON_KEY = Symbol.for("__episodic_claw_singleton__");
 type SingletonType = {
   rpcClient: EpisodicCoreClient;
-  segmenter: EventSegmenter;
   retriever: EpisodicRetriever;
-  compactor: Compactor;
-  debouncer?: FileEventDebouncer;
   sidecarStarted: boolean;
-  resolvedAgentWs: string;
-  lastRecallResult: string;
-  lastRecallTime: number;
-  lastRecallFullKey: string;
-  lastSetMetaTime: number;
   cfg: ReturnType<typeof loadConfig>;
+  agentStates: Map<string, AgentRuntimeState>;
+  debouncers: Map<string, FileEventDebouncer>;
+  watcherWorkspaces: Set<string>;
+  watcherDegradedWorkspaces: Set<string>;
 };
 let _singleton: SingletonType | null = null;
 
@@ -183,37 +288,16 @@ const episodicClawPlugin = {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
         const cfg = loadConfig(openClawGlobalConfig);
         const rpcClient = new EpisodicCoreClient();
-        const segmenter = new EventSegmenter(
-          rpcClient,
-          cfg.dedupWindow,
-          cfg.maxBufferChars,
-          cfg.maxCharsPerChunk,
-          {
-            lambda: cfg.segmentationLambda,
-            warmupCount: cfg.segmentationWarmupCount,
-            minRawSurprise: cfg.segmentationMinRawSurprise,
-            cooldownTurns: cfg.segmentationCooldownTurns,
-            stdFloor: cfg.segmentationStdFloor,
-            fallbackThreshold: cfg.segmentationFallbackThreshold,
-          }
-        );
         const retriever = new EpisodicRetriever(rpcClient, cfg);
-        const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
-        const debouncer = new FileEventDebouncer(rpcClient);
-        const recallCalibration = buildRecallCalibration(cfg);
         _singleton = {
           rpcClient,
-          segmenter,
           retriever,
-          compactor,
-          debouncer,
           sidecarStarted: false,
-          resolvedAgentWs: "",
-          lastRecallResult: "",
-          lastRecallTime: 0,
-          lastRecallFullKey: "",
-          lastSetMetaTime: 0,
           cfg,
+          agentStates: new Map(),
+          debouncers: new Map(),
+          watcherWorkspaces: new Set(),
+          watcherDegradedWorkspaces: new Set(),
         };
         (global as any)[SINGLETON_KEY] = _singleton; // global に保存してプロセス全体で共有
         console.log("[Episodic Memory] Singleton created.");
@@ -221,7 +305,7 @@ const episodicClawPlugin = {
         console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
       }
 
-      const { rpcClient, segmenter, retriever, compactor, cfg } = _singleton;
+      const { rpcClient, retriever, cfg } = _singleton;
       const recallCalibration = buildRecallCalibration(cfg);
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
@@ -237,6 +321,93 @@ const episodicClawPlugin = {
       // ingest() が N 回呼ばれても setMeta は最大 5 秒に 1 回のみ発行する。
       const SET_META_INTERVAL_MS = 5000;
 
+      const getAgentState = (agentId: string): AgentRuntimeState => {
+        const existing = _singleton!.agentStates.get(agentId);
+        if (existing) return existing;
+        const segmenter = new EventSegmenter(
+          rpcClient,
+          cfg.dedupWindow,
+          cfg.maxBufferChars,
+          cfg.maxCharsPerChunk,
+          {
+            lambda: cfg.segmentationLambda,
+            warmupCount: cfg.segmentationWarmupCount,
+            minRawSurprise: cfg.segmentationMinRawSurprise,
+            cooldownTurns: cfg.segmentationCooldownTurns,
+            stdFloor: cfg.segmentationStdFloor,
+            fallbackThreshold: cfg.segmentationFallbackThreshold,
+          }
+        );
+        const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
+        const state: AgentRuntimeState = {
+          agentId,
+          lastAgentWs: "",
+          segmenter,
+          compactor,
+          recallCache: {
+            lastRecallResult: "",
+            lastRecallTime: 0,
+            lastRecallFullKey: "",
+          },
+          lastSetMetaTime: 0,
+        };
+        _singleton!.agentStates.set(agentId, state);
+        return state;
+      };
+
+      const clearRecallCache = (state: AgentRuntimeState) => {
+        state.recallCache.lastRecallResult = "";
+        state.recallCache.lastRecallTime = 0;
+        state.recallCache.lastRecallFullKey = "";
+      };
+
+      const invalidateRecallCacheForWorkspace = (workspace: string) => {
+        if (!workspace) return;
+        for (const state of _singleton!.agentStates.values()) {
+          if (state.lastAgentWs === workspace) {
+            clearRecallCache(state);
+          }
+        }
+      };
+
+      const getDebouncerForWorkspace = (agentWs: string): FileEventDebouncer => {
+        const existing = _singleton!.debouncers.get(agentWs);
+        if (existing) return existing;
+        const debouncer = new FileEventDebouncer(rpcClient, agentWs, 2000, invalidateRecallCacheForWorkspace);
+        _singleton!.debouncers.set(agentWs, debouncer);
+        return debouncer;
+      };
+
+      const ensureWatcher = async (agentWs: string): Promise<void> => {
+        if (!agentWs) return;
+        if (_singleton!.watcherWorkspaces.has(agentWs)) return;
+        _singleton!.watcherWorkspaces.add(agentWs);
+        try {
+          await fs.promises.mkdir(agentWs, { recursive: true });
+        } catch {}
+        try {
+          await Promise.race([
+            rpcClient.startWatcher(agentWs),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Watcher Start Timeout")), 5000))
+          ]);
+        } catch (err) {
+          _singleton!.watcherWorkspaces.delete(agentWs);
+          _singleton!.watcherDegradedWorkspaces.add(agentWs);
+          console.warn("[Episodic Memory] Failed to start watcher; falling back to rebuildIndex.", err);
+          try {
+            await rpcClient.rebuildIndex(agentWs, agentWs);
+            console.log(`[Episodic Memory] Rebuild fallback completed for ${agentWs}.`);
+            invalidateRecallCacheForWorkspace(agentWs);
+          } catch (rebuildErr) {
+            console.error("[Episodic Memory] Rebuild fallback failed.", rebuildErr);
+          }
+        }
+      };
+
+      const prepareWorkspaces = async (resolution: WorkspaceResolution) => {
+        await ensureWatcher(resolution.agentWs);
+      };
+
       api.on("gateway_start", async (event?: any, _ctx?: any) => {
         if (_singleton!.sidecarStarted) {
           console.log("[Episodic Memory] Sidecar already started, skipping duplicate gateway_start");
@@ -246,56 +417,23 @@ const episodicClawPlugin = {
         console.log("[Episodic Memory] Starting Go sidecar...", event?.port ? `(gateway port: ${event.port})` : "");
         await rpcClient.start(_singleton!.cfg);
 
-        // 正しい workspace 解決ロジックの実装
-        const cfgAgents = openClawGlobalConfig?.agents;
-        let defaultAgentId = "main";
-        if (cfgAgents?.list && Array.isArray(cfgAgents.list) && cfgAgents.list.length > 0) {
-          const defaults = cfgAgents.list.filter((a: any) => a.default);
-          defaultAgentId = (defaults[0] ?? cfgAgents.list[0])?.id?.trim() || "main";
+        const defaultAgentId = resolveDefaultAgentId(openClawGlobalConfig?.agents);
+        const resolution = resolveAgentWorkspaces({ agentId: defaultAgentId }, openClawGlobalConfig);
+        console.log(`[Episodic Memory] Resolved default workspace dir: ${resolution.agentWs}`);
+        await prepareWorkspaces(resolution);
+        if (_singleton!.watcherDegradedWorkspaces.size > 0) {
+          console.warn("[Episodic Memory] One or more watcher workspaces are degraded; rebuild fallback is active.");
         }
-
-        let wsPath = "";
-        const targetAgent = cfgAgents?.list?.find((a: any) => a.id === defaultAgentId);
-        if (targetAgent && typeof targetAgent.workspace === 'string' && targetAgent.workspace.trim() !== '') {
-          wsPath = targetAgent.workspace.trim();
-        } else if (cfgAgents?.defaults?.workspace && typeof cfgAgents.defaults.workspace === 'string' && cfgAgents.defaults.workspace.trim() !== '') {
-          wsPath = cfgAgents.defaults.workspace.trim();
-        } else {
-          const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
-          const wsDirName = defaultAgentId === "main" ? "workspace" : `workspace-${defaultAgentId}`;
-          wsPath = path.join(homeDir, ".openclaw", wsDirName);
-        }
-
-        // チルダ展開と絶対パスへの解決 (OpenClaw の resolveUserPath と同等)
-        if (wsPath.startsWith("~/") || wsPath.startsWith("~\\")) {
-          const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
-          wsPath = path.join(homeDir, wsPath.slice(2));
-        } else if (wsPath === "~") {
-          wsPath = process.env.HOME || process.env.USERPROFILE || os.homedir();
-        }
-        wsPath = path.resolve(wsPath);
-
-        _singleton!.resolvedAgentWs = path.join(wsPath, "episodes");
-        console.log(`[Episodic Memory] Resolved workspace dir: ${_singleton!.resolvedAgentWs}`);
-        // クロスクロージャ/スレッド共有用にワークスペースパスをファイルに保存
-        try { fs.writeFileSync(path.join(os.tmpdir(), "episodic-claw-workspace.path"), _singleton!.resolvedAgentWs, "utf8"); } catch {};
-
-        // ディレクトリが存在しない場合は自動作成
-        await fs.promises.mkdir(_singleton!.resolvedAgentWs, { recursive: true });
 
         // Connect the onFileChange raw event to the Debouncer
         rpcClient.onFileChange = (event) => {
-          if (_singleton?.debouncer && _singleton.resolvedAgentWs) {
-            _singleton.debouncer.push(event, _singleton.resolvedAgentWs);
-          }
+          const eventPath = event?.Path ?? event?.path;
+          if (!eventPath) return;
+          const matched = matchWorkspaceForPath(eventPath, _singleton!.watcherWorkspaces);
+          if (!matched) return;
+          const debouncer = getDebouncerForWorkspace(matched);
+          debouncer.push(event);
         };
-
-        Promise.race([
-          rpcClient.startWatcher(_singleton!.resolvedAgentWs),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Watcher Start Timeout")), 5000))
-        ]).catch(err => {
-          console.error("[Episodic Memory] Failed to start watcher.", err);
-        });
       });
 
       api.on("gateway_stop", async (event?: any, _ctx?: any) => {
@@ -307,11 +445,12 @@ const episodicClawPlugin = {
       // Fix C: before_reset フック — セッション消去前（buffer がまだ有効）に flush を開始
       // openclaw は void 発火のため完了保証はないが、最も早いタイミングで RPC を発行できる
       api.on("before_reset", async (_event?: any, ctx?: any) => {
-        if (!_singleton!.resolvedAgentWs) return;
-        const agentId = extractAgentId(ctx);
+        const { agentId, agentWs } = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+        if (!agentWs) return;
+        const state = getAgentState(agentId);
         console.log("[Episodic Memory] before_reset: flushing segmenter buffer...");
         try {
-          await segmenter.forceFlush(_singleton!.resolvedAgentWs, agentId);
+          await state.segmenter.forceFlush(agentWs, agentId);
           console.log("[Episodic Memory] before_reset: flush complete");
         } catch (err) {
           console.error("[Episodic Memory] before_reset: forceFlush error", err);
@@ -325,85 +464,102 @@ const episodicClawPlugin = {
             name: "Episodic Memory Engine",
             ownsCompaction: true,
           },
-          async ingest(ctx: any) {
-            const msgs = (ctx.messages || []) as Message[];
-            const agentId = extractAgentId(ctx);
-            // BUG-1修正: クロスクロージャ/スレッド対応 — ファイルからワークスペースパスを復元
-            if (!_singleton!.resolvedAgentWs) {
-              try {
-                const wp = fs.readFileSync(path.join(os.tmpdir(), "episodic-claw-workspace.path"), "utf8").trim();
-                if (wp) { _singleton!.resolvedAgentWs = wp; console.log(`[Episodic Memory] ingest: loaded workspace from file: ${wp}`); }
-              } catch {}
+        async ingest(ctx: any) {
+          const msgs = (ctx.messages || []) as Message[];
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) return { ingested: false };
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
+          try {
+            clearRecallCache(state);
+            await state.segmenter.processTurn(msgs, agentWs, agentId);
+            // [Fix D-3] setMeta rate-limit: フォールバック連発時の spam を抑制
+            const nowMeta = Date.now();
+            if (nowMeta - state.lastSetMetaTime >= SET_META_INTERVAL_MS) {
+              await rpcClient.setMeta("last_activity", nowMeta.toString(), agentWs);
+              state.lastSetMetaTime = nowMeta;
             }
-            try {
-              const boundaryCrossed = await segmenter.processTurn(msgs, _singleton!.resolvedAgentWs, agentId);
-              // [Fix D-3] setMeta rate-limit: フォールバック連発時の spam を抑制
-              const nowMeta = Date.now();
-              if (nowMeta - _singleton!.lastSetMetaTime >= SET_META_INTERVAL_MS) {
-                await rpcClient.setMeta("last_activity", nowMeta.toString(), _singleton!.resolvedAgentWs);
-                _singleton!.lastSetMetaTime = nowMeta;
-              }
-            } catch (err) {
-              console.error("[Episodic Memory] Error processing ingest:", err);
-            }
-            return { ingested: true };
-          },
-          async assemble(ctx: any) {
-            const msgs = (ctx.messages || []) as Message[];
-            const agentId = extractAgentId(ctx);
-            // BUG-1修正: クロスクロージャ/スレッド対応 — ファイルからワークスペースパスを復元
-            if (!_singleton!.resolvedAgentWs) {
-              try {
-                const wp = fs.readFileSync(path.join(os.tmpdir(), "episodic-claw-workspace.path"), "utf8").trim();
-                if (wp) { _singleton!.resolvedAgentWs = wp; console.log(`[Episodic Memory] assemble: loaded workspace from file: ${wp}`); }
-              } catch {}
-            }
+            clearRecallCache(state);
+          } catch (err) {
+            console.error("[Episodic Memory] Error processing ingest:", err);
+          }
+          return { ingested: true };
+        },
+        async assemble(ctx: any) {
+          const msgs = (ctx.messages || []) as Message[];
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
+            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
+          }
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
 
-            // ⚠️ OpenClaw は ingest() をメモリフラッシュ時にしか呼ばないため、
-            // 毎ターン確実に呼ばれる assemble() 内でセグメンテーションを発火させる。
-            // fire-and-forget で assemble のレスポンス速度に影響しないようにする。
-            segmenter.processTurn(msgs, _singleton!.resolvedAgentWs, agentId).catch(err => {
-              console.log("[Episodic Memory] Segmenter error in assemble:", err);
-            });
+          // ⚠️ OpenClaw は ingest() をメモリフラッシュ時にしか呼ばないため、
+          // 毎ターン確実に呼ばれる assemble() 内でセグメンテーションを発火させる。
+          // fire-and-forget で assemble のレスポンス速度に影響しないようにする。
+          state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
+            console.log("[Episodic Memory] Segmenter error in assemble:", err);
+          });
 
-            const totalBudget = ctx.tokenBudget || 8192;
-            const reserveTokens = cfg.reserveTokens ?? 6144;
-            const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
+          const totalBudget = ctx.tokenBudget || 8192;
+          const reserveTokens = cfg.reserveTokens ?? 2048;
+          const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
+          if (maxEpisodicTokens <= 0) {
+            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
+          }
 
-            // [Fix D-2] recall debounce: フォールバック連発時の多重 RPC を抑制
-            // コンテンツキー（最後のユーザーメッセージ）+ 時間キーの二重条件でキャッシュ判定。
-            // 同一クエリ → 時間に関わらず cache hit、異なるクエリ → 即失効。
-            // BUG-1 修正: _singleton 経由で共有（二重 register() でもキャッシュが引き継がれる）
-            const now = Date.now();
-            const lastUserMsg = msgs.filter(m => m.role === "user").slice(-1)[0];
-            const recallKey = lastUserMsg
-              ? extractText(lastUserMsg.content).trim().slice(0, 200)
-              : "";
-            // agentId を含めてキー化することでマルチエージェント環境での recall 結果漏洩を防ぐ（R-3 対応）
-            const fullKey = `${agentId}:${recallKey}`;
-            let episodicContext: string;
-            const isCacheHit = fullKey
-              && fullKey === _singleton!.lastRecallFullKey
-              && (now - _singleton!.lastRecallTime < RECALL_DEBOUNCE_MS)
-              && _singleton!.lastRecallResult;
-            if (isCacheHit) {
-              episodicContext = _singleton!.lastRecallResult;
-              console.log(`[Episodic Memory] recall debounce: cache hit for same query (${now - _singleton!.lastRecallTime}ms since last recall)`);
-            } else {
-              episodicContext = await retriever.retrieveRelevantContext(msgs, _singleton!.resolvedAgentWs, 5, maxEpisodicTokens);
-              _singleton!.lastRecallResult = episodicContext;
-              _singleton!.lastRecallTime = now;
-              _singleton!.lastRecallFullKey = fullKey;
-            }
-            return {
-              messages: msgs,
-              prependSystemContext: episodicContext,
-              estimatedTokens: estimateTokens(episodicContext),
-            };
+          const k = 5;
+          const now = Date.now();
+          const recentMessages = msgs.slice(-5);
+          const queryParts = recentMessages
+            .map(m => {
+              const content = extractText(m.content).trim();
+              return content ? `${m.role}: ${content}` : "";
+            })
+            .filter(part => part.length > 0);
+          const fullQuery = queryParts.join("\n").trim();
+          const queryHash = fullQuery ? createHash("sha1").update(fullQuery).digest("hex") : "";
+          const fullKey = queryHash
+            ? `${agentId}::${agentWs}::${maxEpisodicTokens}::${k}::${queryHash}`
+            : "";
+
+          let episodicContext: string;
+          const cache = state.recallCache;
+          const isCacheHit = fullKey
+            && fullKey === cache.lastRecallFullKey
+            && (now - cache.lastRecallTime < RECALL_DEBOUNCE_MS)
+            && cache.lastRecallResult;
+          if (isCacheHit) {
+            episodicContext = cache.lastRecallResult;
+            console.log(`[Episodic Memory] recall debounce: cache hit for same query (${now - cache.lastRecallTime}ms since last recall)`);
+          } else {
+            episodicContext = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxEpisodicTokens);
+            cache.lastRecallResult = episodicContext;
+            cache.lastRecallTime = now;
+            cache.lastRecallFullKey = fullKey;
+          }
+          return {
+            messages: msgs,
+            prependSystemContext: episodicContext,
+            estimatedTokens: estimateTokens(episodicContext),
+          };
           },
           async compact(ctx: any) {
-            ctx.resolvedAgentWs = _singleton!.resolvedAgentWs;
-            return await compactor.compact(ctx);
+            const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+            const { agentId, agentWs } = resolution;
+            if (!agentWs) return { ok: false, compacted: false };
+            await prepareWorkspaces(resolution);
+            const state = getAgentState(agentId);
+            state.lastAgentWs = agentWs;
+            ctx.resolvedAgentWs = agentWs;
+            clearRecallCache(state);
+            const result = await state.compactor.compact(ctx);
+            clearRecallCache(state);
+            return result;
           }
         };
       });
@@ -425,9 +581,14 @@ const episodicClawPlugin = {
         parameters: EpRecallSchema,
         execute: async (_toolCallId: string, params: any) => {
           // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ
-          if (!_singleton!.resolvedAgentWs) {
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
             return { content: [{ type: "text", text: "My memory isn't up yet — the gateway hasn't started. Try again in a moment." }] };
           }
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
           const p = (params || {}) as Record<string, unknown>;
           const k = typeof p.k === "number" ? p.k : 3;
           const topics = Array.isArray(p.topics)
@@ -436,14 +597,15 @@ const episodicClawPlugin = {
           // For ep-recall (explicit facet search), default to strict filtering when not specified.
           const strictTopics = typeof (p as any).strictTopics === "boolean" ? ((p as any).strictTopics as boolean) : true;
           try {
-            const results = await rpcClient.recall(
+            const primaryResults = await rpcClient.recall(
               p.query as string || "",
               k,
-              _singleton!.resolvedAgentWs,
+              agentWs,
               topics,
               strictTopics,
               recallCalibration
             );
+            const results = (primaryResults ?? []).slice(0, k);
             if (!results || results.length === 0) {
               return { content: [{ type: "text", text: "Nothing came back. I don't have any memories matching that." }] };
             }
@@ -495,10 +657,14 @@ const episodicClawPlugin = {
         parameters: EpSaveSchema,
         execute: async (_toolCallId: string, params: any) => {
           // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ
-          if (!_singleton!.resolvedAgentWs) {
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
             return { content: [{ type: "text", text: "My memory isn't up yet — the gateway hasn't started. Try again in a moment." }] };
           }
-          const agentId = extractAgentId(ctx);
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
           try {
             const p = (params || {}) as Record<string, unknown>;
             const raw: string = (p.content as string) || (p.summary as string) || "";
@@ -506,7 +672,7 @@ const episodicClawPlugin = {
             if (!raw || typeof raw !== "string" || !raw.trim()) {
               return { content: [{ type: "text", text: "Nothing to save — the content was empty. Write something and I'll hold onto it." }] };
             }
-
+            invalidateRecallCacheForWorkspace(agentWs);
             const runes = Array.from(raw);
             const content = runes.length > 3600 ? runes.slice(0, 3600).join("") + "\n...(truncated)" : raw;
             const topicSource = Array.isArray(p.topics) && p.topics.length > 0 ? p.topics : p.tags;
@@ -516,7 +682,7 @@ const episodicClawPlugin = {
             }
             const slugRes = await rpcClient.generateEpisodeSlug({
               summary: content,
-              agentWs: _singleton!.resolvedAgentWs,
+              agentWs,
               topics,
               tags: ["manual-save"],
               edges: [],
@@ -543,14 +709,19 @@ const episodicClawPlugin = {
         parameters: EpExpandSchema,
         execute: async (_toolCallId: string, params: any) => {
           // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ
-          if (!_singleton!.resolvedAgentWs) {
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
             return { content: [{ type: "text", text: "My memory isn't up yet — the gateway hasn't started. Try again in a moment." }] };
           }
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
           try {
             const p = (params || {}) as Record<string, unknown>;
-            const expanded = await rpcClient.expand(p.slug as string || "", _singleton!.resolvedAgentWs);
+            let expanded = await rpcClient.expand(p.slug as string || "", agentWs);
             if (!expanded || !expanded.children || expanded.children.length === 0) {
-               return { content: [{ type: "text", text: "Nothing underneath that one — either it doesn't exist yet or it's not a summary node." }] };
+              return { content: [{ type: "text", text: "Nothing underneath that one — either it doesn't exist yet or it's not a summary node." }] };
             }
             return {
               content: [{ type: "text", text: `Here's what's stored under that summary:\n${expanded.body}` }],

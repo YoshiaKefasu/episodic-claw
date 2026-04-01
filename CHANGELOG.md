@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.5] — 2026-04-02
+
+### Added
+- Added a smoke test (`test_phase4_5.ts`) to protect the v0.2.5 runtime contract. It checks the `reserveTokens` default, `postinstall` behavior, workspace-scoped caching, and the freshness rules.
+- Wrote down the freshness contract for recall. Ingest-boundary reads are now treated as `eventual freshness`, not instant propagation.
+
+### Changed
+- `sharedEpisodesDir` and `allowCrossAgentRecall` are still present in the schema, but they are now disabled at runtime and do not change behavior.
+- Each agent now uses only its own workspace. That means `Recall`, `ep-save`, `ep-recall`, `ep-expand`, cache invalidation, and watcher routing all stay inside one agent's workspace.
+- `assemble()` now injects memory only from the active agent workspace. It no longer reads from cross-agent or legacy shared stores.
+- `ep-recall` and `ep-expand` now stay on the agent workspace too, so manual memory lookup matches automatic prompt injection.
+- Recall feedback goes back to the active agent workspace only. That keeps learning signals from leaking across workspaces.
+- Recall cache keys now include agent identity, workspace, token budget, tool fan-out size, and the full recall query hash, so cache hits are less likely to be wrong.
+- `reserveTokens` is set to `2048` everywhere: config loading, schema, and docs. That keeps the injected memory budget consistent.
+- `postinstall` is more forgiving now. If the binary download fails, `EPISODIC_SKIP_POSTINSTALL=1` can skip it, and normal download failures warn instead of killing `npm install`.
+- Release metadata and docs were synced across `package.json`, `package-lock.json`, `openclaw.plugin.json`, and the README files.
+
+### Fixed
+- `ep-recall` no longer returns raw JSON. It now shows episode text in a format people can read.
+- Tool output no longer exposes embedding vectors, so the UI stays clean.
+- Fixed the `FileEvent` casing mismatch, so watcher events accept both `Path` and `path`.
+- Fixed the `ep-save` cache invalidation path, so saving a memory clears the right workspace cache.
+- Hardened ingest and compaction so recall cache state does not get cleared too early before debounce checks run.
+- Kept watcher fallback handling resilient, so if a watcher fails the active workspace can still fall back to `rebuildIndex`.
+
 ## [0.2.4] — 2026-04-01
 
 ### Fixed

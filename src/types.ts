@@ -30,11 +30,11 @@ export interface MarkdownDocument {
 export interface FileEvent {
   Path: string;
   Operation: string;
+  // Some sources send lowercase "path"; keep optional for compatibility.
+  path?: string;
 }
 
 export interface EpisodicPluginConfig {
-  sharedEpisodesDir?: string;
-  allowCrossAgentRecall: boolean;
   tombstoneRetentionDays?: number;
   enableBackgroundWorkers?: boolean;
   lexicalPreFilterLimit?: number;

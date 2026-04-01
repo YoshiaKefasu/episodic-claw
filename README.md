@@ -167,7 +167,7 @@ In v0.2.1, we exposed the AI's brain chemistry to the UI. The defaults are alrea
 
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
-| `reserveTokens` | `64000` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
+| `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
 | `recentKeep` | `96` | **Too high:** Eats your API token limit instantly. **Too low:** The AI loses the flow of the current chat and acts confused. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |
 | `maxBufferChars` | `7200` | **Too high:** You risk losing a massive chunk of chat if the PC crashes. **Too low:** The AI murders your hard drive by saving tiny files every second. |
@@ -225,7 +225,7 @@ I built this because AI agents deserve better memory than a basic rolling chat w
 Keeping this running means paying for raw Claude and OpenAI Codex API hits. If this plugin literally saved a project for you, even a small sponsor amount is a lifesaver.
 
 Future goals:
-- cross-agent recall (Agents sharing memories)
+- keep each agent on its own workspace by default
 - memory decay (Forgetting useless stuff over years)
 - A slick web UI for messing with the DB directly
 

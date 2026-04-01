@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "crypto";
 import { buildRecallCalibration } from "./config";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig } from "./types";
-import { Message } from "./segmenter";
+import { Message, extractText } from "./segmenter";
 import { estimateTokens } from "./utils";
 
 export class EpisodicRetriever {
@@ -23,22 +23,34 @@ export class EpisodicRetriever {
     maxTokens: number = 4096
   ): Promise<string> {
     if (currentMessages.length === 0) return "";
+    if (maxTokens <= 0) return "";
 
     // Build the query from the recent N messages
     const recentMessages = currentMessages.slice(-5);
-    const queryParts = recentMessages.map(m => `${m.role}: ${m.content}`);
-    const query = queryParts.join("\n");
+    const queryParts = recentMessages
+      .map(m => {
+        const content = extractText(m.content).trim();
+        return content ? `${m.role}: ${content}` : "";
+      })
+      .filter(part => part.length > 0);
+    const query = queryParts.join("\n").trim();
+    if (!query) return "";
     const calibration = this.config ? buildRecallCalibration(this.config) : undefined;
 
     try {
-      const results = await this.rpcClient.recall(query, k, agentWs, [], undefined, calibration);
-      if (!results || results.length === 0) {
+      let sourcedResults: Array<{ ws: string; item: any }> = [];
+      try {
+        const results = await this.rpcClient.recall(query, k, agentWs, [], undefined, calibration);
+        if (results && results.length > 0) {
+          sourcedResults = results.map(item => ({ ws: agentWs, item }));
+        }
+      } catch (err) {
+        console.warn("[Episodic Memory] Recall failed for primary workspace:", err);
+      }
+      if (sourcedResults.length === 0) {
         return "";
       }
 
-      const recalledIds = results
-        .map((res: any) => res?.Record?.id ?? res?.Record?.ID ?? "")
-        .filter((id: unknown): id is string => typeof id === "string" && id.trim().length > 0);
       const queryHash = createHash("sha1").update(query).digest("hex");
 
       // System hint: placed at the top so the model sees it before any episode content.
@@ -47,19 +59,30 @@ export class EpisodicRetriever {
       assembled += "Here's what I pulled up that looks relevant:\n\n";
 
       let tokenCount = 0;
-      const injectedIds: string[] = [];
+      const injectedIdsByWs = new Map<string, string[]>();
 
-      for (const res of results) {
+      const scoreOf = (res: any): number => {
+        if (typeof res?.Score === "number") return res.Score;
+        if (typeof res?.score === "number") return res.score;
+        return 0;
+      };
+
+      const deduped = sourcedResults
+        .slice()
+        .sort((a, b) => scoreOf(b.item) - scoreOf(a.item));
+
+      for (let index = 0; index < deduped.length; index += 1) {
+        const res = deduped[index].item;
         const title = res.Record?.title || res.Record?.id || "Unknown";
         const date = res.Record?.timestamp ? new Date(res.Record.timestamp).toISOString().split('T')[0] : "unknown date";
-        const score = res.Score !== undefined ? res.Score.toFixed(3) : "N/A";
+        const score = scoreOf(res) !== 0 ? scoreOf(res).toFixed(3) : "N/A";
 
         const episodeId = (res?.Record?.id ?? res?.Record?.ID ?? "").toString().trim();
         const bodyText = res.Body ? res.Body.trim() : "(nothing stored here)";
         const entryTokens = estimateTokens(bodyText);
 
         if (tokenCount + entryTokens > maxTokens) {
-          const remainingIds = results.slice(results.indexOf(res)).map(r => r.Record?.id).filter(Boolean);
+          const remainingIds = deduped.slice(index).map(r => r.item.Record?.id).filter(Boolean);
           assembled += `\n(${remainingIds.length} more matched but I hit my token limit. I can pull those up with ep-recall:)\n`;
           assembled += remainingIds.map(id => `- ${id}`).join("\n") + "\n";
           break;
@@ -69,16 +92,19 @@ export class EpisodicRetriever {
         assembled += bodyText + "\n\n";
         tokenCount += entryTokens;
         if (episodeId) {
-          injectedIds.push(episodeId);
+          const bucket = injectedIdsByWs.get(agentWs) ?? [];
+          bucket.push(episodeId);
+          injectedIdsByWs.set(agentWs, bucket);
         }
       }
 
       assembled += "--- End of Memory ---\n";
 
-      if (injectedIds.length > 0) {
+      for (const [ws, injectedIds] of injectedIdsByWs.entries()) {
+        if (injectedIds.length === 0) continue;
         try {
           await this.rpcClient.recallFeedback({
-            agentWs,
+            agentWs: ws,
             feedbackId: randomUUID(),
             queryHash,
             shown: injectedIds,
@@ -95,7 +121,7 @@ export class EpisodicRetriever {
 
     } catch (err) {
       console.error("[Episodic Memory] Retrieval failed:", err);
-      return `[Episodic Memory Retrieval Failed: ${(err as Error).message}]`;
+      return "";
     }
   }
 }

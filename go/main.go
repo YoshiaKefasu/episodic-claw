@@ -208,7 +208,7 @@ func sendEvent(conn net.Conn, method string, params interface{}) {
 }
 
 var (
-	globalWatcher     *watcher.Watcher
+	globalWatchers    map[string]*watcher.Watcher
 	globalWatcherConn net.Conn
 	globalWatcherMu   sync.Mutex
 )
@@ -227,8 +227,13 @@ func handleWatcherStart(conn net.Conn, req RPCRequest) {
 	}
 
 	globalWatcherMu.Lock()
-	if globalWatcher != nil {
-		globalWatcher.Stop()
+	if globalWatchers == nil {
+		globalWatchers = make(map[string]*watcher.Watcher)
+	}
+	if existing := globalWatchers[path]; existing != nil {
+		globalWatcherMu.Unlock()
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Watcher already active on " + path, ID: req.ID})
+		return
 	}
 
 	w, err := watcher.New(1500, func(event watcher.FileEvent) {
@@ -241,10 +246,12 @@ func handleWatcherStart(conn net.Conn, req RPCRequest) {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{-32000, err.Error()}, ID: req.ID})
 		return
 	}
-	globalWatcher = w
+	globalWatchers[path] = w
 	globalWatcherConn = conn
 
-	if err := globalWatcher.AddRecursive(path); err != nil {
+	if err := w.AddRecursive(path); err != nil {
+		w.Stop()
+		delete(globalWatchers, path)
 		globalWatcherMu.Unlock()
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{-32000, "Failed to watch dir: " + err.Error()}, ID: req.ID})
 		return
@@ -2140,10 +2147,14 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	defer func() {
 		globalWatcherMu.Lock()
-		if globalWatcherConn == conn && globalWatcher != nil {
-			EmitLog("Connection closed. Stopping globalWatcher tied to this connection.")
-			globalWatcher.Stop()
-			globalWatcher = nil
+		if globalWatcherConn == conn && globalWatchers != nil {
+			EmitLog("Connection closed. Stopping watchers tied to this connection.")
+			for path, w := range globalWatchers {
+				if w != nil {
+					w.Stop()
+				}
+				delete(globalWatchers, path)
+			}
 			globalWatcherConn = nil
 		}
 		globalWatcherMu.Unlock()

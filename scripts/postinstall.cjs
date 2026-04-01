@@ -25,6 +25,20 @@ const platform = os.platform();
 const binaryName = platform === "win32" ? "episodic-core.exe" : "episodic-core";
 const binaryPath = path.join(DIST, binaryName);
 const downloadURL = `https://github.com/${REPO}/releases/download/v${version}/${binaryName}`;
+const skipPostinstall = process.env.EPISODIC_SKIP_POSTINSTALL === "1";
+
+function printManualInstallHint() {
+  console.error("[episodic-claw] You can download manually:");
+  console.error(`  ${downloadURL}`);
+  console.error(`  -> Place it at: ${binaryPath}`);
+}
+
+function warnAndContinue(reason) {
+  console.warn(`[episodic-claw] ${reason}`);
+  console.warn("[episodic-claw] Continuing without the sidecar binary. Memory features will stay unavailable until the binary is installed.");
+  printManualInstallHint();
+  process.exit(0);
+}
 
 if (fs.existsSync(binaryPath)) {
   if (platform !== "win32") {
@@ -40,13 +54,17 @@ if (!fs.existsSync(DIST)) {
   fs.mkdirSync(DIST, { recursive: true });
 }
 
+if (skipPostinstall) {
+  warnAndContinue("Skipping sidecar download because EPISODIC_SKIP_POSTINSTALL=1.");
+}
+
 console.log(`[episodic-claw] Downloading Go sidecar binary for ${platform}...`);
 console.log(`[episodic-claw] ${downloadURL}`);
 
 function download(url, dest, redirectCount = 0) {
   if (redirectCount > 5) {
-    console.error("[episodic-claw] Too many redirects. Download failed.");
-    process.exit(1);
+    warnAndContinue("Too many redirects. Download failed.");
+    return;
   }
 
   https
@@ -56,11 +74,8 @@ function download(url, dest, redirectCount = 0) {
       }
 
       if (res.statusCode !== 200) {
-        console.error(`[episodic-claw] Download failed: HTTP ${res.statusCode}`);
-        console.error("[episodic-claw] You can download manually:");
-        console.error(`  ${downloadURL}`);
-        console.error(`  -> Place it at: ${binaryPath}`);
-        process.exit(1);
+        warnAndContinue(`Download failed: HTTP ${res.statusCode}`);
+        return;
       }
 
       const total = parseInt(res.headers["content-length"] || "0", 10);
@@ -92,16 +107,11 @@ function download(url, dest, redirectCount = 0) {
 
       file.on("error", (err) => {
         fs.unlink(dest, () => {});
-        console.error("[episodic-claw] File write error:", err.message);
-        process.exit(1);
+        warnAndContinue(`File write error: ${err.message}`);
       });
     })
     .on("error", (err) => {
-      console.error("[episodic-claw] Network error:", err.message);
-      console.error("[episodic-claw] You can download manually:");
-      console.error(`  ${downloadURL}`);
-      console.error(`  -> Place it at: ${binaryPath}`);
-      process.exit(1);
+      warnAndContinue(`Network error: ${err.message}`);
     });
 }
 

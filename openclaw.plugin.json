@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -29,7 +29,7 @@
       },
       "reserveTokens": {
         "type": "integer",
-        "description": "The maximum 'brain space' (tokens) reserved strictly for injecting past memories into the system prompt. Default: 64000.\n⚠️ [Blast Radius] If too high: The AI's prompt gets too crowded, leaving no room to process your current question (causing crashes). If too low: The AI becomes forgetful and gives confused, out-of-context answers."
+        "description": "The maximum 'brain space' (tokens) reserved strictly for injecting past memories into the system prompt. Default: 2048.\n⚠️ [Blast Radius] If too high: The AI's prompt gets too crowded, leaving no room to process your current question (causing crashes). If too low: The AI becomes forgetful and gives confused, out-of-context answers."
       },
       "recentKeep": {
         "type": "integer",
@@ -103,11 +103,11 @@
       },
       "sharedEpisodesDir": {
         "type": "string",
-        "description": "Directory path for sharing memories across multiple agents.\n⚠️ Currently disabled in this version."
+        "description": "Disabled and ignored. Shared episode directories are no longer used at runtime."
       },
       "allowCrossAgentRecall": {
         "type": "boolean",
-        "description": "Flag to mix other agents' memories into the search results.\n⚠️ Currently disabled in this version."
+        "description": "Disabled and ignored. Cross-agent recall is no longer used at runtime."
       },
       "tombstoneRetentionDays": {
         "type": "integer",

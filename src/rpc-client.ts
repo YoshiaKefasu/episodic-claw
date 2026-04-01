@@ -612,24 +612,31 @@ export class FileEventDebouncer {
   private dlq: Array<{ path: string; operation: "WRITE" | "REMOVE"; retries: number }> = [];
   private readonly intervalMs: number;
   private intervalId: NodeJS.Timeout | null = null;
-  private currentAgentWs: string | null = null;
+  private agentWs: string;
+  private onIndex?: (agentWs: string) => void;
 
   constructor(
     private client: EpisodicCoreClient,
-    intervalMs = 2000
+    agentWs: string,
+    intervalMs = 2000,
+    onIndex?: (agentWs: string) => void
   ) {
+    this.agentWs = agentWs;
     this.intervalMs = intervalMs;
+    this.onIndex = onIndex;
   }
 
   /**
    * Push an event into the debouncer.
    */
-  public push(event: any, agentWs: string) {
-    this.currentAgentWs = agentWs;
+  public push(event: any) {
+    const eventPath = event?.Path ?? event?.path;
+    if (!eventPath) return;
+
     if (event.Operation === "REMOVE" || event.Operation === "RENAME_DELETE" || event.Operation === "unlink") {
-      this.queue.set(event.Path, "REMOVE");
+      this.queue.set(eventPath, "REMOVE");
     } else if (event.Operation === "WRITE" || event.Operation === "CREATE" || event.Operation === "add" || event.Operation === "change") {
-      this.queue.set(event.Path, "WRITE");
+      this.queue.set(eventPath, "WRITE");
     }
     
     if (!this.intervalId) {
@@ -638,7 +645,7 @@ export class FileEventDebouncer {
   }
 
   private async flush() {
-    if ((this.queue.size === 0 && this.dlq.length === 0) || !this.currentAgentWs) {
+    if (this.queue.size === 0 && this.dlq.length === 0) {
       if (this.intervalId && this.queue.size === 0 && this.dlq.length === 0) {
         clearInterval(this.intervalId);
         this.intervalId = null;
@@ -664,7 +671,9 @@ export class FileEventDebouncer {
     }
     this.queue.clear();
 
-    const agentWs = this.currentAgentWs;
+    const agentWs = this.agentWs;
+
+    let indexed = false;
 
     if (writes.length > 0) {
       for (let i = 0; i < writes.length; i += 100) {
@@ -672,6 +681,7 @@ export class FileEventDebouncer {
         try {
           await this.client.triggerBackgroundIndex(chunk, agentWs);
           console.log(`[Episodic Memory] Background index triggered for ${chunk.length} files (Chunk ${Math.floor(i / 100) + 1}).`);
+          indexed = true;
         } catch (err) {
           console.error(`[Debouncer] Failed batch write chunk, moving to DLQ:`, err);
           for (const p of chunk) {
@@ -693,6 +703,7 @@ export class FileEventDebouncer {
         try {
           await this.client.batchDeleteEpisodes(chunk, agentWs);
           console.log(`[Episodic Memory] Batch deletion triggered for ${chunk.length} files (Chunk ${Math.floor(i / 100) + 1}).`);
+          indexed = true;
         } catch (err) {
           console.error(`[Debouncer] Failed batch remove chunk, moving to DLQ:`, err);
           for (const p of chunk) {
@@ -708,6 +719,10 @@ export class FileEventDebouncer {
       }
     }
     
+    if (indexed && this.onIndex) {
+      this.onIndex(agentWs);
+    }
+
     if (this.queue.size === 0 && this.dlq.length === 0 && this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
