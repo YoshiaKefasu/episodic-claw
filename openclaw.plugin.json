@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -25,89 +25,103 @@
     "properties": {
       "enabled": {
         "type": "boolean",
-        "description": "Enable or disable the plugin (default true)."
+        "description": "ON/OFF switch for the Episodic Memory engine. Default: true.\n⚠️ [Blast Radius] If OFF: The AI completely loses its long-term memory and acts like a goldfish with complete amnesia."
       },
       "reserveTokens": {
         "type": "integer",
-        "description": "Max tokens reserved for injected episode memories in the system prompt (default 6144)."
+        "description": "The maximum 'brain space' (tokens) reserved strictly for injecting past memories into the system prompt. Default: 64000.\n⚠️ [Blast Radius] If too high: The AI's prompt gets too crowded, leaving no room to process your current question (causing crashes). If too low: The AI becomes forgetful and gives confused, out-of-context answers."
       },
       "recentKeep": {
         "type": "integer",
-        "description": "Number of recent turns to retain during compaction (default 30)."
+        "description": "How many raw, recent chat messages to keep 'hot' in memory before compressing them into the long-term database. Default: 96.\n⚠️ [Blast Radius] If too high: It eats up your token limit instantly. If too low: The AI loses the flow of the current conversation and breaks the chat logic."
       },
       "dedupWindow": {
         "type": "integer",
-        "description": "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
+        "description": "How many turns back the engine looks to block duplicate spam messages. Default: 5.\n⚠️ [Blast Radius] If too high: The AI might wrongly ignore repeated but necessary commands. If too low: Your DB gets flooded with double-posts when the network lags."
       },
       "maxBufferChars": {
         "type": "integer",
         "minimum": 500,
-        "description": "Character threshold that triggers a forced buffer flush regardless of surprise score (default 7200). Must be >= 500."
+        "description": "The character limit that forces the chat buffer to save (Flush) to disk. Default: 7200.\n⚠️ [Blast Radius] If too high: You risk losing a massive amount of unsaved memory if the app crashes. If too low (e.g. <500): The AI spams your disk with tiny, fragmented memory files and murders your PC's I/O performance."
       },
       "maxCharsPerChunk": {
         "type": "integer",
         "minimum": 500,
-        "description": "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
+        "description": "The max size of a single memory chunk sent to the Batch Ingest DB. Default: 9000.\n⚠️ [Blast Radius] If too high: The database chokes on massive text blocks and times out. If too low: A single long conversation gets diced into chaotic pieces, ruining the context when you recall it later."
       },
       "segmentationLambda": {
         "type": "number",
-        "description": "Adaptive segmentation: threshold = mean + lambda * std."
+        "description": "The AI's topic-shift sensitivity. Calculated as 'mean + (lambda * std)'. Default: 2.0.\n⚠️ [Blast Radius] If too high: The AI never groups memories even when the topic completely changes. If too low: The AI becomes hyper-sensitive and slices the memory pointlessly just because you used a new word."
       },
       "segmentationWarmupCount": {
         "type": "integer",
-        "description": "Adaptive segmentation: number of observations needed before dynamic scoring."
+        "description": "How many messages the AI needs to observe to learn your 'chat style' before using dynamic sensitivity. Default: 20.\n⚠️ [Blast Radius] If too high: The AI stays in a dumb 'fixed threshold' mode for way too long. If too low: It finishes learning on skewed data and its slicing logic gets permanently bugged."
       },
       "segmentationMinRawSurprise": {
         "type": "number",
-        "description": "Adaptive segmentation: raw surprise floor below which boundaries are not cut."
+        "description": "The absolute minimum 'Surprise Score' required to authorize cutting a new memory boundary.\n⚠️ [Blast Radius] If too high: Slow, natural topic shifts are never saved and become one giant blob. If too low: The AI saves 'Um, okay' as completely separate, spammy memories."
       },
       "segmentationCooldownTurns": {
         "type": "integer",
-        "description": "Adaptive segmentation: cooldown turns after a detected boundary."
+        "description": "Mandatory wait turns after slicing a memory before the AI is allowed to slice again.\n⚠️ [Blast Radius] If too long: Fast-paced topic changes get merged into high-speed chaos. If too short: The memory slicing misfires back-to-back, creating a hellish spam of 1-turn memories."
       },
       "segmentationStdFloor": {
         "type": "number",
-        "description": "Adaptive segmentation: minimum std floor to avoid over-sensitive scoring."
+        "description": "A safety net (Standard Deviation floor) to prevent the AI from becoming hyper-sensitive during boring chats.\n⚠️ [Blast Radius] If too low: During a boring chat, dropping a slightly interesting word causes the AI to overreact and snap the memory in half."
       },
       "segmentationFallbackThreshold": {
         "type": "number",
-        "description": "Adaptive segmentation: fixed threshold used during fallback or warmup."
+        "description": "The fixed threshold used when the AI hasn't learned your style yet (Warmup) or encounters an error.\n⚠️ [Blast Radius] If too high: Early conversations never get sliced. If too low: Early conversations get minced into dust."
       },
       "recallSemanticFloor": {
         "type": "number",
-        "description": "Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay."
+        "description": "Recall search limit: Any memory with a vector similarity score below this is thrown in the trash.\n⚠️ [Blast Radius] If too high: The AI becomes a perfectionist and throws away useful memories, recalling nothing. If too low: It pulls up irrelevant garbage memories, causing hallucination (lying)."
       },
       "recallUsefulnessClamp": {
         "type": "number",
-        "description": "Recall calibration: cap usefulness posterior contribution so it stays a correction term."
+        "description": "The maximum 'bonus points' a past memory can receive for being useful previously.\n⚠️ [Blast Radius] If too high: One old, viral memory hogs the top spot forever, burying new important memories (Echo Chamber effect). If too low: The AI can't learn from past successes."
       },
       "recallReplayTieBreakMaxBoost": {
         "type": "number",
-        "description": "Recall calibration: maximum replay-state tie-break boost."
+        "description": "A tiny pity bonus given to old memories that haven't been reviewed in a while (Spaced Repetition).\n⚠️ [Blast Radius] If too high: Dead, useless memories hijack the search results simply because they are 'old'."
       },
       "recallReplayLowRetrievabilityBonus": {
         "type": "number",
-        "description": "Recall calibration: tiny extra boost when a replay candidate is clearly getting stale."
+        "description": "The final desperate point boost given to a memory right before it gets permanently forgotten (decayed).\n⚠️ [Blast Radius] If too high: Garbage memories get zombified and refuse to die, turning your vector DB into a slum."
       },
       "recallTopicsMatchBoost": {
         "type": "number",
-        "description": "Recall calibration: bonus per matched topic."
+        "description": "Bonus points awarded when your search perfectly matches the memory's tags/topics.\n⚠️ [Blast Radius] If too high: The AI blindly grabs irrelevant memories just because the tags match, acting completely stupid."
       },
       "recallTopicsMismatchPenalty": {
         "type": "number",
-        "description": "Recall calibration: penalty when topics exist but none match."
+        "description": "Point penalty given to a memory that has tags, but completely missed your search criteria.\n⚠️ [Blast Radius] If too high: A crucial memory with slightly mismatched tags gets locked in the DB dungeon forever."
       },
       "recallTopicsMissingPenalty": {
         "type": "number",
-        "description": "Recall calibration: penalty when the record has no topics at all. Usually zero."
+        "description": "Point penalty for memories that have ZERO tags (Recommended: 0).\n⚠️ [Blast Radius] If too high: All your old 'tagless' ace memories get blacklisted and excluded from search."
       },
       "sharedEpisodesDir": {
         "type": "string",
-        "description": "(Planned — Phase 6) Path to a shared episodes directory across multiple agents. Has no effect in current version."
+        "description": "Directory path for sharing memories across multiple agents.\n⚠️ Currently disabled in this version."
       },
       "allowCrossAgentRecall": {
         "type": "boolean",
-        "description": "(Planned — Phase 6) Whether to include other agents' episodes in recall results. Has no effect in current version."
+        "description": "Flag to mix other agents' memories into the search results.\n⚠️ Currently disabled in this version."
+      },
+      "tombstoneRetentionDays": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "How many days to wait before physically deleting forgotten (Tombstoned) memories from the disk. Default: 14.\n⚠️ [Blast Radius] If too short: You have zero time to salvage an important memory that got accidentally forgotten. If too long: You waste hard drive space endlessly."
+      },
+      "enableBackgroundWorkers": {
+        "type": "boolean",
+        "description": "Enables background workers that summarize (D1) and self-heal your memory DB. Default: true.\n⚠️ [Blast Radius] If false: You save some LLM API money, but your database turns into an unorganized, uncompressed junkyard."
+      },
+      "lexicalPreFilterLimit": {
+        "type": "integer",
+        "minimum": 100,
+        "description": "The max number of memories the lightning-fast Lexical (N-gram) engine filters before passing them to the heavy HNSW vector math. Default: 1000.\n⚠️ [Blast Radius] If too high: Your CPU burns up attempting heavy vector math on the entire database. If too low: Excellent memories get casually thrown out by the dumb text-filter, ruining search accuracy."
       }
     }
   }

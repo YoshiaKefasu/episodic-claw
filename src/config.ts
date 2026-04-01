@@ -8,8 +8,11 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
   return {
     sharedEpisodesDir: rawConfig?.sharedEpisodesDir,
     allowCrossAgentRecall: rawConfig?.allowCrossAgentRecall ?? true,
-    reserveTokens: rawConfig?.reserveTokens ?? 6144,
-    recentKeep: rawConfig?.recentKeep ?? 30,
+    tombstoneRetentionDays: rawConfig?.tombstoneRetentionDays ?? 14,
+    enableBackgroundWorkers: rawConfig?.enableBackgroundWorkers ?? true,
+    lexicalPreFilterLimit: rawConfig?.lexicalPreFilterLimit ?? 1000,
+    reserveTokens: rawConfig?.reserveTokens ?? 64000,
+    recentKeep: rawConfig?.recentKeep ?? 96,
     dedupWindow: rawConfig?.dedupWindow ?? 5,
     maxBufferChars: Math.max(500, rawConfig?.maxBufferChars ?? 7200),
     maxCharsPerChunk: Math.max(500, rawConfig?.maxCharsPerChunk ?? 9000),

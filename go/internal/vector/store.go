@@ -16,11 +16,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"episodic-core/frontmatter"
-
 	"github.com/Bithack/go-hnsw"
 	"github.com/cockroachdb/pebble"
 	"github.com/vmihailenco/msgpack/v5"
+	"github.com/blevesearch/bleve/v2"
+
+	"episodic-core/frontmatter"
 )
 
 // EpisodeRecord encapsulates metadata and the raw embedding for persistent storage.
@@ -58,6 +59,17 @@ type EpisodeRecord struct {
 	DueLagSecondsLast    int64              `json:"due_lag_seconds_last,omitempty" msgpack:"due_lag_seconds_last,omitempty"`
 	DueLagSecondsMax     int64              `json:"due_lag_seconds_max,omitempty" msgpack:"due_lag_seconds_max,omitempty"`
 	LastDueAt            time.Time          `json:"last_due_at,omitempty" msgpack:"last_due_at,omitempty"`
+	// Phase 2: Hippocampus Scoring
+	ImportanceScore      float32            `json:"importance_score,omitempty" msgpack:"importance_score,omitempty"`
+	NoiseScore           float32            `json:"noise_score,omitempty" msgpack:"noise_score,omitempty"`
+	PruneState           string             `json:"prune_state,omitempty" msgpack:"prune_state,omitempty"`
+	CanonicalParent      string             `json:"canonical_parent,omitempty" msgpack:"canonical_parent,omitempty"`
+	LastScoredAt         time.Time          `json:"last_scored_at,omitempty" msgpack:"last_scored_at,omitempty"`
+	TombstonedAt         time.Time          `json:"tombstoned_at,omitempty" msgpack:"tombstoned_at,omitempty"`
+
+	// ContentHash is the first 16 hex chars of SHA-256 over the MD body.
+	// Used by Smart Dedup to skip re-embedding when the body has not changed.
+	ContentHash          string             `json:"content_hash,omitempty" msgpack:"content_hash,omitempty"`
 }
 
 // RecallCalibration tunes the recall rerank without changing the core retrieval path.
@@ -70,6 +82,7 @@ type RecallCalibration struct {
 	TopicsMatchBoost             *float32 `json:"topicsMatchBoost,omitempty"`
 	TopicsMismatchPenalty        *float32 `json:"topicsMismatchPenalty,omitempty"`
 	TopicsMissingPenalty         *float32 `json:"topicsMissingPenalty,omitempty"`
+	LexicalTopK                  *int     `json:"lexicalTopK,omitempty"`
 }
 
 // ScoredEpisode wraps an EpisodeRecord with its distance score (0.0 to 2.0).
@@ -79,6 +92,7 @@ type ScoredEpisode struct {
 	Distance            float32       `json:"Distance"`
 	Score               float32       `json:"Score"` // Final re-ranked score
 	SemanticScore       float32       `json:"semanticScore,omitempty"`
+	BM25Score           float32       `json:"bm25Score,omitempty"`
 	FreshnessScore      float32       `json:"freshnessScore,omitempty"`
 	SurpriseScore       float32       `json:"surpriseScore,omitempty"`
 	UsefulnessScore     float32       `json:"usefulnessScore,omitempty"`
@@ -98,11 +112,19 @@ type Watermark struct {
 	AbsIndex uint32 `json:"absIndex"`
 }
 
+type StoreConfig struct {
+	TombstoneTTL       int // days
+	LexicalFilterLimit int // max items from bleve
+}
+
 type Store struct {
+	config        StoreConfig
 	db            *pebble.DB
 	graph         *hnsw.Hnsw
 	topicIndex    map[string]map[string]struct{}
 	activeD0Index map[string]time.Time
+	lexical       bleve.Index
+	lexicalCancel context.CancelFunc
 	mutex         sync.RWMutex
 	maxID         uint32
 	IsRefining    atomic.Bool
@@ -113,11 +135,13 @@ var (
 	prefixEp     = []byte("ep:")
 	prefixS2I    = []byte("s2i:")
 	prefixI2S    = []byte("i2s:")
+	prefixP2I    = []byte("p2i:") // path to UUID mapping for physical deletion
+	prefixLexQ   = []byte("sys_lexq:")
 	keyMaxID     = []byte("meta:maxid")
 	keyWatermark = []byte("meta:watermark")
 )
 
-func NewStore(dbDir string) (*Store, error) {
+func NewStore(dbDir string, cfg StoreConfig) (*Store, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create vector db dir: %w", err)
 	}
@@ -147,17 +171,32 @@ func NewStore(dbDir string) (*Store, error) {
 	// M=32, efConstruction=200, dimensionality=3072, no random seed
 	graph := hnsw.New(32, 200, make([]float32, 3072))
 
+	lexicalIdx, err := openLexicalIndex(dbDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open lexical index: %w", err)
+	}
+
+	lexCtx, lexCancel := context.WithCancel(context.Background())
+
 	store := &Store{
+		config:        cfg,
 		db:            db,
 		graph:         graph,
 		topicIndex:    make(map[string]map[string]struct{}),
 		activeD0Index: make(map[string]time.Time),
+		lexical:       lexicalIdx,
+		lexicalCancel: lexCancel,
 		maxID:         0,
 	}
+
+	go store.lexicalWorker(lexCtx)
 
 	if err := store.loadIndexFromPebble(); err != nil {
 		return nil, fmt.Errorf("failed to load hnsw index from pebble: %w", err)
 	}
+
+	// Trigger background cleanup and migration
+	store.CleanOrphans()
 
 	return store, nil
 }
@@ -222,41 +261,129 @@ func (s *Store) loadIndexFromPebble() error {
 	return nil
 }
 
-func (s *Store) getNextID() (uint32, error) {
+// CleanOrphans scans the storage for any episodes whose SourcePath no longer exists on the filesystem,
+// and removes them. Additionally, it ensures the p2i reverse index is populated for existing files.
+func (s *Store) CleanOrphans() {
+	go func() {
+		s.mutex.RLock()
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: prefixEp,
+			UpperBound: []byte("ep;"),
+		})
+		s.mutex.RUnlock()
+
+		if err != nil {
+			log.Printf("[Store] Orphan cleanup failed to initialize iter: %v", err)
+			return
+		}
+		defer iter.Close()
+
+		var toDelete []string
+		var toMigrate []EpisodeRecord
+
+		for iter.First(); iter.Valid(); iter.Next() {
+			var rec EpisodeRecord
+			if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil && rec.SourcePath != "" {
+				if _, statErr := os.Stat(rec.SourcePath); os.IsNotExist(statErr) {
+					// Ghost record found
+					toDelete = append(toDelete, string(rec.ID))
+				} else {
+					// File exists, let's make sure its p2i index is there (migration)
+					toMigrate = append(toMigrate, rec)
+				}
+			}
+		}
+
+		// Now apply changes outside the global scan iterator
+		if len(toDelete) > 0 {
+			log.Printf("[Store] Orphan cleanup: found %d ghost records, deleting...", len(toDelete))
+			for _, id := range toDelete {
+				s.Delete(id) // leverages the new pebble.Batch atomic deletion
+			}
+		}
+
+		// Perform p2i migration for legacy records
+		migrated := 0
+		for _, rec := range toMigrate {
+			normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
+			p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+
+			s.mutex.RLock()
+			_, closer, getErr := s.db.Get(p2iKey)
+			s.mutex.RUnlock()
+
+			switch getErr {
+			case pebble.ErrNotFound:
+				// Needs migration
+				s.mutex.Lock()
+				s.db.Set(p2iKey, []byte(rec.ID), pebble.NoSync)
+				s.mutex.Unlock()
+				migrated++
+			case nil:
+				closer.Close()
+			}
+		}
+		if migrated > 0 {
+			log.Printf("[Store] Orphan cleanup: migrated %d existing records to include p2i reverse index.", migrated)
+		}
+	}()
+}
+
+
+// enqueueSysLexq writes a lexical queue task directly into PebbleDB to guarantee processing.
+func (s *Store) enqueueSysLexq(batch *pebble.Batch, action string, recordID string) {
+	key := []byte(fmt.Sprintf("sys_lexq:%d:%s", time.Now().UnixNano(), recordID))
+	val := []byte(action)
+	if batch != nil {
+		_ = batch.Set(key, val, nil)
+	} else {
+		_ = s.db.Set(key, val, pebble.NoSync)
+	}
+}
+
+func (s *Store) getNextID(batch *pebble.Batch) (uint32, error) {
 	s.maxID++
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, s.maxID)
-	if err := s.db.Set(keyMaxID, buf, pebble.Sync); err != nil {
-		return 0, err
+	if batch != nil {
+		if err := batch.Set(keyMaxID, buf, nil); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := s.db.Set(keyMaxID, buf, pebble.Sync); err != nil {
+			return 0, err
+		}
 	}
 	return s.maxID, nil
 }
 
 func (s *Store) Add(ctx context.Context, rec EpisodeRecord) error {
+	// Initialize / Update Phase 2.1 Stage 1 score before hitting DB
+	CalculateImportanceStage1(&rec)
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
 
 	// 1. Get or Create uint32 ID mapping
 	s2iKey := append(append([]byte(nil), prefixS2I...), []byte(rec.ID)...)
 	var uid uint32
+	var oldRec *EpisodeRecord
 
 	val, closer, err := s.db.Get(s2iKey)
-	var oldRec *EpisodeRecord
 	switch err {
 	case pebble.ErrNotFound:
-		uid, err = s.getNextID()
+		uid, err = s.getNextID(batch)
 		if err != nil {
 			return err
 		}
-
 		uidBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(uidBuf, uid)
-
-		// write map
-		s.db.Set(s2iKey, uidBuf, pebble.NoSync)
-
+		batch.Set(s2iKey, uidBuf, nil)
 		i2sKey := append(append([]byte(nil), prefixI2S...), uidBuf...)
-		s.db.Set(i2sKey, []byte(rec.ID), pebble.NoSync)
+		batch.Set(i2sKey, []byte(rec.ID), nil)
 
 	case nil:
 		uid = binary.BigEndian.Uint32(val)
@@ -279,12 +406,20 @@ func (s *Store) Add(ctx context.Context, rec EpisodeRecord) error {
 	}
 
 	epKey := append(append([]byte(nil), prefixEp...), []byte(rec.ID)...)
-	if err := s.db.Set(epKey, data, pebble.Sync); err != nil {
-		return fmt.Errorf("failed to write to pebble: %w", err)
+	batch.Set(epKey, data, nil)
+
+	if rec.SourcePath != "" {
+		normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
+		p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+		batch.Set(p2iKey, []byte(rec.ID), nil)
 	}
 
-	// 3. Add to HNSW
-	// Ensure uniform dimensionality (3072 for gemini-embedding-2-preview default)
+	s.enqueueSysLexq(batch, "ADD", rec.ID)
+
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("failed to commit to pebble: %w", err)
+	}
+
 	if len(rec.Vector) != 3072 {
 		return fmt.Errorf("vector length mismatch: expected 3072, got %d", len(rec.Vector))
 	}
@@ -296,6 +431,120 @@ func (s *Store) Add(ctx context.Context, rec EpisodeRecord) error {
 	return nil
 }
 
+// BatchAdd atomically adds or updates multiple records in one transaction.
+func (s *Store) BatchAdd(ctx context.Context, records []EpisodeRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	
+	for i := range records {
+		CalculateImportanceStage1(&records[i])
+	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	var newUids []uint32
+	needNewID := 0
+
+	for _, rec := range records {
+		s2iKey := append(append([]byte(nil), prefixS2I...), []byte(rec.ID)...)
+		_, closer, err := s.db.Get(s2iKey)
+		switch err {
+		case pebble.ErrNotFound:
+			needNewID++
+		case nil:
+			closer.Close()
+		}
+	}
+
+	if needNewID > 0 {
+		startID := s.maxID + 1
+		s.maxID += uint32(needNewID)
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, s.maxID)
+		batch.Set(keyMaxID, buf, nil)
+
+		newUids = make([]uint32, needNewID)
+		for i := 0; i < needNewID; i++ {
+			newUids[i] = startID + uint32(i)
+		}
+	}
+
+	type memOp struct {
+		uid    uint32
+		record EpisodeRecord
+		oldRec *EpisodeRecord
+	}
+	var ops []memOp
+	uidIdx := 0
+
+	for _, rec := range records {
+		s2iKey := append(append([]byte(nil), prefixS2I...), []byte(rec.ID)...)
+		var uid uint32
+		var oldRec *EpisodeRecord
+
+		val, closer, err := s.db.Get(s2iKey)
+		switch err {
+		case pebble.ErrNotFound:
+			uid = newUids[uidIdx]
+			uidIdx++
+			uidBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(uidBuf, uid)
+
+			batch.Set(s2iKey, uidBuf, nil)
+			i2sKey := append(append([]byte(nil), prefixI2S...), uidBuf...)
+			batch.Set(i2sKey, []byte(rec.ID), nil)
+		case nil:
+			uid = binary.BigEndian.Uint32(val)
+			closer.Close()
+			if existing, oCloser, oErr := s.db.Get(append(append([]byte(nil), prefixEp...), []byte(rec.ID)...)); oErr == nil {
+				var prev EpisodeRecord
+				if uErr := msgpack.Unmarshal(existing, &prev); uErr == nil {
+					oldRec = &prev
+				}
+				oCloser.Close()
+			}
+		}
+
+		data, err := msgpack.Marshal(&rec)
+		if err != nil {
+			return err
+		}
+		epKey := append(append([]byte(nil), prefixEp...), []byte(rec.ID)...)
+		batch.Set(epKey, data, nil)
+
+		if rec.SourcePath != "" {
+			normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
+			p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+			batch.Set(p2iKey, []byte(rec.ID), nil)
+		}
+
+		s.enqueueSysLexq(batch, "ADD", rec.ID)
+		ops = append(ops, memOp{uid: uid, record: rec, oldRec: oldRec})
+	}
+
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("failed to commit batch add: %w", err)
+	}
+
+	for i, op := range ops {
+		if i > 0 && i%100 == 0 {
+			// allow search queries to jump in during large ingestion
+			s.mutex.Unlock()
+			s.mutex.Lock()
+		}
+		s.graph.Grow(int(op.uid))
+		s.graph.Add(hnsw.Point(op.record.Vector), op.uid)
+		s.refreshTopicIndexLocked(op.oldRec, &op.record)
+		s.refreshActiveD0IndexLocked(op.oldRec, &op.record)
+	}
+
+	return nil
+}
 func (s *Store) Clear() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -431,14 +680,93 @@ func (s *Store) ListByTopic(topic string) ([]EpisodeRecord, error) {
 	return results, nil
 }
 
-// Delete completely removes the episode ID and its mappings from Pebble.
+// Delete completely removes the episode ID and its mappings from Pebble atomically.
 func (s *Store) Delete(id string) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	return s.deleteLocked(id)
+}
 
+// GetByPath fetches an EpisodeRecord by its SourcePath using the p2i reverse index.
+// Returns the record and nil error on success, or an error (including pebble.ErrNotFound) on failure.
+func (s *Store) GetByPath(path string) (*EpisodeRecord, error) {
+	if path == "" {
+		return nil, fmt.Errorf("empty path")
+	}
+	normalizedPath := filepath.ToSlash(filepath.Clean(path))
+
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+	idBytes, closer, err := s.db.Get(p2iKey)
+	if err != nil {
+		return nil, err
+	}
+	idStr := string(idBytes)
+	closer.Close()
+
+	return s.Get(idStr)
+}
+
+// DeleteByPath removes an episode physically by its SourcePath using the p2i reverse index.
+func (s *Store) DeleteByPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	normalizedPath := filepath.ToSlash(filepath.Clean(path))
+	
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+	idBytes, closer, err := s.db.Get(p2iKey)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil // Already deleted or doesn't exist
+		}
+		return err
+	}
+	idStr := string(idBytes)
+	closer.Close()
+	
+	return s.deleteLocked(idStr)
+}
+
+// DeleteByPaths provides a bulk, atomic removal of multiple episodes by their SourcePaths.
+// IMPORTANT: It checks physical existence using os.Stat before deletion to guard against RENAME ADD/DELETE ordering issues.
+func (s *Store) DeleteByPaths(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+
+		// [STAT GUARD] Check if file actually exists.
+		// If it exists, it means a bogus or out-of-order DELETE event arrived (e.g., from an atomic save/rename).
+		// We skip deleting from the DB to preserve the record.
+		if _, err := os.Stat(p); err == nil {
+			log.Printf("[Sync-Guard] Skipped deletion for %s (file physically exists)", p)
+			continue
+		}
+
+		// Proceed with deletion since file is truly gone.
+		if err := s.DeleteByPath(p); err != nil {
+			log.Printf("[Store] Batch delete failed for %s: %v", p, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) deleteLocked(id string) error {
 	epKey := append(append([]byte(nil), prefixEp...), []byte(id)...)
 	s2iKey := append(append([]byte(nil), prefixS2I...), []byte(id)...)
 	var oldRec *EpisodeRecord
+
 	if val, closer, err := s.db.Get(epKey); err == nil {
 		var rec EpisodeRecord
 		if uErr := msgpack.Unmarshal(val, &rec); uErr == nil {
@@ -447,25 +775,38 @@ func (s *Store) Delete(id string) error {
 		closer.Close()
 	}
 
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
 	// Fetch uint32 ID to delete i2s mapping
 	if uidBuf, closer, err := s.db.Get(s2iKey); err == nil {
 		i2sKey := append(append([]byte(nil), prefixI2S...), uidBuf...)
-		s.db.Delete(i2sKey, pebble.Sync)
+		batch.Delete(i2sKey, nil)
 		closer.Close()
 	}
 
-	if err := s.db.Delete(epKey, pebble.Sync); err != nil {
+	batch.Delete(epKey, nil)
+	batch.Delete(s2iKey, nil)
+	batch.Delete(replayStateKey(id), nil)
+	batch.Delete(replayLeaseKey(id), nil)
+
+	// Clean up reverse path index
+	if oldRec != nil && oldRec.SourcePath != "" {
+		normalizedPath := filepath.ToSlash(filepath.Clean(oldRec.SourcePath))
+		p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+		batch.Delete(p2iKey, nil)
+	}
+
+	s.enqueueSysLexq(batch, "DELETE", id)
+
+	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
-	if err := s.db.Delete(s2iKey, pebble.Sync); err != nil {
-		return err
-	}
+
 	if oldRec != nil {
 		s.removeFromTopicIndexLocked(*oldRec)
 		s.removeFromActiveD0IndexLocked(*oldRec)
 	}
-	_ = s.db.Delete(replayStateKey(id), pebble.Sync)
-	_ = s.db.Delete(replayLeaseKey(id), pebble.Sync)
 
 	// Note: Go-HNSW does not natively support node deletion from its in-memory graph.
 	// The node (uid) remains in the graph, but `Recall()` will gracefully skip it
@@ -501,11 +842,18 @@ func (s *Store) UpdateRecord(id string, mutator func(*EpisodeRecord) error) erro
 		return fmt.Errorf("failed to marshal updated record: %w", err)
 	}
 
-	if err := s.db.Set(epKey, data, pebble.Sync); err != nil {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	batch.Set(epKey, data, nil)
+	s.enqueueSysLexq(batch, "UPDATE", id)
+
+	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
 	s.refreshTopicIndexLocked(&oldRec, &rec)
 	s.refreshActiveD0IndexLocked(&oldRec, &rec)
+
 	return nil
 }
 
@@ -639,11 +987,13 @@ func (s *Store) GetRawMeta(key []byte) ([]byte, io.Closer, error) {
 
 type rawScore struct {
 	uid  uint32
+	id   string
 	dist float32
 }
 
 type recallWeights struct {
 	semantic    float32
+	lexical     float32
 	freshness   float32
 	surprise    float32
 	usefulness  float32
@@ -651,11 +1001,24 @@ type recallWeights struct {
 }
 
 var defaultRecallWeights = recallWeights{
-	semantic:    0.70,
+	semantic:    0.60,
+	lexical:     0.10,
 	freshness:   0.15,
 	surprise:    0.05,
 	usefulness:  0.08,
 	exploration: 0.02,
+}
+
+func l2SquaredDistance(a, b []float32) float32 {
+	if len(a) != len(b) {
+		return 1000.0
+	}
+	var dist float32
+	for i := range a {
+		diff := a[i] - b[i]
+		dist += diff * diff
+	}
+	return dist
 }
 
 func float32OrDefault(value *float32, fallback float32) float32 {
@@ -665,19 +1028,31 @@ func float32OrDefault(value *float32, fallback float32) float32 {
 	return fallback
 }
 
+func intOrDefault(value *int, fallback int) int {
+	if value != nil {
+		return *value
+	}
+	return fallback
+}
+
 func (s *Store) Recall(queryVector []float32, topK int, now time.Time) ([]ScoredEpisode, error) {
-	return s.RecallWithTopicsMode(queryVector, topK, now, nil, true, nil)
+	return s.baseRecall("", queryVector, topK, now, nil, true, nil)
 }
 
 func (s *Store) RecallWithTopics(queryVector []float32, topK int, now time.Time, topics []string) ([]ScoredEpisode, error) {
 	// Backward-compatible default: topics means "strict facet filter".
-	return s.RecallWithTopicsMode(queryVector, topK, now, topics, true, nil)
+	return s.baseRecall("", queryVector, topK, now, topics, true, nil)
 }
 
-// RecallWithTopicsMode controls whether topics acts as a strict facet filter or a soft rerank hint.
-// strictTopics=true  => only episodes that match any topic are eligible (with legacy scan fallback)
-// strictTopics=false => topics is only used for rerank boost/penalty; never returns empty just because facet index is empty
 func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
+	return s.baseRecall("", queryVector, topK, now, topics, strictTopics, calibration)
+}
+
+func (s *Store) RecallWithQuery(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
+	return s.baseRecall(queryString, queryVector, topK, now, topics, strictTopics, calibration)
+}
+
+func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
 	if len(queryVector) != 3072 {
 		return nil, fmt.Errorf("query vector length mismatch: expected 3072, got %d", len(queryVector))
 	}
@@ -689,6 +1064,10 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 	topicsMatchBoost := float32(0.05)
 	topicsMismatchPenalty := float32(0.10)
 	topicsMissingPenalty := float32(0.0)
+	lexicalTopK := s.config.LexicalFilterLimit
+	if lexicalTopK <= 0 {
+		lexicalTopK = 1000
+	}
 	if calibration != nil {
 		semanticFloor = float32OrDefault(calibration.SemanticFloor, semanticFloor)
 		usefulnessClamp = float32OrDefault(calibration.UsefulnessClamp, usefulnessClamp)
@@ -697,6 +1076,7 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 		topicsMatchBoost = float32OrDefault(calibration.TopicsMatchBoost, topicsMatchBoost)
 		topicsMismatchPenalty = float32OrDefault(calibration.TopicsMismatchPenalty, topicsMismatchPenalty)
 		topicsMissingPenalty = float32OrDefault(calibration.TopicsMissingPenalty, topicsMissingPenalty)
+		lexicalTopK = intOrDefault(calibration.LexicalTopK, lexicalTopK)
 	}
 	if usefulnessClamp <= 0 {
 		usefulnessClamp = 1.0
@@ -749,23 +1129,50 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 		candidateK = topK
 	}
 
-	s.mutex.RLock()
-	// go-hnsw Search parameters: Query Point, ef (search depth), K (candidate count)
-	pq := s.graph.Search(hnsw.Point(queryVector), candidateK*2, candidateK)
-
 	var candidates []rawScore
-	for pq.Len() > 0 {
-		item := pq.Pop()
-		candidates = append(candidates, rawScore{uid: uint32(item.ID), dist: item.D})
+	var bm25Scores map[string]float32
+	var maxBM25 float32
+
+	if queryString != "" && s.lexical != nil {
+		req := bleve.NewSearchRequest(bleve.NewMatchQuery(queryString))
+		req.Size = lexicalTopK
+		if res, err := s.lexical.Search(req); err == nil && res.Total > 0 {
+			bm25Scores = make(map[string]float32)
+			for _, hit := range res.Hits {
+				if float32(hit.Score) > maxBM25 {
+					maxBM25 = float32(hit.Score)
+				}
+				bm25Scores[hit.ID] = float32(hit.Score)
+				candidates = append(candidates, rawScore{id: hit.ID, dist: -1})
+			}
+		} else if err != nil {
+			log.Printf("[LexicalEngine] Search failed, falling back to HNSW: %v\n", err)
+		}
 	}
-	s.mutex.RUnlock()
+
+	if len(candidates) == 0 {
+		s.mutex.RLock()
+		pq := s.graph.Search(hnsw.Point(queryVector), candidateK*2, candidateK)
+		for pq.Len() > 0 {
+			item := pq.Pop()
+			candidates = append(candidates, rawScore{uid: uint32(item.ID), dist: item.D})
+		}
+		s.mutex.RUnlock()
+	}
 
 	var scored []ScoredEpisode
 
 	for candidateRank, cand := range candidates {
-		idStr, err := s.GetIDByUint32(cand.uid)
-		if err != nil {
-			continue
+		var idStr string
+		var err error
+
+		if cand.id != "" {
+			idStr = cand.id
+		} else {
+			idStr, err = s.GetIDByUint32(cand.uid)
+			if err != nil {
+				continue
+			}
 		}
 
 		if allowedIDs != nil {
@@ -787,6 +1194,9 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 				break
 			}
 		}
+		// ...
+		// We'll trust the underlying implementation.
+
 		if isArchived {
 			continue
 		}
@@ -796,6 +1206,16 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 			recordTopics = legacyTopicsFromTags(rec.Tags)
 		}
 		topicsPresent := len(recordTopics) > 0
+
+		if cand.dist < 0 {
+			cand.dist = l2SquaredDistance(queryVector, rec.Vector)
+		}
+
+		// Normalize BM25
+		var bm25 float32
+		if maxBM25 > 0 {
+			bm25 = bm25Scores[idStr] / maxBM25
+		}
 
 		// distance returned by Bithack is actually L2 squared
 		semanticScore := float32(1.0 / (1.0 + cand.dist))
@@ -808,6 +1228,7 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 		explorationScore := explorationBonus(rec.Retrievals)
 
 		finalScore := (defaultRecallWeights.semantic * semanticScore) +
+			(defaultRecallWeights.lexical * bm25) +
 			(defaultRecallWeights.freshness * freshnessScore) +
 			(defaultRecallWeights.surprise * surpriseScore) +
 			(defaultRecallWeights.usefulness * usefulnessScore) +
@@ -875,6 +1296,7 @@ func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.T
 			Distance:            float32(cand.dist),
 			Score:               finalScore,
 			SemanticScore:       semanticScore,
+			BM25Score:           bm25,
 			FreshnessScore:      freshnessScore,
 			SurpriseScore:       surpriseScore,
 			UsefulnessScore:     usefulnessScore,
@@ -1090,6 +1512,9 @@ func legacyTopicsFromTags(tags []string) []string {
 }
 
 func isActiveD0Record(rec EpisodeRecord) bool {
+	if rec.PruneState == "tombstone" || rec.PruneState == "merged" {
+		return false
+	}
 	if len(rec.Tags) == 0 {
 		return true
 	}
@@ -1123,5 +1548,177 @@ func (s *Store) SearchGraph(query []float32, ef, k int) []GraphResult {
 }
 
 func (s *Store) Close() error {
+	if s.lexicalCancel != nil {
+		s.lexicalCancel()
+	}
+	if s.lexical != nil {
+		_ = s.lexical.Close()
+	}
 	return s.db.Close()
+}
+
+// ComputeStage2BatchScores iterates over all D0 records (skipping those less than 30 mins old),
+// calculates the Stage 2 Hippocampus Scores (Importance & Noise), and writes them
+// back using a synchronous Pebble Batch.
+func (s *Store) ComputeStage2BatchScores(ctx context.Context) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	const maxLag = 30 * time.Minute
+	now := time.Now()
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("ep:"),
+		UpperBound: []byte("ep;"),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	var updatedCount int
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+
+		if !isActiveD0Record(rec) {
+			continue
+		}
+
+		// Only recompute if uncomputed or older than maxLag
+		if !rec.LastScoredAt.IsZero() && now.Sub(rec.LastScoredAt) < maxLag {
+			continue
+		}
+
+		// Age Penalty: max 30 days
+		ageDays := now.Sub(rec.Timestamp).Hours() / 24.0
+		if ageDays > 30.0 {
+			ageDays = 30.0
+		} else if ageDays < 0.0 {
+			ageDays = 0.0
+		}
+		ageWithoutReusePenalty := ageDays / 30.0
+
+		// Topics persistence score based on local `topicIndex`
+		persistenceScore := 0.0
+		topics, _ := ValidateTopics(rec.Topics)
+		if len(topics) == 0 {
+			topics = legacyTopicsFromTags(rec.Tags)
+		}
+		if len(topics) > 0 {
+			for _, t := range topics {
+				if b, ok := s.topicIndex[t]; ok {
+					bucketSize := float64(len(b))
+					if bucketSize > 10.0 {
+						bucketSize = 10.0
+					}
+					persistenceScore += bucketSize / 10.0
+				}
+			}
+			persistenceScore /= float64(len(topics))
+		}
+
+		redundancyWithD1 := 0.0
+		for _, e := range rec.Edges {
+			if e.Type == "child" { // e.g. record is a child of D1
+				// Fast check using the record map `ep:[id]`
+				_, closer, getErr := s.db.Get(append([]byte("ep:"), []byte(e.ID)...))
+				if getErr == nil {
+					redundancyWithD1 = 1.0
+					rec.CanonicalParent = e.ID
+					closer.Close()
+					break
+				}
+			}
+		}
+
+		noExpandNoHit := 0.0
+		if rec.ExpandCount == 0 && rec.Hits == 0 {
+			noExpandNoHit = 1.0
+		}
+
+		params := ScoreUpdateParams{
+			AgeWithoutReusePenalty: ageWithoutReusePenalty,
+			TopicsPersistence:      persistenceScore,
+			RedundancyWithD1:       redundancyWithD1,
+			NoExpandNoHit:          noExpandNoHit,
+		}
+
+		CalculateScoreStage2(&rec, params)
+
+		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
+			rec.PruneState = "tombstone"
+			rec.TombstonedAt = now
+			log.Printf("[Hippocampus Dry-Run] Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
+		}
+
+		// Write back to DB via batch
+		if serialized, mErr := msgpack.Marshal(rec); mErr == nil {
+			_ = batch.Set(iter.Key(), serialized, pebble.NoSync)
+			updatedCount++
+		}
+	}
+
+	if updatedCount > 0 {
+		if err := batch.Commit(pebble.Sync); err != nil {
+			log.Printf("ComputeStage2BatchScores: Failed to commit batch: %v", err)
+			return err
+		}
+		log.Printf("ComputeStage2BatchScores: Successfully updated Stage 2 scores for %d records.", updatedCount)
+	}
+
+	return nil
+}
+
+// RunGarbageCollector physically deletes files that have been marked as tombstone
+// for over 14 days, delegating DB Hard-Delete to the background FS Watcher.
+func (s *Store) RunGarbageCollector(ctx context.Context) error {
+	now := time.Now()
+	tombstoneTTL := time.Duration(s.config.TombstoneTTL) * 24 * time.Hour
+	if s.config.TombstoneTTL <= 0 {
+		tombstoneTTL = 14 * 24 * time.Hour
+	}
+
+	s.mutex.RLock()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("ep:"),
+		UpperBound: []byte("ep;"),
+	})
+	if err != nil {
+		s.mutex.RUnlock()
+		return err
+	}
+
+	var deleteList []EpisodeRecord
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		if rec.PruneState == "tombstone" {
+			if !rec.TombstonedAt.IsZero() && now.Sub(rec.TombstonedAt) >= tombstoneTTL {
+				deleteList = append(deleteList, rec)
+			}
+		}
+	}
+	iter.Close()
+	s.mutex.RUnlock()
+
+	for _, rec := range deleteList {
+		if rec.SourcePath != "" {
+			if err := os.Remove(rec.SourcePath); err == nil || os.IsNotExist(err) {
+				log.Printf("[Hippocampus GC] Physically deleted tombstone memory file: %s", rec.SourcePath)
+			} else {
+				log.Printf("[Hippocampus GC] Failed to delete tombstone file %s: %v", rec.SourcePath, err)
+			}
+		}
+	}
+
+	return nil
 }

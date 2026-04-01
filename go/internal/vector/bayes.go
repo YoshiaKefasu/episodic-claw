@@ -50,13 +50,12 @@ func freshnessScore(ts time.Time, now time.Time) float32 {
 	if ts.IsZero() {
 		return 0
 	}
-	daysOld := now.Sub(ts).Hours() / 24.0
+	daysOld := float64(now.Sub(ts).Hours() / 24.0)
 	if daysOld < 0 {
 		daysOld = 0
 	}
-	penalty := float32(daysOld / 30.0 * 0.01)
-	if penalty > 0.20 {
-		penalty = 0.20
-	}
-	return 1.0 - penalty
+	// Inverse proportional decay based on the scalable_architecture_plan.md definition:
+	// FinalScore(Freshness) = 1.0 / (1.0 + (DaysFromNow * DecayFactor))
+	// We use 0.05 as the DecayFactor here, meaning after 20 days, the score is 0.5.
+	return float32(1.0 / (1.0 + (daysOld * 0.05)))
 }

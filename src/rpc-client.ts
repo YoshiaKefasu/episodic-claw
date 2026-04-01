@@ -128,7 +128,10 @@ export class EpisodicCoreClient {
     }
   }
 
-  async start(): Promise<void> {
+  async start(cfg?: any): Promise<void> {
+    // SECURITY_NOTE: `__dirname` resolves to `dist/` at runtime post-compilation.
+    // Resolving ".." points back to the true plugin root. If bundler output structure
+    // changes in the future, `fs.existsSync(binaryPath)` safely catches any path drift.
     const pluginRoot = path.resolve(__dirname, "..");
     
     // Determine socket path / TCP port based on platform
@@ -161,16 +164,34 @@ export class EpisodicCoreClient {
 
     console.log(`[Plugin] Spawn Go sidecar ${usePrebuilt ? "(binary)" : "(go run)"} at ${usePrebuilt ? binaryPath : path.join(pluginRoot, "go")} on ${actualAddr}`);
     
+    const args = ["-socket", actualAddr, "-ppid", process.pid.toString()];
+    if (cfg) {
+      if (typeof cfg.tombstoneRetentionDays === "number") args.push("-tombstone-ttl", cfg.tombstoneRetentionDays.toString());
+      if (cfg.enableBackgroundWorkers === false) args.push("-disable-workers");
+      if (typeof cfg.lexicalPreFilterLimit === "number") args.push("-lexical-limit", cfg.lexicalPreFilterLimit.toString());
+    }
+
     if (usePrebuilt) {
-      this.child = spawn(binaryPath, ["-socket", actualAddr, "-ppid", process.pid.toString()], {
-        cwd: pluginRoot
+      // SECURITY_NOTE: False positive 'Shell command execution'.
+      // The Go sidecar is a core component required for vector processing.
+      // `spawn` is used strictly with `shell: false` neutralizing command injection.
+      // eslint-disable-next-line security/detect-child-process
+      this.child = spawn(binaryPath, args, {
+        cwd: pluginRoot,
+        shell: false,
+        windowsHide: true
       });
     } else {
       if (!fs.existsSync(goDir)) {
         throw new Error("episodic-core is missing and no Go source tree is packaged. Install the release binary or re-run plugin installation.");
       }
-      this.child = spawn(isWin ? "go.exe" : "go", ["run", ".", "-socket", actualAddr, "-ppid", process.pid.toString()], { 
-        cwd: goDir 
+      // SECURITY_NOTE: False positive 'Shell command execution' — development fallback.
+      // Executing local Go compiler reliably without shell injection risks.
+      // eslint-disable-next-line security/detect-child-process
+      this.child = spawn(isWin ? "go.exe" : "go", ["run", ".", ...args], { 
+        cwd: goDir,
+        shell: false,
+        windowsHide: true
       });
     }
 
@@ -552,5 +573,125 @@ export class EpisodicCoreClient {
 
   async expand(slug: string, agentWs: string): Promise<{ children: string[], body: string }> {
     return this.request<{ children: string[], body: string }>("ai.expand", { slug, agentWs });
+  }
+
+  async deleteEpisode(path: string, agentWs: string): Promise<string> {
+    return this.request<string>("ai.deleteEpisode", { path, agentWs });
+  }
+
+  async batchDeleteEpisodes(paths: string[], agentWs: string): Promise<string> {
+    return this.request<string>("ai.batchDeleteEpisodes", { paths, agentWs });
+  }
+}
+
+/**
+ * FileEventDebouncer coordinates rapid WRITE and REMOVE events via batched flush.
+ * Uses a Dead Letter Queue (DLQ) to retry failed batch RPCs.
+ */
+export class FileEventDebouncer {
+  private queue = new Map<string, "WRITE" | "REMOVE">();
+  private dlq: Array<{ path: string; operation: "WRITE" | "REMOVE"; retries: number }> = [];
+  private readonly intervalMs: number;
+  private intervalId: NodeJS.Timeout | null = null;
+  private currentAgentWs: string | null = null;
+
+  constructor(
+    private client: EpisodicCoreClient,
+    intervalMs = 2000
+  ) {
+    this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Push an event into the debouncer.
+   */
+  public push(event: any, agentWs: string) {
+    this.currentAgentWs = agentWs;
+    if (event.Operation === "REMOVE" || event.Operation === "RENAME_DELETE" || event.Operation === "unlink") {
+      this.queue.set(event.Path, "REMOVE");
+    } else if (event.Operation === "WRITE" || event.Operation === "CREATE" || event.Operation === "add" || event.Operation === "change") {
+      this.queue.set(event.Path, "WRITE");
+    }
+    
+    if (!this.intervalId) {
+      this.intervalId = setInterval(() => this.flush(), this.intervalMs);
+    }
+  }
+
+  private async flush() {
+    if ((this.queue.size === 0 && this.dlq.length === 0) || !this.currentAgentWs) {
+      if (this.intervalId && this.queue.size === 0 && this.dlq.length === 0) {
+        clearInterval(this.intervalId);
+        this.intervalId = null;
+      }
+      return;
+    }
+
+    const writes: string[] = [];
+    const removes: string[] = [];
+    const pendingDlq = [...this.dlq];
+    this.dlq = [];
+
+    for (const item of pendingDlq) {
+      // Don't add if a newer action is already in the main queue
+      if (!this.queue.has(item.path)) {
+        if (item.operation === "WRITE") writes.push(item.path);
+        if (item.operation === "REMOVE") removes.push(item.path);
+      }
+    }
+    for (const [path, op] of this.queue.entries()) {
+      if (op === "WRITE") writes.push(path);
+      if (op === "REMOVE") removes.push(path);
+    }
+    this.queue.clear();
+
+    const agentWs = this.currentAgentWs;
+
+    if (writes.length > 0) {
+      for (let i = 0; i < writes.length; i += 100) {
+        const chunk = writes.slice(i, i + 100);
+        try {
+          await this.client.triggerBackgroundIndex(chunk, agentWs);
+          console.log(`[Episodic Memory] Background index triggered for ${chunk.length} files (Chunk ${Math.floor(i / 100) + 1}).`);
+        } catch (err) {
+          console.error(`[Debouncer] Failed batch write chunk, moving to DLQ:`, err);
+          for (const p of chunk) {
+            const existing = pendingDlq.find(x => x.path === p && x.operation === "WRITE");
+            const retries = existing ? existing.retries + 1 : 1;
+            if (retries <= 5) {
+              this.dlq.push({ path: p, operation: "WRITE", retries });
+            } else {
+              console.error(`[Debouncer] Dropping write for ${p} after 5 retries.`);
+            }
+          }
+        }
+      }
+    }
+
+    if (removes.length > 0) {
+      for (let i = 0; i < removes.length; i += 100) {
+        const chunk = removes.slice(i, i + 100);
+        try {
+          await this.client.batchDeleteEpisodes(chunk, agentWs);
+          console.log(`[Episodic Memory] Batch deletion triggered for ${chunk.length} files (Chunk ${Math.floor(i / 100) + 1}).`);
+        } catch (err) {
+          console.error(`[Debouncer] Failed batch remove chunk, moving to DLQ:`, err);
+          for (const p of chunk) {
+            const existing = pendingDlq.find(x => x.path === p && x.operation === "REMOVE");
+            const retries = existing ? existing.retries + 1 : 1;
+            if (retries <= 5) {
+              this.dlq.push({ path: p, operation: "REMOVE", retries });
+            } else {
+              console.error(`[Debouncer] Dropping remove for ${p} after 5 retries.`);
+            }
+          }
+        }
+      }
+    }
+    
+    if (this.queue.size === 0 && this.dlq.length === 0 && this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
   }
 }

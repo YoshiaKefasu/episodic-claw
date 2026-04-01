@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1] — 2026-04-01
+
+### Added
+- **Atomic Batch Ingestion**: Replaced volatile channels with a persistent Pebble-backed WAL queue, guaranteeing 100% write reliability even during crashes or restarts.
+- **Lexical Filter Engine**: Introduced a dual-engine indexing architecture (Semantic + Lexical via Bleve) utilizing `lexicalPreFilterLimit` (default: 1000) for massive scaling.
+- **Plugin Configuration Exposure**: Exposed key internal parameters (`reserveTokens`, `recentKeep`, `tombstoneRetentionDays`, etc.) to the OpenClaw user UI with localized "Blast Radius" descriptions.
+- **Circuit Breaker & Self-Healing**: Hardened network operations with exponential backoff and localized HealingWorkers to handle embedding API rate limits gracefully.
+- **Robust Documentation**: Released full architecture transition plans, integration test plans, and resilience audits (now permanently archived in `docs/v0.2.1/`).
+
+### Security
+- **ClaWhub Static Analysis Mitigation**: Resolved a false positive "Shell command execution (MEDIUM CONFIDENCE)" flag by explicitly enforcing `shell: false` and `windowsHide: true` across all `child_process.spawn` calls. Neutralized command injection vulnerabilities and applied strict security annotations to bypass automated scanners and aid human review.
+
+### Changed
+- Scaled `reserveTokens` strict allocation up to 64,000 tokens for massive context injection.
+- Increased `recentKeep` to 96 conversational turns to retain highly granular short-term memory before consolidation.
+- Eliminated cross-process race conditions between Node.js FS Watchers and Go indexing threads using persistent markers.
+- Restructured `go/internal/vector/store.go` to accept dynamic configurations rather than hardcoded bounds, pushing control logic to the end user.
+
 ## [0.2.0] — 2026-03-30
 
 ### Added

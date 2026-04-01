@@ -2,7 +2,7 @@ import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
 import { Type } from "@sinclair/typebox";
-import { EpisodicCoreClient } from "./rpc-client";
+import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever } from "./retriever";
@@ -145,6 +145,7 @@ type SingletonType = {
   segmenter: EventSegmenter;
   retriever: EpisodicRetriever;
   compactor: Compactor;
+  debouncer?: FileEventDebouncer;
   sidecarStarted: boolean;
   resolvedAgentWs: string;
   lastRecallResult: string;
@@ -198,12 +199,14 @@ const episodicClawPlugin = {
         );
         const retriever = new EpisodicRetriever(rpcClient, cfg);
         const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
+        const debouncer = new FileEventDebouncer(rpcClient);
         const recallCalibration = buildRecallCalibration(cfg);
         _singleton = {
           rpcClient,
           segmenter,
           retriever,
           compactor,
+          debouncer,
           sidecarStarted: false,
           resolvedAgentWs: "",
           lastRecallResult: "",
@@ -241,7 +244,7 @@ const episodicClawPlugin = {
         }
         _singleton!.sidecarStarted = true;
         console.log("[Episodic Memory] Starting Go sidecar...", event?.port ? `(gateway port: ${event.port})` : "");
-        await rpcClient.start();
+        await rpcClient.start(_singleton!.cfg);
 
         // 正しい workspace 解決ロジックの実装
         const cfgAgents = openClawGlobalConfig?.agents;
@@ -279,6 +282,13 @@ const episodicClawPlugin = {
 
         // ディレクトリが存在しない場合は自動作成
         await fs.promises.mkdir(_singleton!.resolvedAgentWs, { recursive: true });
+
+        // Connect the onFileChange raw event to the Debouncer
+        rpcClient.onFileChange = (event) => {
+          if (_singleton?.debouncer && _singleton.resolvedAgentWs) {
+            _singleton.debouncer.push(event, _singleton.resolvedAgentWs);
+          }
+        };
 
         Promise.race([
           rpcClient.startWatcher(_singleton!.resolvedAgentWs),

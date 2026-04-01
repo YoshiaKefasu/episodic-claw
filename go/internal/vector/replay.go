@@ -391,7 +391,7 @@ func (s *Store) ApplyReplayObservation(obs ReplayObservation) error {
 
 	if _, _, err := s.db.Get(replayObservationKey(obs.ObservationID)); err == nil {
 		return nil
-	} else if err != nil && err != pebble.ErrNotFound {
+	} else if err != pebble.ErrNotFound {
 		return err
 	}
 
@@ -525,6 +525,13 @@ func (s *Store) ListDueReplayCandidates(now time.Time, limit int) ([]ReplayCandi
 		if cls == replayClassD0 {
 			return nil
 		}
+
+		// Phase 3.1: Replay Scheduler gates
+		// Ensure only high importance, low noise items are revived
+		if rec.ImportanceScore < 0.60 || rec.NoiseScore >= 0.5 {
+			return nil
+		}
+
 
 		state, ok, err := s.GetReplayState(rec.ID)
 		if err != nil {

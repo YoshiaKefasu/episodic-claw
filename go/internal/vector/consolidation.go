@@ -310,6 +310,9 @@ func linkClusterChildren(children []EpisodeRecord, parentID string, vstore *Stor
 			if !hasRelatedEdge(rec.Edges, newEdge) {
 				rec.Edges = append(rec.Edges, newEdge)
 			}
+			// Phase 4.1: Flag as merged so it's hidden from active D0 queries
+			rec.PruneState = "merged"
+			rec.CanonicalParent = parentID
 			return nil
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error updating D0 node %s: %v\n", cid, err)

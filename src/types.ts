@@ -35,6 +35,9 @@ export interface FileEvent {
 export interface EpisodicPluginConfig {
   sharedEpisodesDir?: string;
   allowCrossAgentRecall: boolean;
+  tombstoneRetentionDays?: number;
+  enableBackgroundWorkers?: boolean;
+  lexicalPreFilterLimit?: number;
   reserveTokens?: number;
   recentKeep?: number;
   /** processTurn() dedup フィルタのウィンドウサイズ（デフォルト 5）。

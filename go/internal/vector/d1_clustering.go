@@ -257,8 +257,8 @@ func buildConsolidationNodes(records []EpisodeRecord, cfg d1ClusterConfig) []d1C
 			Record:           rec,
 			Index:            idx,
 			NormalizedVector: norm,
-			SalienceScore:    computeSalience(rec, cfg),
-			WeaknessScore:    computeWeakness(rec),
+			SalienceScore:    ComputeSalience(rec),
+			WeaknessScore:    ComputeWeakness(rec),
 			EstimatedTokens:  estimateNodeTokens(rec, cfg),
 			BoundaryAfter:    hasBoundaryAfter(rec, cfg),
 		})
@@ -319,24 +319,7 @@ func addScaledVector(dst []float32, src []float32, scale float32) {
 	}
 }
 
-func computeSalience(rec EpisodeRecord, cfg d1ClusterConfig) float64 {
-	if hasTag(rec.Tags, "manual-save") {
-		return 1.0
-	}
-	score := math.Log1p(max(rec.Surprise, 0)) / math.Log1p(1.0)
-	if rec.Hits > 0 {
-		score += 0.1
-	}
-	return clamp01(score)
-}
 
-func computeWeakness(rec EpisodeRecord) float64 {
-	if rec.Retrievals <= 0 {
-		return 1.0
-	}
-	hitRate := float64(rec.Hits) / float64(max(rec.Retrievals, 1))
-	return clamp01(1.0 - hitRate)
-}
 
 func estimateNodeTokens(rec EpisodeRecord, cfg d1ClusterConfig) int {
 	estimate := rec.Tokens

@@ -28,6 +28,10 @@ import (
 )
 
 var (
+	tombstoneTTL   *int
+	disableWorkers *bool
+	lexicalLimit   *int
+
 	storeMutex      sync.Mutex
 	isConsolidating int32
 	isReplaying     int32
@@ -40,16 +44,17 @@ var (
 	healEmbedLimiter = rate.NewLimiter(rate.Limit(10.0/60.0), 1)  // 10 RPM (Pass 1 Healing - 10% of main)
 
 	// TPM-aware rate limiter: guards against token-count-based quota exhaustion.
-	// After Layer 1 truncation (MaxEmbedRunes=8000 runes), each embed is ≤8,000 tokens.
-	// We charge a fixed tpmTokensPerEmbed per request — conservative, predictable, no ordering issues.
-	// Target: 900K TPM (90% of 1M limit). Rate = 900K/60 = 15,000 tokens/sec.
-	// Burst = 15,000 = 1 second's worth.
-	// NOTE: recall is intentionally excluded — queries are short and user-latency-sensitive.
 	tpmLimiter = rate.NewLimiter(rate.Limit(900_000.0/60.0), 15_000)
 
 	// Wakeup channel for instantaneous healing
 	healWorkerWakeup = make(chan struct{}, 1)
 )
+
+func init() {
+	tombstoneTTL = flag.Int("tombstone-ttl", 14, "Days to keep tombstones before deleting")
+	disableWorkers = flag.Bool("disable-workers", false, "Disable background healing and consolidation workers")
+	lexicalLimit = flag.Int("lexical-limit", 1000, "Max lexical pre-filter limit")
+}
 
 func triggerHealing() {
 	select {
@@ -66,7 +71,10 @@ func getStore(agentWs string) (*vector.Store, error) {
 		return s, nil
 	}
 
-	s, err := vector.NewStore(agentWs)
+	s, err := vector.NewStore(agentWs, vector.StoreConfig{
+		TombstoneTTL:       *tombstoneTTL,
+		LexicalFilterLimit: *lexicalLimit,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -983,6 +991,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	// We now use global gemmaLimiter and embedLimiter across all handlers
 
 	var slugs []string
+	var successRecords []vector.EpisodeRecord
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 5)
@@ -1060,9 +1069,8 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 				return
 			}
 
-			// Both embedding and file OK — now add to Vector store.
 			if embErr == nil && emb != nil && vstore != nil {
-				if addErr := vstore.Add(ctx, vector.EpisodeRecord{
+				rec := vector.EpisodeRecord{
 					ID:         slug,
 					Title:      slug,
 					Tags:       it.Tags,
@@ -1074,9 +1082,10 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 					Depth:      it.Depth,
 					Tokens:     frontmatter.EstimateTokens(it.Summary),
 					Surprise:   it.Surprise,
-				}); addErr != nil {
-					EmitLog("BatchIngest: vstore.Add failed for %s: %v", slug, addErr)
 				}
+				mu.Lock()
+				successRecords = append(successRecords, rec)
+				mu.Unlock()
 			} else if vstore != nil {
 				EmitLog("BatchIngest: VectorDB missing %s due to embedding failure. Triggering healing.", slug)
 				triggerHealing() // Wake up the background worker
@@ -1089,6 +1098,13 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	}
 
 	wg.Wait()
+
+	if vstore != nil && len(successRecords) > 0 {
+		if err := vstore.BatchAdd(ctx, successRecords); err != nil {
+			EmitLog("BatchIngest: vstore.BatchAdd failed: %v", err)
+		}
+	}
+
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: slugs, ID: req.ID})
 }
 
@@ -1381,6 +1397,30 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		}
 		return nil
 	})
+
+	// ----------------------------------------------------
+	// Pass 3: Periodic Async Batch Scoring (Hippocampus)
+	// ----------------------------------------------------
+	EmitLog("HealingWorker: [Pass 3] Starting Stage 2 Batch Score update...")
+	ctxPass3, cancelPass3 := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancelPass3()
+	if err := vstore.ComputeStage2BatchScores(ctxPass3); err != nil {
+		EmitLog("HealingWorker: [Pass 3] Failed to compute batch scores: %v", err)
+	} else {
+		EmitLog("HealingWorker: [Pass 3] Completed Stage 2 Batch Score update.")
+	}
+
+	// ----------------------------------------------------
+	// Pass 4: Garbage Collection (Tombstone removal)
+	// ----------------------------------------------------
+	EmitLog("HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)...")
+	ctxPass4, cancelPass4 := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancelPass4()
+	if err := vstore.RunGarbageCollector(ctxPass4); err != nil {
+		EmitLog("HealingWorker: [Pass 4] Garbage Collection failed: %v", err)
+	} else {
+		EmitLog("HealingWorker: [Pass 4] Completed Garbage Collection.")
+	}
 }
 
 func handleRecall(conn net.Conn, req RPCRequest) {
@@ -1443,7 +1483,7 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 		strictTopics = *params.StrictTopics
 	}
 
-	results, err := vstore.RecallWithTopicsMode(emb, params.K, now, params.Topics, strictTopics, params.Calibration)
+	results, err := vstore.RecallWithQuery(params.Query, emb, params.K, now, params.Topics, strictTopics, params.Calibration)
 	if err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Recall failed: " + err.Error()}, ID: req.ID})
 		return
@@ -1926,9 +1966,72 @@ func handleExpand(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 }
 
+func handleDeleteEpisode(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		Path    string `json:"path"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.AgentWs == "" || params.Path == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing agentWs or path"}, ID: req.ID})
+		return
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	if err := vstore.DeleteByPath(params.Path); err != nil {
+		EmitLog("Failed to delete episode by path %s: %v", params.Path, err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Delete failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	EmitLog("Successfully physically deleted episode by path: %s", params.Path)
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Deleted", ID: req.ID})
+}
+
+func handleBatchDeleteEpisodes(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string   `json:"agentWs"`
+		Paths   []string `json:"paths"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.AgentWs == "" || len(params.Paths) == 0 {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing agentWs or paths"}, ID: req.ID})
+		return
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	if err := vstore.DeleteByPaths(params.Paths); err != nil {
+		EmitLog("Failed to batch delete episodes: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Batch delete failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	EmitLog("Successfully processed batch delete for %d paths", len(params.Paths))
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "BatchDeleted", ID: req.ID})
+}
+
 func main() {
 	socketPath := flag.String("socket", "", "Path to unix domain socket or named pipe")
 	ppid := flag.Int("ppid", 0, "Parent Process ID to monitor for suicide")
+	
 	flag.Parse()
 
 	if *socketPath == "" {
@@ -2037,6 +2140,10 @@ func handleConnection(conn net.Conn) {
 			go handleReplay(conn, req)
 		case "ai.expand":
 			go handleExpand(conn, req)
+		case "ai.deleteEpisode":
+			go handleDeleteEpisode(conn, req)
+		case "ai.batchDeleteEpisodes":
+			go handleBatchDeleteEpisodes(conn, req)
 		case "ping":
 			go sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "pong", ID: req.ID})
 		default:
