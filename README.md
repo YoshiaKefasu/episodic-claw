@@ -1,4 +1,4 @@
-# <img src="./assets/icons/brain-circuit.svg" width="24" alt="" /> episodic-claw
+# <img src="./assets/icons/brain-circuit.svg" width="24" align="center" alt="" /> episodic-claw
 
 **The "never-forget" long-term episodic memory for OpenClaw agents.**
 
@@ -16,7 +16,7 @@ Check the `v0.2.1` roadmap and security audit [here](./docs/v0.2.1/v0.2.1_master
 
 ---
 
-## <img src="./assets/icons/cog.svg" width="24" alt="" /> Why TypeScript + Go?
+## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Why TypeScript + Go?
 
 Most plugins force everything into one language. This one deliberately uses two. Think of it like a store.
 
@@ -28,7 +28,7 @@ Because of this split, **TypeScript smoothly runs the show while Go does the man
 
 ---
 
-## <img src="./assets/icons/workflow.svg" width="24" alt="" /> How It Works
+## <img src="./assets/icons/workflow.svg" width="24" align="center" alt="" /> How It Works
 
 > **TL;DR:** Every time you send a message, it quickly looks up important past memories and whispers them to the AI before it replies.
 
@@ -72,11 +72,11 @@ And while you are chatting, new memories are being made in the background:
 
 ---
 
-## <img src="./assets/icons/layers-3.svg" width="24" alt="" /> Memory Hierarchy (D0 / D1)
+## <img src="./assets/icons/layers-3.svg" width="24" align="center" alt="" /> Memory Hierarchy (D0 / D1)
 
 > **TL;DR:** D0 is a raw, messy diary entry. D1 is the neat summary you wrote later so you wouldn't have to read the whole diary.
 
-### <img src="./assets/icons/file-text.svg" width="24" alt="" /> D0 — Raw Episodes
+### <img src="./assets/icons/file-text.svg" width="24" align="center" alt="" /> D0 — Raw Episodes
 
 Whenever the chat topic changes, the buffer is saved as a D0 episode. These are verbatim logs: detailed, timestamped, and long.
 
@@ -84,14 +84,14 @@ Whenever the chat topic changes, the buffer is saved as a D0 episode. These are 
 - Auto-tagged with hints like `auto-segmented`.
 - Instantly retrievable.
 
-### <img src="./assets/icons/moon.svg" width="24" alt="" /> D1 — Summarized Long-Term Memory (Sleep Consolidation)
+### <img src="./assets/icons/moon.svg" width="24" align="center" alt="" /> D1 — Summarized Long-Term Memory (Sleep Consolidation)
 
 Over time, Background Workers group up multiple D0s and ask the LLM to compress them into a short D1 summary. This is basically human sleep consolidation: the clutter fades, the important lesson stays.
 
 - Token cost drops massively while the meaning survives.
 - If the AI needs the gritty details, the `ep-expand` tool lets it drill from a D1 summary back to the raw D0 logs.
 
-### <img src="./assets/icons/zap.svg" width="24" alt="" /> What is Surprise Score?
+### <img src="./assets/icons/zap.svg" width="24" align="center" alt="" /> What is Surprise Score?
 
 It's a smart math signal comparing incoming words against the ongoing chat.
 If we're talking about "building a React app," and suddenly you ask "how should I index my database?", the Surprise Score spikes. The plugin says "Oh, topic changed. Let's seal the React memory and start a new one." 
@@ -99,7 +99,7 @@ Because of this, your memories don't mush into one giant, pointless blob.
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" alt="" /> What makes v0.2.1 so insane
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.2.1 so insane
 
 v0.2.1 graduated from a cool idea to a production-ready engine.
 
@@ -110,7 +110,7 @@ v0.2.1 graduated from a cool idea to a production-ready engine.
 
 ---
 
-## <img src="./assets/icons/package.svg" width="24" alt="" /> Install
+## <img src="./assets/icons/package.svg" width="24" align="center" alt="" /> Install
 
 ```bash
 openclaw plugins install clawhub:episodic-claw
@@ -120,7 +120,7 @@ That's it. The Go sidecar automatically grabs the `GEMINI_API_KEY` you already h
 
 ---
 
-## <img src="./assets/icons/cpu.svg" width="24" alt="" /> Agent Install Prompt
+## <img src="./assets/icons/cpu.svg" width="24" align="center" alt="" /> Agent Install Prompt
 
 AI agents can hallucinate or run destructive commmands if not guided properly. Copy and paste this **strict, step-by-step instruction** directly to your agent so it can safely install this memory engine for itself.
 
@@ -146,7 +146,7 @@ AI agents can hallucinate or run destructive commmands if not guided properly. C
 
 ---
 
-## <img src="./assets/icons/wrench.svg" width="24" alt="" /> The 3 Memory Tools
+## <img src="./assets/icons/wrench.svg" width="24" align="center" alt="" /> The 3 Memory Tools
 
 The AI can use these automatically, or you can explicitly tell it to use them.
 
@@ -161,7 +161,7 @@ If the AI reads a D1 summary but says "I need the exact code snippet from that",
 
 ---
 
-## <img src="./assets/icons/cog.svg" width="24" alt="" /> Configuration (openclaw.plugin.json)
+## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
 
 In v0.2.1, we exposed the AI's brain chemistry to the UI. The defaults are already heavily tuned, but here is what happens if you mess with them.
 
@@ -181,7 +181,7 @@ There are other micro-settings, but genuinely, unless you know what you are doin
 
 ---
 
-## <img src="./assets/icons/book-open.svg" width="24" alt="" /> Research Foundation
+## <img src="./assets/icons/book-open.svg" width="24" align="center" alt="" /> Research Foundation
 
 (Kept intact as original reference material)
 
@@ -212,7 +212,7 @@ So if the README drops terms like "human-like memory" or "Bayesian segmentation,
 
 ---
 
-## <img src="./assets/icons/user.svg" width="24" alt="" /> About
+## <img src="./assets/icons/user.svg" width="24" align="center" alt="" /> About
 
 I'm a self-taught AI nerd, currently living my best NEET life. No corporate team, no VC funding—just me, my AI co-pilot, and way too many browser tabs open at 2 AM.
 
@@ -220,7 +220,7 @@ I'm a self-taught AI nerd, currently living my best NEET life. No corporate team
 
 I built this because AI agents deserve better memory than a basic rolling chat window. If `episodic-claw` makes your agent noticeably smarter, calmer, and impossible to trick into forgetting things, then it did its job.
 
-### <img src="./assets/icons/heart.svg" width="24" alt="" /> Sponsor
+### <img src="./assets/icons/heart.svg" width="24" align="center" alt="" /> Sponsor
 
 Keeping this running means paying for raw Claude and OpenAI Codex API hits. If this plugin literally saved a project for you, even a small sponsor amount is a lifesaver.
 
@@ -235,7 +235,7 @@ No pressure. The plugin stays MPL-2.0 and completely free.
 
 ---
 
-## <img src="./assets/icons/scale.svg" width="24" alt="" /> License
+## <img src="./assets/icons/scale.svg" width="24" align="center" alt="" /> License
 
 [Mozilla Public License 2.0 (MPL-2.0)](LICENSE) © 2026 YoshiaKefasu
 
