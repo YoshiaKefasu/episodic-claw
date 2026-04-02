@@ -8,6 +8,7 @@
 - Added runtime observability for `prependSystemContext`, including `queryHash`, `estimatedTokens`, and reason-coded outcomes so injection success and failure are easy to distinguish.
 
 ### Changed
+- Updated the OpenClaw compatibility range so v0.2.6 covers OpenClaw 2026.4.1 in addition to the earlier 2026.3.28 baseline.
 - `episodes/episodes` duplication is now blocked at the source by tightening the workspace/path contract around `agentWs`.
 - `ep-recall` now logs the real `handleRecall()` payload and treats workspace cache mismatch as a first-class debugging signal.
 - `resolveAgentWorkspaces()` now refreshes stale cached workspace state instead of trusting it blindly.
