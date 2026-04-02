@@ -188,9 +188,9 @@ async function main() {
   const rpcClientSource = fs.readFileSync(path.resolve("src", "rpc-client.ts"), "utf8");
   const postinstallSource = fs.readFileSync(path.resolve("scripts", "postinstall.cjs"), "utf8");
 
-  assert.equal(pkg.version, "0.2.5", "package.json version should be 0.2.5");
-  assert.equal(manifest.version, "0.2.5", "openclaw.plugin.json version should be 0.2.5");
-  assert.match(changelog, /\[0\.2\.5\]/, "CHANGELOG should mention v0.2.5");
+  assert.equal(pkg.version, "0.2.6", "package.json version should be 0.2.6");
+  assert.equal(manifest.version, "0.2.6", "openclaw.plugin.json version should be 0.2.6");
+  assert.match(changelog, /\[0\.2\.6\]/, "CHANGELOG should mention v0.2.6");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,
