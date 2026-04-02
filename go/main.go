@@ -39,15 +39,19 @@ var (
 	vectorStores    = make(map[string]*vector.Store)
 
 	// Global rate limiters to respect Google AI Studio quotas across all handlers
-	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 5)  // 15 RPM
+	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 5)   // 15 RPM
 	embedLimiter     = rate.NewLimiter(rate.Limit(100.0/60.0), 10) // 100 RPM
-	healEmbedLimiter = rate.NewLimiter(rate.Limit(10.0/60.0), 2)  // 10 RPM (Pass 1 Healing - 10% of main)
+	healEmbedLimiter = rate.NewLimiter(rate.Limit(10.0/60.0), 2)   // 10 RPM (Pass 1 Healing - 10% of main)
 
 	// TPM-aware rate limiter: guards against token-count-based quota exhaustion.
 	tpmLimiter = rate.NewLimiter(rate.Limit(900_000.0/60.0), 15_000)
 
 	// In-memory query cache for deduplication (Step 3)
 	recallCache sync.Map // key: query string, value: recallCacheEntry
+
+	legacyEpisodeRepairMu         sync.Mutex
+	legacyEpisodeCleanupPending   = make(map[string]bool)
+	legacyEpisodeQuarantineBypass = make(map[string]bool)
 
 	// Wakeup channel for instantaneous healing
 	healWorkerWakeup = make(chan struct{}, 1)
@@ -75,7 +79,18 @@ func getStore(agentWs string) (*vector.Store, error) {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
 
+	if consumeLegacyEpisodeQuarantineBypass(agentWs) {
+		EmitLog("Skipping legacy nested episode quarantine once for %s during rollback re-open", agentWs)
+	} else {
+		if quarantined, moved, err := quarantineLegacyNestedEpisodeTree(agentWs); err != nil {
+			return nil, fmt.Errorf("legacy nested episode quarantine failed for %s: %w", agentWs, err)
+		} else if moved {
+			EmitLog("Legacy nested episode tree isolated at %s before rebuild/watch replay", quarantined)
+		}
+	}
+
 	if s, ok := vectorStores[agentWs]; ok {
+		maybeCleanLegacyOrphans(agentWs, s)
 		return s, nil
 	}
 
@@ -87,6 +102,7 @@ func getStore(agentWs string) (*vector.Store, error) {
 		return nil, err
 	}
 	vectorStores[agentWs] = s
+	consumeLegacyEpisodeCleanupPending(agentWs)
 
 	// ==== Phase B & D: Auto-Rebuild Trigger ====
 	if s.Count() == 0 {
@@ -102,24 +118,309 @@ func getStore(agentWs string) (*vector.Store, error) {
 	}
 
 	// Background worker: Heal missing embeddings and refine fallback slugs
-	go func(ws string, vs *vector.Store) {
-		EmitLog("Starting Async Healing Worker for workspace: %s", ws)
-		RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
-		ticker := time.NewTicker(30 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
-			case <-healWorkerWakeup:
-				EmitLog("Healing Worker woken up by instantaneous trigger.")
-				time.Sleep(2 * time.Second) // Small debounce for concurrent batches
-				RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
+	if disableWorkers == nil || !*disableWorkers {
+		go func(ws string, vs *vector.Store) {
+			EmitLog("Starting Async Healing Worker for workspace: %s", ws)
+			RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
+			ticker := time.NewTicker(30 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
+				case <-healWorkerWakeup:
+					EmitLog("Healing Worker woken up by instantaneous trigger.")
+					time.Sleep(2 * time.Second) // Small debounce for concurrent batches
+					RunAsyncHealingWorker(ws, os.Getenv("GEMINI_API_KEY"), vs)
+				}
 			}
-		}
-	}(agentWs, s)
+		}(agentWs, s)
+	} else {
+		EmitLog("Background workers disabled for %s; skipping Async Healing Worker startup", agentWs)
+	}
 
 	return s, nil
+}
+
+func markLegacyEpisodeCleanupPending(agentWs string) {
+	legacyEpisodeRepairMu.Lock()
+	legacyEpisodeCleanupPending[agentWs] = true
+	legacyEpisodeRepairMu.Unlock()
+}
+
+func consumeLegacyEpisodeCleanupPending(agentWs string) bool {
+	legacyEpisodeRepairMu.Lock()
+	defer legacyEpisodeRepairMu.Unlock()
+
+	pending := legacyEpisodeCleanupPending[agentWs]
+	if pending {
+		delete(legacyEpisodeCleanupPending, agentWs)
+	}
+	return pending
+}
+
+func markLegacyEpisodeQuarantineBypass(agentWs string) {
+	legacyEpisodeRepairMu.Lock()
+	legacyEpisodeQuarantineBypass[agentWs] = true
+	legacyEpisodeRepairMu.Unlock()
+}
+
+func consumeLegacyEpisodeQuarantineBypass(agentWs string) bool {
+	legacyEpisodeRepairMu.Lock()
+	defer legacyEpisodeRepairMu.Unlock()
+
+	pending := legacyEpisodeQuarantineBypass[agentWs]
+	if pending {
+		delete(legacyEpisodeQuarantineBypass, agentWs)
+	}
+	return pending
+}
+
+func maybeCleanLegacyOrphans(agentWs string, vstore *vector.Store) {
+	if consumeLegacyEpisodeCleanupPending(agentWs) {
+		EmitLog("Cleaning orphaned records after legacy nested tree quarantine for %s", agentWs)
+		vstore.CleanOrphans()
+	}
+}
+
+func hasLegacyNestedEpisodePath(root string, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return false
+	}
+	return rel == "episodes" || strings.HasPrefix(rel, "episodes"+string(filepath.Separator))
+}
+
+type legacyMigrationManifest struct {
+	OriginalRoot  string `json:"original_root"`
+	QuarantinedAt string `json:"quarantined_at"`
+	QuarantinedTo string `json:"quarantined_to"`
+	AgentWs       string `json:"agent_ws"`
+}
+
+func quarantineLegacyNestedEpisodeTree(agentWs string) (string, bool, error) {
+	legacyRoot := filepath.Join(agentWs, "episodes")
+	info, err := os.Stat(legacyRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if !info.IsDir() {
+		return "", false, nil
+	}
+
+	quarantineRoot := filepath.Join(filepath.Dir(agentWs), ".episodic-quarantine")
+	if err := os.MkdirAll(quarantineRoot, 0o755); err != nil {
+		return "", false, err
+	}
+
+	if err := snapshotLegacyStoreState(agentWs, quarantineRoot); err != nil {
+		return "", false, err
+	}
+
+	quarantined := filepath.Join(
+		quarantineRoot,
+		fmt.Sprintf("%s-nested-episodes-%s", filepath.Base(agentWs), time.Now().UTC().Format("20060102T150405.000000000")),
+	)
+	if err := os.Rename(legacyRoot, quarantined); err != nil {
+		return "", false, err
+	}
+
+	manifest := legacyMigrationManifest{
+		OriginalRoot:  legacyRoot,
+		QuarantinedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		QuarantinedTo: quarantined,
+		AgentWs:       agentWs,
+	}
+	if err := writeLegacyMigrationManifest(quarantined, manifest); err != nil {
+		EmitLog("Legacy nested tree quarantine manifest write failed for %s: %v", quarantined, err)
+	}
+
+	markLegacyEpisodeCleanupPending(agentWs)
+	return quarantined, true, nil
+}
+
+func snapshotLegacyStoreState(agentWs string, quarantineRoot string) error {
+	storeRoot := filepath.Join(quarantineRoot, "store")
+	if err := os.MkdirAll(storeRoot, 0o755); err != nil {
+		return err
+	}
+
+	for _, name := range []string{"vector.db", "lexical"} {
+		src := filepath.Join(agentWs, name)
+		if _, err := os.Stat(src); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		dst := filepath.Join(storeRoot, name)
+		if err := copyPathRecursive(src, dst); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func latestQuarantineRoot(agentWs string) (string, bool, error) {
+	quarantineRoot := filepath.Join(filepath.Dir(agentWs), ".episodic-quarantine")
+	entries, err := os.ReadDir(quarantineRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+
+	var newest string
+	var newestInfo os.FileInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(quarantineRoot, entry.Name())
+		info, statErr := os.Stat(candidate)
+		if statErr != nil {
+			continue
+		}
+		if newestInfo == nil || info.ModTime().After(newestInfo.ModTime()) {
+			newest = candidate
+			newestInfo = info
+		}
+	}
+	if newest == "" {
+		return "", false, nil
+	}
+	return newest, true, nil
+}
+
+func writeLegacyMigrationManifest(quarantinedRoot string, manifest legacyMigrationManifest) error {
+	if err := os.MkdirAll(quarantinedRoot, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(quarantinedRoot, ".rollback.json"), data, 0o644)
+}
+
+func restoreLegacyNestedEpisodeTree(agentWs string) (string, bool, error) {
+	newest, ok, err := latestQuarantineRoot(agentWs)
+	if err != nil || !ok {
+		return "", false, err
+	}
+
+	manifestPath := filepath.Join(newest, ".rollback.json")
+	var manifest legacyMigrationManifest
+	if data, readErr := os.ReadFile(manifestPath); readErr == nil {
+		_ = json.Unmarshal(data, &manifest)
+	}
+
+	restoreTarget := legacyRootForAgent(agentWs)
+	if manifest.OriginalRoot != "" {
+		restoreTarget = manifest.OriginalRoot
+	}
+
+	if _, err := os.Stat(restoreTarget); err == nil {
+		return "", false, fmt.Errorf("restore target already exists: %s", restoreTarget)
+	}
+
+	if err := os.Rename(newest, restoreTarget); err != nil {
+		return "", false, err
+	}
+
+	if err := restoreLegacyStoreState(agentWs, restoreTarget); err != nil {
+		return "", false, err
+	}
+
+	legacyEpisodeRepairMu.Lock()
+	delete(legacyEpisodeCleanupPending, agentWs)
+	legacyEpisodeRepairMu.Unlock()
+
+	return restoreTarget, true, nil
+}
+
+func restoreLegacyStoreState(agentWs string, quarantineRoot string) error {
+	storeRoot := filepath.Join(quarantineRoot, "store")
+	for _, name := range []string{"vector.db", "lexical"} {
+		src := filepath.Join(storeRoot, name)
+		if _, err := os.Stat(src); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		dst := filepath.Join(agentWs, name)
+		if err := os.RemoveAll(dst); err != nil {
+			return err
+		}
+		if err := copyPathRecursive(src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyPathRecursive(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if err := copyPathRecursive(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode())
+}
+
+func rehydrateLegacyNestedEpisodeTree(agentWs string) (string, error) {
+	restoreTarget, moved, err := restoreLegacyNestedEpisodeTree(agentWs)
+	if err != nil || !moved {
+		return restoreTarget, err
+	}
+
+	markLegacyEpisodeQuarantineBypass(agentWs)
+
+	storeMutex.Lock()
+	if s, ok := vectorStores[agentWs]; ok && s != nil {
+		_ = s.Close()
+		delete(vectorStores, agentWs)
+	}
+	storeMutex.Unlock()
+
+	if _, err := getStore(agentWs); err != nil {
+		return "", err
+	}
+
+	return restoreTarget, nil
+}
+
+func legacyRootForAgent(agentWs string) string {
+	return filepath.Join(agentWs, "episodes")
 }
 
 type RPCRequest struct {
@@ -249,6 +550,19 @@ func handleWatcherStart(conn net.Conn, req RPCRequest) {
 	globalWatchers[path] = w
 	globalWatcherConn = conn
 
+	if quarantined, moved, err := quarantineLegacyNestedEpisodeTree(path); err != nil {
+		w.Stop()
+		delete(globalWatchers, path)
+		if globalWatcherConn == conn {
+			globalWatcherConn = nil
+		}
+		globalWatcherMu.Unlock()
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Legacy nested tree quarantine failed: " + err.Error()}, ID: req.ID})
+		return
+	} else if moved {
+		EmitLog("Legacy nested episode tree isolated at %s before watcher registration", quarantined)
+	}
+
 	if err := w.AddRecursive(path); err != nil {
 		w.Stop()
 		delete(globalWatchers, path)
@@ -289,6 +603,29 @@ func handleFrontmatterParse(conn net.Conn, req RPCRequest) {
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: doc, ID: req.ID})
+}
+
+func handleRollbackLegacyNestedEpisodeTree(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.AgentWs == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+
+	restoredRoot, err := rehydrateLegacyNestedEpisodeTree(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"restoredRoot": restoredRoot, "status": "recovered"}, ID: req.ID})
 }
 
 // RebuildResult is the structured result of a runAutoRebuild call.
@@ -351,6 +688,13 @@ func handleIndexerRebuild(conn net.Conn, req RPCRequest) {
 // may be lower than the theoretical 100 RPM / 0.6s-per-file rate.
 // With batch size 10: effective throughput = 10 files per embedLimiter token (10x RPM reduction).
 func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) RebuildResult {
+	if quarantined, moved, err := quarantineLegacyNestedEpisodeTree(targetDir); err != nil {
+		EmitLog("Failed to quarantine legacy nested episode tree before auto rebuild for %s: %v", targetDir, err)
+		return RebuildResult{}
+	} else if moved {
+		EmitLog("Legacy nested episode tree isolated at %s before auto rebuild", quarantined)
+	}
+
 	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 	ctx := context.Background()
 
@@ -364,6 +708,10 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 	err := filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if info.IsDir() && isNestedLegacyEpisodePath(targetDir, path) {
+			EmitLog("Skipping legacy nested episode tree during rebuild: %s", path)
+			return filepath.SkipDir
 		}
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
 			files = append(files, fileRecord{path: path, modTime: info.ModTime()})
@@ -557,6 +905,18 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 		CircuitTripped: circuitTripped,
 		DelegatedCount: delegatedCount,
 	}
+}
+
+func isNestedLegacyEpisodePath(root string, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return false
+	}
+	return rel == "episodes" || strings.HasPrefix(rel, "episodes"+string(filepath.Separator))
 }
 
 func handleSurprise(conn net.Conn, req RPCRequest) {
@@ -1189,6 +1549,12 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		if err != nil {
 			return nil
 		}
+		if hasLegacyNestedEpisodePath(agentWs, path) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		name := d.Name()
 
 		if d.IsDir() {
@@ -1465,6 +1831,13 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 		params.K = 5
 	}
 
+	strictTopics := false
+	if params.StrictTopics != nil {
+		strictTopics = *params.StrictTopics
+	}
+
+	EmitLog("ai.recall payload: agentWs=%s k=%d strictTopics=%v topics=%v query=%q", params.AgentWs, params.K, strictTopics, params.Topics, params.Query)
+
 	if strings.TrimSpace(params.Query) == "" {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "query must not be empty"}, ID: req.ID})
 		return
@@ -1522,12 +1895,6 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 	}
 
 	now := time.Now()
-	// Default behavior: topics is a soft hint (boost-only). Use strict facet filtering only when explicitly requested.
-	strictTopics := false
-	if params.StrictTopics != nil {
-		strictTopics = *params.StrictTopics
-	}
-
 	results, err := vstore.RecallWithQuery(params.Query, emb, params.K, now, params.Topics, strictTopics, params.Calibration)
 	if err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Recall failed: " + err.Error()}, ID: req.ID})
@@ -2076,7 +2443,7 @@ func handleBatchDeleteEpisodes(conn net.Conn, req RPCRequest) {
 func main() {
 	socketPath := flag.String("socket", "", "Path to unix domain socket or named pipe")
 	ppid := flag.Int("ppid", 0, "Parent Process ID to monitor for suicide")
-	
+
 	flag.Parse()
 
 	// LOW-7: Launch periodic Garbage Collection for TTL Cache in main() to avoid init() anti-pattern
@@ -2200,6 +2567,8 @@ func handleConnection(conn net.Conn) {
 			go handleSetMeta(conn, req)
 		case "ai.triggerBackgroundIndex":
 			go handleTriggerBackgroundIndex(conn, req)
+		case "migration.rollbackLegacyNestedEpisodeTree":
+			go handleRollbackLegacyNestedEpisodeTree(conn, req)
 		case "ai.consolidate":
 			go handleConsolidate(conn, req)
 		case "ai.replay":

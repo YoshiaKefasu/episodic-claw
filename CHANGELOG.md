@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.6] — 2026-04-02
+
+### Added
+- Added three release investigation plans under `docs/` to keep the v0.2.6 workstream separated and auditable: duplicate episode path handling, empty `ep-recall` results, and `prependSystemContext` logging.
+- Added a `gateway_start`-style production smoke test path so the nested episode-tree fix can be verified from startup through watcher setup and rebuild behavior.
+- Added runtime observability for `prependSystemContext`, including `queryHash`, `estimatedTokens`, and reason-coded outcomes so injection success and failure are easy to distinguish.
+
+### Changed
+- `episodes/episodes` duplication is now blocked at the source by tightening the workspace/path contract around `agentWs`.
+- `ep-recall` now logs the real `handleRecall()` payload and treats workspace cache mismatch as a first-class debugging signal.
+- `resolveAgentWorkspaces()` now refreshes stale cached workspace state instead of trusting it blindly.
+- `prependSystemContext` logging now distinguishes `max_tokens_zero` from `budget_truncated_to_zero` so input-time impossibility is not confused with budget-time truncation.
+- The master plan was updated to reflect that all three v0.2.6 tracks converged.
+
+### Fixed
+- Fixed the nested episode tree duplication path that could create `episodes/episodes`.
+- Fixed the empty-result investigation path so `ep-recall` and automatic injection can be separated cleanly during debugging.
+- Fixed the observability gap around memory injection so runtime logs now show whether context was injected, skipped, or truncated.
+
 ## [0.2.5] — 2026-04-02
 
 ### Added

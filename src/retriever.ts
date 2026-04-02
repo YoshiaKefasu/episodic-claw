@@ -6,6 +6,15 @@ import { EpisodicPluginConfig } from "./types";
 import { Message, extractText } from "./segmenter";
 import { estimateTokens } from "./utils";
 
+export type RecallInjectionOutcome = {
+  text: string;
+  reason: "injected" | "no_messages" | "max_tokens_zero" | "empty_query" | "recall_empty" | "recall_failed";
+  queryHash: string;
+  injectedEpisodeCount: number;
+  truncatedEpisodeCount: number;
+  firstEpisodeId: string;
+};
+
 export class EpisodicRetriever {
   constructor(
     private rpcClient: EpisodicCoreClient,
@@ -21,9 +30,14 @@ export class EpisodicRetriever {
     agentWs: string, 
     k: number = 5,
     maxTokens: number = 4096
-  ): Promise<string> {
-    if (currentMessages.length === 0) return "";
-    if (maxTokens <= 0) return "";
+  ): Promise<RecallInjectionOutcome> {
+    if (currentMessages.length === 0) {
+      return { text: "", reason: "no_messages", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "" };
+    }
+    // max_tokens_zero: ここでの 0 は「入力時点で注入不能」。
+    if (maxTokens <= 0) {
+      return { text: "", reason: "max_tokens_zero", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "" };
+    }
 
     // Build the query from the recent N messages
     const recentMessages = currentMessages.slice(-5);
@@ -34,7 +48,10 @@ export class EpisodicRetriever {
       })
       .filter(part => part.length > 0);
     const query = queryParts.join("\n").trim();
-    if (!query) return "";
+    if (!query) {
+      return { text: "", reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "" };
+    }
+    const queryHash = createHash("sha1").update(query).digest("hex");
     const calibration = this.config ? buildRecallCalibration(this.config) : undefined;
 
     try {
@@ -48,10 +65,8 @@ export class EpisodicRetriever {
         console.warn("[Episodic Memory] Recall failed for primary workspace:", err);
       }
       if (sourcedResults.length === 0) {
-        return "";
+        return { text: "", reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "" };
       }
-
-      const queryHash = createHash("sha1").update(query).digest("hex");
 
       // System hint: placed at the top so the model sees it before any episode content.
       let assembled = "--- My Memory ---\n";
@@ -59,6 +74,9 @@ export class EpisodicRetriever {
       assembled += "Here's what I pulled up that looks relevant:\n\n";
 
       let tokenCount = 0;
+      let injectedEpisodeCount = 0;
+      let truncatedEpisodeCount = 0;
+      let firstEpisodeId = "";
       const injectedIdsByWs = new Map<string, string[]>();
 
       const scoreOf = (res: any): number => {
@@ -83,6 +101,7 @@ export class EpisodicRetriever {
 
         if (tokenCount + entryTokens > maxTokens) {
           const remainingIds = deduped.slice(index).map(r => r.item.Record?.id).filter(Boolean);
+          truncatedEpisodeCount = remainingIds.length;
           assembled += `\n(${remainingIds.length} more matched but I hit my token limit. I can pull those up with ep-recall:)\n`;
           assembled += remainingIds.map(id => `- ${id}`).join("\n") + "\n";
           break;
@@ -91,6 +110,10 @@ export class EpisodicRetriever {
         assembled += `[${title} · ${date} · relevance: ${score}]\n`;
         assembled += bodyText + "\n\n";
         tokenCount += entryTokens;
+        injectedEpisodeCount += 1;
+        if (!firstEpisodeId && episodeId) {
+          firstEpisodeId = episodeId;
+        }
         if (episodeId) {
           const bucket = injectedIdsByWs.get(agentWs) ?? [];
           bucket.push(episodeId);
@@ -117,11 +140,18 @@ export class EpisodicRetriever {
         }
       }
 
-      return assembled;
+      return {
+        text: assembled,
+        reason: "injected",
+        queryHash,
+        injectedEpisodeCount,
+        truncatedEpisodeCount,
+        firstEpisodeId,
+      };
 
     } catch (err) {
       console.error("[Episodic Memory] Retrieval failed:", err);
-      return "";
+      return { text: "", reason: "recall_failed", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "" };
     }
   }
 }

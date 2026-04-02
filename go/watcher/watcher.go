@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type Watcher struct {
 	debounce time.Duration
 	queue    map[string]*queuedEvent
 	mu       sync.Mutex
+	root     string
 	Emit     func(event FileEvent) // Callback to send to RPC
 	Done     chan bool
 }
@@ -49,9 +51,16 @@ func New(debounceMs int, emitFn func(FileEvent)) (*Watcher, error) {
 
 // AddRecursive walks a directory and adds it and subdirectories to the watcher.
 func (w *Watcher) AddRecursive(dir string) error {
-	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	w.root = filepath.Clean(dir)
+	return filepath.Walk(w.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if w.shouldSkipPath(path) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if info.IsDir() {
 			if err := w.fw.Add(path); err != nil {
@@ -60,6 +69,23 @@ func (w *Watcher) AddRecursive(dir string) error {
 		}
 		return nil
 	})
+}
+
+func (w *Watcher) shouldSkipPath(candidate string) bool {
+	if w.root == "" {
+		return false
+	}
+
+	rel, err := filepath.Rel(w.root, candidate)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return false
+	}
+
+	return rel == "episodes" || strings.HasPrefix(rel, "episodes"+string(filepath.Separator))
 }
 
 // processQueue is a worker tick that runs periodically to flush matured events safely
@@ -72,7 +98,7 @@ func (w *Watcher) processQueue() {
 		case <-ticker.C:
 			now := time.Now()
 			w.mu.Lock()
-			
+
 			// Find matured events
 			var matured []FileEvent
 			for path, qEv := range w.queue {
@@ -87,7 +113,7 @@ func (w *Watcher) processQueue() {
 			for _, ev := range matured {
 				w.Emit(ev)
 			}
-			
+
 		case <-w.Done:
 			return
 		}
@@ -111,9 +137,16 @@ func (w *Watcher) Start() {
 				if event.Has(fsnotify.Create) {
 					info, err := os.Stat(event.Name)
 					if err == nil && info.IsDir() {
+						if w.shouldSkipPath(event.Name) {
+							continue
+						}
 						w.fw.Add(event.Name)
 						continue // Don't emit directory creation to TS directly
 					}
+				}
+
+				if w.shouldSkipPath(event.Name) {
+					continue
 				}
 
 				// Only care about markdown files

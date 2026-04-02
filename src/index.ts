@@ -6,7 +6,7 @@ import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
-import { EpisodicRetriever } from "./retriever";
+import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
 import { Compactor } from "./compactor";
 import { estimateTokens } from "./utils";
 
@@ -73,7 +73,7 @@ type WorkspaceResolution = {
 };
 
 type RecallCacheState = {
-  lastRecallResult: string;
+  lastRecallResult: RecallInjectionOutcome | null;
   lastRecallTime: number;
   lastRecallFullKey: string;
 };
@@ -88,6 +88,33 @@ type AgentRuntimeState = {
 };
 
 const WORKSPACE_CACHE_PREFIX = "episodic-claw-workspace";
+
+type PrependSystemContextStatus = "injected" | "skipped" | "truncated";
+
+function logPrependSystemContextOutcome(args: {
+  status: PrependSystemContextStatus;
+  agentId: string;
+  agentWs: string;
+  queryHash: string;
+  estimatedTokens: number;
+  injectedEpisodeCount: number;
+  truncatedEpisodeCount: number;
+  reason?: string;
+  firstEpisodeId?: string;
+}): void {
+  const parts = [
+    `status=${args.status}`,
+    `agentId=${args.agentId}`,
+    `agentWs=${args.agentWs}`,
+    `queryHash=${args.queryHash || "none"}`,
+    `estimatedTokens=${args.estimatedTokens}`,
+    `injectedEpisodeCount=${args.injectedEpisodeCount}`,
+    `truncatedEpisodeCount=${args.truncatedEpisodeCount}`,
+  ];
+  if (args.firstEpisodeId) parts.push(`firstEpisodeId=${args.firstEpisodeId}`);
+  if (args.reason) parts.push(`reason=${args.reason}`);
+  console.log(`[Episodic Memory] prependSystemContext ${parts.join(" ")}`);
+}
 
 function resolveDefaultAgentId(cfgAgents: any): string {
   let defaultAgentId = "main";
@@ -149,10 +176,10 @@ function resolveAgentWorkspaces(ctx: any, openClawGlobalConfig: any): WorkspaceR
   const defaultAgentId = resolveDefaultAgentId(cfgAgents);
   const agentRoot = resolveWorkspaceRoot(agentId, cfgAgents);
   const defaultRoot = resolveWorkspaceRoot(defaultAgentId, cfgAgents);
-  let agentWs = path.join(agentRoot, "episodes");
+  const agentWs = path.join(agentRoot, "episodes");
   const cached = readWorkspaceCache(agentId);
-  if (cached && !cfgAgents) {
-    agentWs = cached;
+  if (cached && cached !== agentWs) {
+    console.warn(`[Episodic Memory] Workspace cache mismatch for ${agentId}: cached=${cached}, resolved=${agentWs}. Refreshing cache.`);
   }
   writeWorkspaceCache(agentId, agentWs);
   const defaultWs = path.join(defaultRoot, "episodes");
@@ -339,24 +366,24 @@ const episodicClawPlugin = {
           }
         );
         const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
-        const state: AgentRuntimeState = {
-          agentId,
-          lastAgentWs: "",
-          segmenter,
-          compactor,
-          recallCache: {
-            lastRecallResult: "",
-            lastRecallTime: 0,
-            lastRecallFullKey: "",
-          },
-          lastSetMetaTime: 0,
-        };
+          const state: AgentRuntimeState = {
+            agentId,
+            lastAgentWs: "",
+            segmenter,
+            compactor,
+            recallCache: {
+              lastRecallResult: null,
+              lastRecallTime: 0,
+              lastRecallFullKey: "",
+            },
+            lastSetMetaTime: 0,
+          };
         _singleton!.agentStates.set(agentId, state);
         return state;
       };
 
       const clearRecallCache = (state: AgentRuntimeState) => {
-        state.recallCache.lastRecallResult = "";
+        state.recallCache.lastRecallResult = null;
         state.recallCache.lastRecallTime = 0;
         state.recallCache.lastRecallFullKey = "";
       };
@@ -508,10 +535,6 @@ const episodicClawPlugin = {
           const totalBudget = ctx.tokenBudget || 8192;
           const reserveTokens = cfg.reserveTokens ?? 2048;
           const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
-          if (maxEpisodicTokens <= 0) {
-            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
-          }
-
           const k = 5;
           const now = Date.now();
           const recentMessages = msgs.slice(-5);
@@ -527,25 +550,56 @@ const episodicClawPlugin = {
             ? `${agentId}::${agentWs}::${maxEpisodicTokens}::${k}::${queryHash}`
             : "";
 
-          let episodicContext: string;
+          if (maxEpisodicTokens <= 0) {
+            // budget_truncated_to_zero: 候補はあったが、reserve 後の budget が 0 以下で注入できない。
+            logPrependSystemContextOutcome({
+              status: "skipped",
+              agentId,
+              agentWs,
+              queryHash,
+              estimatedTokens: 0,
+              injectedEpisodeCount: 0,
+              truncatedEpisodeCount: 0,
+              reason: "budget_truncated_to_zero",
+            });
+            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
+          }
+
+          let recallOutcome: RecallInjectionOutcome;
           const cache = state.recallCache;
           const isCacheHit = fullKey
             && fullKey === cache.lastRecallFullKey
             && (now - cache.lastRecallTime < RECALL_DEBOUNCE_MS)
             && cache.lastRecallResult;
           if (isCacheHit) {
-            episodicContext = cache.lastRecallResult;
+            recallOutcome = cache.lastRecallResult!;
             console.log(`[Episodic Memory] recall debounce: cache hit for same query (${now - cache.lastRecallTime}ms since last recall)`);
           } else {
-            episodicContext = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxEpisodicTokens);
-            cache.lastRecallResult = episodicContext;
+            recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxEpisodicTokens);
+            cache.lastRecallResult = recallOutcome;
             cache.lastRecallTime = now;
             cache.lastRecallFullKey = fullKey;
           }
+          const estimatedTokens = estimateTokens(recallOutcome.text);
+          const status: PrependSystemContextStatus =
+            recallOutcome.reason === "injected"
+              ? (recallOutcome.truncatedEpisodeCount > 0 ? "truncated" : "injected")
+              : "skipped";
+          logPrependSystemContextOutcome({
+            status,
+            agentId,
+            agentWs,
+            queryHash: recallOutcome.queryHash || queryHash,
+            estimatedTokens,
+            injectedEpisodeCount: recallOutcome.injectedEpisodeCount,
+            truncatedEpisodeCount: recallOutcome.truncatedEpisodeCount,
+            reason: status === "skipped" ? recallOutcome.reason : undefined,
+            firstEpisodeId: recallOutcome.firstEpisodeId,
+          });
           return {
             messages: msgs,
-            prependSystemContext: episodicContext,
-            estimatedTokens: estimateTokens(episodicContext),
+            prependSystemContext: recallOutcome.text,
+            estimatedTokens,
           };
           },
           async compact(ctx: any) {
