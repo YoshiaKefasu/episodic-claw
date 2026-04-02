@@ -11,7 +11,7 @@
       "./index.ts"
     ],
     "compat": {
-      "pluginApi": ">=2026.4.1 <2026.5.0"
+      "pluginApi": ">=2026.3.28 <=2026.4.1"
     },
     "build": {
       "openclawVersion": "2026.4.1",
@@ -40,7 +40,7 @@
     "CHANGELOG.md"
   ],
   "peerDependencies": {
-    "openclaw": ">=2026.4.1 <2026.5.0"
+    "openclaw": ">=2026.3.28 <=2026.4.1"
   },
   "peerDependenciesMeta": {
     "openclaw": {
