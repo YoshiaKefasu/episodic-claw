@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/Bithack/go-hnsw"
+	"github.com/blevesearch/bleve/v2"
 	"github.com/cockroachdb/pebble"
 	"github.com/vmihailenco/msgpack/v5"
-	"github.com/blevesearch/bleve/v2"
 
 	"episodic-core/frontmatter"
 )
@@ -60,16 +60,16 @@ type EpisodeRecord struct {
 	DueLagSecondsMax     int64              `json:"due_lag_seconds_max,omitempty" msgpack:"due_lag_seconds_max,omitempty"`
 	LastDueAt            time.Time          `json:"last_due_at,omitempty" msgpack:"last_due_at,omitempty"`
 	// Phase 2: Hippocampus Scoring
-	ImportanceScore      float32            `json:"importance_score,omitempty" msgpack:"importance_score,omitempty"`
-	NoiseScore           float32            `json:"noise_score,omitempty" msgpack:"noise_score,omitempty"`
-	PruneState           string             `json:"prune_state,omitempty" msgpack:"prune_state,omitempty"`
-	CanonicalParent      string             `json:"canonical_parent,omitempty" msgpack:"canonical_parent,omitempty"`
-	LastScoredAt         time.Time          `json:"last_scored_at,omitempty" msgpack:"last_scored_at,omitempty"`
-	TombstonedAt         time.Time          `json:"tombstoned_at,omitempty" msgpack:"tombstoned_at,omitempty"`
+	ImportanceScore float32   `json:"importance_score,omitempty" msgpack:"importance_score,omitempty"`
+	NoiseScore      float32   `json:"noise_score,omitempty" msgpack:"noise_score,omitempty"`
+	PruneState      string    `json:"prune_state,omitempty" msgpack:"prune_state,omitempty"`
+	CanonicalParent string    `json:"canonical_parent,omitempty" msgpack:"canonical_parent,omitempty"`
+	LastScoredAt    time.Time `json:"last_scored_at,omitempty" msgpack:"last_scored_at,omitempty"`
+	TombstonedAt    time.Time `json:"tombstoned_at,omitempty" msgpack:"tombstoned_at,omitempty"`
 
 	// ContentHash is the first 16 hex chars of SHA-256 over the MD body.
 	// Used by Smart Dedup to skip re-embedding when the body has not changed.
-	ContentHash          string             `json:"content_hash,omitempty" msgpack:"content_hash,omitempty"`
+	ContentHash string `json:"content_hash,omitempty" msgpack:"content_hash,omitempty"`
 }
 
 // RecallCalibration tunes the recall rerank without changing the core retrieval path.
@@ -195,7 +195,7 @@ func NewStore(dbDir string, cfg StoreConfig) (*Store, error) {
 		return nil, fmt.Errorf("failed to load hnsw index from pebble: %w", err)
 	}
 
-	// Trigger background cleanup and migration
+	// Trigger startup cleanup and migration before the store is considered ready.
 	store.CleanOrphans()
 
 	return store, nil
@@ -264,71 +264,68 @@ func (s *Store) loadIndexFromPebble() error {
 // CleanOrphans scans the storage for any episodes whose SourcePath no longer exists on the filesystem,
 // and removes them. Additionally, it ensures the p2i reverse index is populated for existing files.
 func (s *Store) CleanOrphans() {
-	go func() {
+	s.mutex.RLock()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefixEp,
+		UpperBound: []byte("ep;"),
+	})
+	s.mutex.RUnlock()
+
+	if err != nil {
+		log.Printf("[Store] Orphan cleanup failed to initialize iter: %v", err)
+		return
+	}
+	defer iter.Close()
+
+	var toDelete []string
+	var toMigrate []EpisodeRecord
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil && rec.SourcePath != "" {
+			if _, statErr := os.Stat(rec.SourcePath); os.IsNotExist(statErr) {
+				// Ghost record found
+				toDelete = append(toDelete, string(rec.ID))
+			} else {
+				// File exists, let's make sure its p2i index is there (migration)
+				toMigrate = append(toMigrate, rec)
+			}
+		}
+	}
+
+	// Now apply changes outside the global scan iterator
+	if len(toDelete) > 0 {
+		log.Printf("[Store] Orphan cleanup: found %d ghost records, deleting...", len(toDelete))
+		for _, id := range toDelete {
+			s.Delete(id) // leverages the new pebble.Batch atomic deletion
+		}
+	}
+
+	// Perform p2i migration for legacy records
+	migrated := 0
+	for _, rec := range toMigrate {
+		normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
+		p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
+
 		s.mutex.RLock()
-		iter, err := s.db.NewIter(&pebble.IterOptions{
-			LowerBound: prefixEp,
-			UpperBound: []byte("ep;"),
-		})
+		_, closer, getErr := s.db.Get(p2iKey)
 		s.mutex.RUnlock()
 
-		if err != nil {
-			log.Printf("[Store] Orphan cleanup failed to initialize iter: %v", err)
-			return
+		switch getErr {
+		case pebble.ErrNotFound:
+			// Needs migration
+			s.mutex.Lock()
+			s.db.Set(p2iKey, []byte(rec.ID), pebble.NoSync)
+			s.mutex.Unlock()
+			migrated++
+		case nil:
+			closer.Close()
 		}
-		defer iter.Close()
-
-		var toDelete []string
-		var toMigrate []EpisodeRecord
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			var rec EpisodeRecord
-			if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil && rec.SourcePath != "" {
-				if _, statErr := os.Stat(rec.SourcePath); os.IsNotExist(statErr) {
-					// Ghost record found
-					toDelete = append(toDelete, string(rec.ID))
-				} else {
-					// File exists, let's make sure its p2i index is there (migration)
-					toMigrate = append(toMigrate, rec)
-				}
-			}
-		}
-
-		// Now apply changes outside the global scan iterator
-		if len(toDelete) > 0 {
-			log.Printf("[Store] Orphan cleanup: found %d ghost records, deleting...", len(toDelete))
-			for _, id := range toDelete {
-				s.Delete(id) // leverages the new pebble.Batch atomic deletion
-			}
-		}
-
-		// Perform p2i migration for legacy records
-		migrated := 0
-		for _, rec := range toMigrate {
-			normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
-			p2iKey := append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...)
-
-			s.mutex.RLock()
-			_, closer, getErr := s.db.Get(p2iKey)
-			s.mutex.RUnlock()
-
-			switch getErr {
-			case pebble.ErrNotFound:
-				// Needs migration
-				s.mutex.Lock()
-				s.db.Set(p2iKey, []byte(rec.ID), pebble.NoSync)
-				s.mutex.Unlock()
-				migrated++
-			case nil:
-				closer.Close()
-			}
-		}
-		if migrated > 0 {
-			log.Printf("[Store] Orphan cleanup: migrated %d existing records to include p2i reverse index.", migrated)
-		}
-	}()
+	}
+	if migrated > 0 {
+		log.Printf("[Store] Orphan cleanup: migrated %d existing records to include p2i reverse index.", migrated)
+	}
 }
-
 
 // enqueueSysLexq writes a lexical queue task directly into PebbleDB to guarantee processing.
 func (s *Store) enqueueSysLexq(batch *pebble.Batch, action string, recordID string) {
@@ -436,7 +433,7 @@ func (s *Store) BatchAdd(ctx context.Context, records []EpisodeRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
-	
+
 	for i := range records {
 		CalculateImportanceStage1(&records[i])
 	}
@@ -714,7 +711,7 @@ func (s *Store) DeleteByPath(path string) error {
 		return nil
 	}
 	normalizedPath := filepath.ToSlash(filepath.Clean(path))
-	
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -728,7 +725,7 @@ func (s *Store) DeleteByPath(path string) error {
 	}
 	idStr := string(idBytes)
 	closer.Close()
-	
+
 	return s.deleteLocked(idStr)
 }
 

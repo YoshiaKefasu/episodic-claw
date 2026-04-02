@@ -131,7 +131,7 @@ export class Compactor {
       if (unprocessed.length > 50) {
         console.log(`[Episodic Memory] Massive gap detected (${unprocessed.length} msgs). Firing Background Indexer...`);
         const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-        const dumpDir = path.join(agentWs, "episodes", today.slice(0, 4), today.slice(4, 6), today.slice(6, 8));
+        const dumpDir = path.join(agentWs, today.slice(0, 4), today.slice(4, 6), today.slice(6, 8));
         await fs.mkdir(dumpDir, { recursive: true });
         const dumpFile = path.join(dumpDir, `legacy_backlog_${today}_${Date.now()}.json`);
         
