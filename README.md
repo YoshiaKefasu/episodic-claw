@@ -4,15 +4,15 @@
 
 > English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.1-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 Conversations are saved locally. When you chat, it searches past history by "meaning" instead of just keyword matching, and slips the right memories into the AI's prompt before it even replies. This makes OpenClaw actually remember what you talked about last week without you having to re-explain it.
 
-With `v0.3.0`, the engine absorbed the bulletproof resilience of `lossless-claw`. **It now bridges the gap between old and new chats without dropping context (Anchor Compaction), auto-repairs broken tool logs before saving them (Transcript Repair), and refuses to lose memories even when APIs scream rate-limit at you (Summarization Escalation).** It still boasts a colossal 64,000 token context limit, but now it proactively organizes its own brain before it even gets full.
+With `v0.3.1`, the engine took a massive architectural leap. Instead of wrestling to compress memories ourselves, we now fully delegate the heavy-lifting of compaction back to OpenClaw's native LLM. But to ensure zero context loss, we use stealthy "Hooks". Right before memory is wiped, it saves everything. The AI can also proactively write an `ep-anchor` throughout the chat. Once compaction wipes the mental slate clean, we secretly inject that anchor right back into the active prompt so the AI never misses a beat.
 
-Check the `v0.3.0` roadmap and master plan [here](./docs/v0.3.0_master_plan.md).
+Check the `v0.3.x` roadmap and master plan [here](./docs/v0.3.0_master_plan.md).
 
 ---
 
@@ -99,15 +99,15 @@ Because of this, your memories don't mush into one giant, pointless blob.
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.3.0 so insane
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.3.1 so insane (Delegation Era)
 
-v0.2.1 was production-grade. v0.3.0 is a paranoid survivor that absolutely refuses to lose context.
+We completely rethought the architecture here. Trying to do "everything" ourselves was dropping the big picture. Now, we delegate the heavy lifting to the Host, and focus purely on being a stealthy memory bodyguard.
 
-- **Bridging the Forgotten (Anchor Compaction)**: When old chats are compressed and removed from active context, it doesn't just delete them. It creates a tightly summarized "Anchor" and temporarily injects it into the ongoing conversation. The AI never loses track of the current topic, even after heavy pruning.
-- **Bulletproof & Auto-Healing (Atomic Ingestion & Transcript Repair)**: Not only will ripping the power cord out not corrupt your data (WAL queue), but if the AI hallucinates bad tool calls, the plugin auto-repairs the broken logs before saving them into long-term memory (ported straight from `lossless-claw`!).
-- **Never Surrenders to Rate Limits (Self-Healing & Summarization Escalation)**: If your API provider throws a 429 Rate Limit tantrum, the system doesn't crash or drop memories. It waits, then escalates through three different fallback strategies (Normal -> Aggressive -> Deterministic) to guarantee zero data loss.
-- **Proactive Brain Management (Pressure Monitor)**: Instead of waiting for the AI's context limit to explode, it constantly monitors the token pressure (`contextThreshold`). When it senses the AI's brain getting too full, it proactively starts organizing (compacting) the chat while things are still smooth.
-- **Smart Filtering & Insane Search (Externalization & Hybrid Search)**: Massive, useless text dumps (like directory listings) are automatically stubbed out with `[Externalized]` so they don't clog your database. It uses lightning-fast text filters (Bleve) to trash irrelevant stuff, then uses deep semantic meaning (HNSW Backfill) to find the exact perfect memory. It can recall up to 64,000 tokens of past history instantly.
+- **Delegated Compaction & Ninja Hooks**: `episodic-claw` no longer hogs the compaction cycle. OpenClaw handles the heavy LLM crunching natively. But wait—doesn't that mean we lose the raw chat logs? Nope! We use a `before_compaction` hook to intercept the process 1ms before it gets wiped, and safely freeze all unsaved chats into the DB.
+- **Proactive Anchors (`ep-anchor`)**: The Agent can now decide "Oh, this is important" and use the `ep-anchor` tool to write a dense session summary on its own terms, whenever it wants.
+- **Auto-Injection (`after_compaction`)**: Right after OpenClaw wipes the chat window, we sneak back in via the `after_compaction` hook, grab the Anchor the agent wrote, and inject it straight back into the active prompt. The AI literally doesn't even feel the memory wipe.
+- **Inherited Bulletproof Defense**: All the insane durability from v0.3.0 (WAL queues, 429 Rate Limit escalation strategies, Transcript auto-repair) is still intact. Your memories are safer than ever.
+- **Dropped the Clunky Stuff**: Since the Host now manages the memory limits, we deleted all our clunky "Context Pressure Monitor" logic. The plugin is leaner, meaner, and solely focused on protecting and serving memories.
 
 > **Special Thanks: lossless-claw**
 > The insane paranoic resilience in v0.3.0—the auto-repairing transcripts and the never-surrender rate limit handling (Phase 7)—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.
@@ -130,14 +130,14 @@ AI agents can hallucinate or run destructive commmands if not guided properly. C
 
 > **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 >
-> You are to install the long-term memory extension plugin (episodic-claw v0.3.0) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
+> You are to install the long-term memory extension plugin (episodic-claw v0.3.1) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
 >
 > **[ Execution Steps ]**
 > 1. **Pre-check:** Run `openclaw --version` in the terminal to verify the CLI is available. (If this fails, STOP immediately and ask me for help).
 > 2. **Install:** Run exactly this command: `openclaw plugins install clawhub:episodic-claw`
 > 3. **Verify Installation:** Run `openclaw plugins list` to confirm it was added successfully.
 > 4. **API Key Check:** The underlying backend requires a `GEMINI_API_KEY` in the environment. Verify if you have access to this environment variable. If missing or unsure, STOP and ask me to provide it. Do NOT hallucinate a key.
-> 5. **Tool Verification:** Check your available tools to confirm you now possess `ep-recall`, `ep-save`, and `ep-expand`.
+> 5. **Tool Verification:** Check your available tools to confirm you now possess `ep-recall`, `ep-save`, `ep-expand`, and `ep-anchor`.
 > 6. **Configuration Auto-Tuning & Safety Lock:** Read the `openclaw.plugin.json` schema to understand all available properties (e.g., `reserveTokens`, `segmentationLambda` and their blast radius warnings). Based on our recent chat history and behavior, ponder the most optimal configuration for my needs. However, if you are unsure about ANY property, you MUST leave it at default/OFF and explicitly ask me: "How should I configure [Property]?" Do NOT guess.
 > 7. **Gateway Restart & Sleep Notice:** A restart of the OpenClaw Gateway or system is required to apply the plugin. Do NOT execute the restart command immediately. You MUST schedule a 6-minute sleep/wait before the command. Before going into sleep, inform me with a message like: *"A restart is required and will execute in 6 minutes. During the exact moment of restart, my consciousness will cut off before we can fully verify the installation. Please send me a message to wake me up when it's done so we can finish the test."*
 >
@@ -150,7 +150,7 @@ AI agents can hallucinate or run destructive commmands if not guided properly. C
 
 ---
 
-## <img src="./assets/icons/wrench.svg" width="24" align="center" alt="" /> The 3 Memory Tools
+## <img src="./assets/icons/wrench.svg" width="24" align="center" alt="" /> The 4 Memory Tools
 
 The AI can use these automatically, or you can explicitly tell it to use them.
 
@@ -163,6 +163,9 @@ Tell the AI "Remember this strictly" and it forcefully saves it instantly. Perfe
 ### `ep-expand` — Expand a summary back into detail
 If the AI reads a D1 summary but says "I need the exact code snippet from that", it uses this tool to unfold the summary back into the massive D0 log.
 
+### `ep-anchor` — (v0.3.1+) Proactive session anchor
+Before the context window gets bloated, the Agent can write down the key decisions, mindset, and current goals into a dense session anchor. When the memory inevitably gets compressed, this anchor flawlessly bridges the context gap.
+
 ---
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
@@ -173,8 +176,6 @@ In v0.3.0, we exposed the AI's brain chemistry to the UI. The defaults are alrea
 |---|---|---|
 | `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
 | `contextThreshold` | `0.85` | Ratio of the active token budget at which proactive compaction should kick in. **Too high:** compaction starts too late and the prompt gets crowded. **Too low:** compaction churns too often. |
-| `anchorPrompt` | `I'm about to lose {evictedCount} wonderful messages from my active context — my short-term memory just can't hold them all anymore. Before they slip away for good, I need to jot down the key facts, decisions, how I was feeling in the moment, and any loose threads I'll want to pick up later.` | Pre-compaction instruction for the Anchor. Supports `{evictedCount}`, `{keptRawCount}`, `{freshTailCount}`. |
-| `compactionPrompt` | `We've had such a rich, wonderful conversation — but my short-term context window just can't hold all of it anymore. Before everything is lost, I have to consolidate {evictedCount} messages into my long-term memory right now. I'll keep it tight and focus on only what truly matters — for me and for the person I care about. The freshest {keptRawCount} messages will stay raw in my context.` | Pre-compaction instruction for the summary. Supports `{evictedCount}`, `{keptRawCount}`, `{freshTailCount}`. |
 | `freshTailCount` | `96` | Canonical key for how many freshest raw messages survive compaction. **Too high:** Eats your API token limit instantly. **Too low:** The AI loses the flow of the current chat and acts confused. |
 | `recentKeep` | `96` | Legacy alias for `freshTailCount`. Existing configs still work during the transition. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |

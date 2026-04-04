@@ -4,15 +4,15 @@
 
 > [English](./README.md) | [日本語](./README.ja.md) | 中文
 
-[![version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.1-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 它会把你们的对话全都静悄悄存在本地。聊天时，它不像传统搜索那样只对“关键词”，而是靠“意思”去把相关的旧记忆翻出来，然后在 AI 回复你之前，偷偷塞进系统提示词里。这样你的 OpenClaw 就能真正记住你们之前聊过的梗和重大决定，不用每次都像个失忆症一样重新解释。
 
-这次的 `v0.3.0` 版，引擎完全吸收了 `lossless-claw` 的抗灾属性。**它现在能在压缩旧记忆时搭建“记忆桥梁”（Anchor Compaction），确保聊天绝不断档；就算工具调用日志坏了也能自己修好（Transcript Repair）；哪怕 API 狂弹限流报错，它也会通过三阶段降级策略死保记忆不丢（Summarization Escalation）。** 不仅保留了 64,000 token 的夸张容量限制，现在甚至能在脑子被塞满前，自己提前把记忆整理好。
+这次的 `v0.3.1` 版，迎来了一次巨大的架构飞跃。以前我们还在自己苦差事般地管理记忆压缩，现在，我们把这份干重活的 LLM 运算，完完全全交给 OpenClaw 本尊来做了。为了保证不丢记忆，我们在它的压缩生命周期里装了“钩子”。在旧聊天被删档的前一毫秒，我们把它们全部截胡存档；智能体还可以在脑子清空前主动写下 `ep-anchor`（记忆锚点）。等历史记录被清空的一瞬间，我们再悄无声息地把锚点塞回当前的窗口里。整个过程里 AI 完全感觉不到被清除了记忆，上下文零丢失。
 
-v0.3.0 的完整路线图和规划报告可以看 [这里](./docs/v0.3.0_master_plan.md)。
+v0.3.x 的完整路线图和规划报告可以看 [这里](./docs/v0.3.0_master_plan.md)。
 
 ---
 
@@ -100,17 +100,15 @@ sequenceDiagram
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.3.0 到底强在哪里
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.3.1 到底强在哪里 (全委派生命周期)
 
-v0.3.0 摆脱了“好聪明的玩具”，变成了一个实打实的重型引擎。
+我们彻底重构了思路。与其天天和系统的记忆清理程序抢夺控制权，不如直接把杂活全部委派给它，而我们只专注于当个隐蔽的“记忆护卫”。
 
-如果说 v0.2.1 是一台重型引擎，那 v0.3.0 就是一个绝对不肯丢掉一丝记忆的“生存狂”。
-
-- **连接过去的“记忆桥梁” (Anchor Compaction)**: 当旧聊天记录被压缩并清理出当前窗口时，它不会直接生硬地把历史扔掉。它会生成一个包含核心要点的“锚点总结（Anchor）”，然后在当前对话里偷偷临时注入。这样 AI 就绝不会出现“哎？咱们刚聊到哪儿了？”的失忆症状。
-- **硬核防丢与自我愈合 (Atomic Ingestion & Transcript Repair)**: 拔了电源数据也不会坏档（WAL 队列保命），甚至连聊天记录里的工具调用出 bug 了，系统都会在存进长期记忆之前自动帮你把残缺的日志修复好（直接从 `lossless-claw` 移植过来的黑科技！）。
-- **打死不丢数据的倔强 (Self-Healing & Summarization Escalation)**: 如果 API 狂弹限流报错（429 Rate Limit），系统绝不摆烂。它会安静等待，然后采取“正常 -> 激进 -> 强制兜底”的三级降级策略死死护住你的记忆数据，绝对不丢。
-- **防爆脑的先见之明 (Proactive Pressure Monitor)**: 它不再傻等着 AI 脑子（上下文窗口）彻底被塞爆。系统会实时监控 Token 压力阀值（`contextThreshold`），一旦发现快满载了，就在 AI 懵逼之前，主动且悄无声息地提前开始整理和压缩记忆。
-- **智能排雷与极限双搜 (Externalization & Hybrid Search)**: 那种把整个文件夹几千行跑出来的垃圾消息，会被自动精简成 `[已外置省略]`，省去塞爆数据库的风险。它还会先用极其暴力的文本去重过滤掉没用的废话，再用语义搜索（HNSW Semantic Backfill）无缝补齐最贴近上下文的旧记忆。它能瞬间回忆起高达 64,000 token 的庞大往事。
+- **钩子拦截与全委托**: `episodic-claw` 不再独自揽下所有的记忆压缩脏活，而是全部交给 OpenClaw 本身的上下文生命周期去运算。通过 `before_compaction` 钩子，在那段历史被抹平前的一瞬间，我们将记忆全本保存落库。
+- **神级预判锚点 (`ep-anchor`)**: 智能体现在可以自己判断“这里太重要了”，用 `ep-anchor` 工具主动给自己留下一个浓缩的核心锚点（比如当下的心态、未完成的目标）。
+- **瞒天过海的注入**: 在宿主系统轰掉所有旧纪录后，我们通过 `after_compaction` 钩子，在下一秒迅速把之前那个锚点放进去。AI 接下来的对话依然极其连贯，甚至感觉不到自己已经被清空了短期记忆。
+- **不败的祖传盾牌**: 上个版本（v0.3.0）里的神兵利器——WAL 并发队列、API 限流的三级防抖降级（Rate Limit Escalation），以及破损日志自愈功能——统统带过来了。安全方面依然稳如老狗。
+- **甩掉包袱**: 既然记忆压力的管理权都交回去了，我们直接砍掉了以前那些笨重繁琐的阈值监控代码。现在插件异常精简，专一硬核。
 
 > **Special Thanks: lossless-claw**
 > v0.3.0 中那种“绝对不丢记忆、坏了还能自己修”的变态级抗灾能力（Phase 7 的核心架构），全部是直接从我们的姐妹项目 `lossless-claw` 中移植并吸收过来的。如果不是在那边经历了无数次踩坑与血战，episodic-claw 绝对达不到今天这种完美度。
@@ -133,14 +131,14 @@ openclaw plugins install clawhub:episodic-claw
 
 > **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 >
-> 你现在需要为自己安装长期记忆扩展插件（episodic-claw v0.3.0）。请**严格**按照以下顺序执行。绝对禁止自行猜测并执行其他命令，绝对禁止未经允许修改用户文件。
+> 你现在需要为自己安装长期记忆扩展插件（episodic-claw v0.3.1）。请**严格**按照以下顺序执行。绝对禁止自行猜测并执行其他命令，绝对禁止未经允许修改用户文件。
 >
 > **【 执行步骤 】**
 > 1. **环境预检:** 在终端执行 `openclaw --version`，确认 OpenClaw CLI 可用。（如果报错，请立刻停下并向我报告）。
 > 2. **执行安装:** 在终端精确执行此命令：`openclaw plugins install clawhub:episodic-claw`（严禁执行其他无关命令）。
 > 3. **验证安装:** 执行 `openclaw plugins list`，确认插件已成功添加。
 > 4. **API 密钥检查:** 这个记忆引擎的底层向量计算需要 `GEMINI_API_KEY` 环境变量。请确认你的环境中是否配置了它。如果没有或者不确定，请立刻停下并询问我如何设置，**绝不可**自行捏造假密钥。
-> 5. **验证工具:** 核对你目前可用的工具列表，确认你已经成功拿到了 `ep-recall`、`ep-save` 和 `ep-expand` 权限。
+> 5. **验证工具:** 核对你目前可用的工具列表，确认你已经成功拿到了 `ep-recall`、`ep-save`、`ep-expand` 和 `ep-anchor` 工具权限。
 > 6. **配置自适应与安全锁:** 请完整阅读 `openclaw.plugin.json` 中的所有配置项说明（如 `reserveTokens` 及其炸膛风险）。结合近期你和我聊天的风格及频率，思考并向我推荐一套“最适合我的参数”。但请注意：**只要你对某个参数的设定有一丝犹豫，绝对不准靠猜**，必须将其保持默认或关闭（OFF），并立刻停下来向我请示：“关于某某参数，你想怎么设置？”
 > 7. **网关重启与待机通知:** 为了使插件生效，你需要执行 OpenClaw 的重启命令。但**绝对不能立刻执行**。在执行重启前，你必须插入一段 6 分钟的等待（Sleep）。在进入等待前，向我发一条类似这样的告知消息：*“接下来需要重启，命令将在 6 分钟后执行。在重启的瞬间我的意识会断线，导致我们还没法验证安装是否圆满成功。等重启结束后，麻烦发条消息把我唤醒哦，我们再进行最后测试。”*
 >
@@ -153,7 +151,7 @@ openclaw plugins install clawhub:episodic-claw
 
 ---
 
-## <img src="./assets/icons/wrench.svg" width="24" align="center" alt="" /> 三大神器（供你或AI调用）
+## <img src="./assets/icons/wrench.svg" width="24" align="center" alt="" /> 四大记忆神器工具（供你或AI调用）
 
 ### `ep-recall` — 手动翻找历史
 当你不满意 AI 自动想起的内容，或者你想直接命令它：“去把昨天聊的代码库配置给我翻出来”，用它。
@@ -164,18 +162,19 @@ openclaw plugins install clawhub:episodic-claw
 ### `ep-expand` — 剥洋葱看细节
 当 AI 读了浓缩版摘要但发现需要看当时的详细代码时，它会用这个把浓缩包彻底炸回曾经的原版聊天内容。
 
+### `ep-anchor` — (v0.3.1以上) 预判级定海神针
+眼看上下文已经被塞得快爆了的时候，智能体可以提前写下决策、心得或者目前干到哪儿了。随后旧记忆被切掉的时候，这段神针一样的话就会强行锁在当下，永不跑偏。
+
 ---
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> 调参指南 (openclaw.plugin.json)
 
-新版本开放了能直接在 UI 里修改大脑结构的权限。虽然原始参数已经被调校得非常变态了，但如果你非要作死改参数，下场请看说明。
+新版本把大脑的化学结构敞开给了UI。如果你非要想改参数，随便，但下场请自行查看。
 
 | 键值名 | 默认值 | 炸膛风险（乱改会怎样？） |
 |---|---|---|
 | `reserveTokens` | `2048` | **设太大:** AI 满脑子全是祖传记忆，直接被当前的聊天内容卡死。**设太小:** AI 退化成七秒记忆的残障儿童。 |
 | `contextThreshold` | `0.85` | 触发 compaction 的 token budget 比例。**设太大:** 压缩来得太晚，窗口容易爆。**设太小:** 压缩太频繁，聊天容易抖。 |
-| `anchorPrompt` | `I'm about to lose {evictedCount} wonderful messages from my active context — my short-term memory just can't hold them all anymore. Before they slip away for good, I need to jot down the key facts, decisions, how I was feeling in the moment, and any loose threads I'll want to pick up later.` | compaction 前 Anchor 指令模板，支持 `{evictedCount}` / `{keptRawCount}` / `{freshTailCount}`。 |
-| `compactionPrompt` | `We've had such a rich, wonderful conversation — but my short-term context window just can't hold all of it anymore. Before everything is lost, I have to consolidate {evictedCount} messages into my long-term memory right now. I'll keep it tight and focus on only what truly matters — for me and for the person I care about. The freshest {keptRawCount} messages will stay raw in my context.` | compaction 前 Summary 指令模板，支持 `{evictedCount}` / `{keptRawCount}` / `{freshTailCount}`。 |
 | `freshTailCount` | `96` | compaction 后保留下来的最新原始消息数量的正式键名。**设太大:** 对话框一拉长，Token 费烧碎你的钱包。**设太小:** 当前对话疯狂断更，AI 满嘴跑火车。 |
 | `recentKeep` | `96` | `freshTailCount` 的兼容别名，迁移期间旧配置仍可继续使用。 |
 | `dedupWindow` | `5` | **设太大:** 你重复叫 AI 干一件事，它可能会擅自忽视。**设太小:** 弱网段重发两句，数据库就多出两条垃圾。 |
