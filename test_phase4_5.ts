@@ -88,6 +88,8 @@ async function runAnchorInjectionSmoke(): Promise<void> {
 
   fs.mkdirSync(runtimeDist, { recursive: true });
   for (const file of [
+    "anchor-store.js",
+    "archiver.js",
     "large-payload.js",
     "compactor.js",
     "config.js",
@@ -150,7 +152,6 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
   const tempBase = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-anchor-"));
   const agentRoot = path.join(tempBase, "workspace");
   const agentWs = path.join(agentRoot, "episodes");
-  const sessionFile = path.join(tempBase, "session.json");
   const messages = Array.from({ length: 18 }, (_value, index) => ({
     role: index % 2 === 0 ? "user" : "assistant",
     content:
@@ -162,14 +163,16 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
   }));
 
   fs.mkdirSync(agentWs, { recursive: true });
-  fs.writeFileSync(sessionFile, JSON.stringify({ messages }, null, 2), "utf8");
 
   delete (globalThis as any)[singletonKey];
 
   let contextEngineFactory: (() => any) | null = null;
   let registerCommandCalls = 0;
+  const handlers = new Map<string, (event?: any, ctx?: any) => Promise<void> | void>();
   const mockApi = {
-    on() {},
+    on(hookName: string, handler: (event?: any, ctx?: any) => Promise<void> | void) {
+      handlers.set(hookName, handler);
+    },
     registerContextEngine(_id: string, factory: () => any) {
       contextEngineFactory = factory;
     },
@@ -183,7 +186,6 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
         loadConfig() {
           return {
             anchorInjectionAssembles: 1,
-            freshTailCount: 15,
             agents: {
               list: [{ id: "main", default: true, workspace: agentRoot }],
               defaults: { workspace: agentRoot },
@@ -207,17 +209,14 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
 
     assert.equal(registerCommandCalls, 0, "plugin should not register a competing /compact command");
     assert.ok(contextEngineFactory, "context engine should be registered");
+    const afterCompaction = handlers.get("after_compaction");
+    assert.ok(afterCompaction, "after_compaction hook should be registered");
     const engine = contextEngineFactory!();
 
-    const compactResult = await engine.compact({
-      sessionFile,
-      agentId: "main",
-      force: true,
-      compactionTarget: "threshold",
-      customInstructions: "Keep the compacted result focused on exam prep continuity.",
-    });
-    assert.equal(compactResult.ok, true, "compaction should succeed before temporary anchor injection");
-    assert.equal(compactResult.compacted, true, "compaction should arm the temporary anchor injection state");
+    const anchorFile = path.join(agentWs, "anchor.md");
+    const anchorPayload = "Remember the exam plan, the latest outline, and the one-step recovery rule.";
+    fs.writeFileSync(anchorFile, anchorPayload, "utf8");
+    await afterCompaction!(undefined, { agentId: "main" });
 
     const budgetZero = await engine.assemble({
       agentId: "main",
@@ -239,11 +238,10 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
         { role: "user", content: "What should I remember for the next exam practice?" },
       ],
     });
-    assert.match(firstEligible.prependSystemContext ?? "", /\[Compaction Anchor\]/, "the next eligible prompt build should inject the compaction anchor");
-    assert.match(firstEligible.prependSystemContext ?? "", /\[Compaction Summary\]/, "the next eligible prompt build should inject the compaction summary");
+    assert.match(firstEligible.prependSystemContext ?? "", /Remember the exam plan, the latest outline, and the one-step recovery rule\./, "the next eligible prompt build should inject the anchor text from anchor.md");
     assert.match(firstEligible.prependSystemContext ?? "", /--- My Memory ---/, "recall injection should remain active and separately merged");
     assert.ok(
-      (firstEligible.prependSystemContext ?? "").indexOf("[Compaction Anchor]") < (firstEligible.prependSystemContext ?? "").indexOf("--- My Memory ---"),
+      (firstEligible.prependSystemContext ?? "").indexOf("Remember the exam plan") < (firstEligible.prependSystemContext ?? "").indexOf("--- My Memory ---"),
       "anchor injection should merge before recall injection in the final prependSystemContext"
     );
 
@@ -254,7 +252,7 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
         { role: "user", content: "What should I remember for the next exam practice?" },
       ],
     });
-    assert.doesNotMatch(expired.prependSystemContext ?? "", /\[Compaction Anchor\]/, "temporary anchor injection should expire after the configured lifetime");
+    assert.doesNotMatch(expired.prependSystemContext ?? "", /Remember the exam plan, the latest outline, and the one-step recovery rule\./, "temporary anchor injection should expire after the configured lifetime");
     assert.match(expired.prependSystemContext ?? "", /--- My Memory ---/, "recall injection should continue after anchor injection expires");
   } finally {
     process.argv.length = 0;
@@ -471,8 +469,8 @@ async function runCompactionModelSmoke(): Promise<void> {
 
   const customSessionFile = path.join(tempBase, "session-custom.json");
   fs.writeFileSync(customSessionFile, JSON.stringify({ messages }, null, 2), "utf8");
-  // anchorPrompt / compactionPrompt are now pre-compaction instructions, not bridge text.
-  // The bridge embedded in the session always comes from the fixed bridge templates.
+  // The legacy compactor harness still accepts pre-compaction instruction prompts.
+  // The bridge embedded in the rewritten session always comes from the fixed bridge templates.
   // Verify the compactor accepts custom instruction prompts without throwing.
   const customCompactor = new Compactor(rpcClient as any, segmenter as any, 15, {
     anchorPrompt: "Before trimming {evictedCount} messages, record the key decisions for later retrieval.",
@@ -637,6 +635,8 @@ async function runGatewayStartSmoke(): Promise<void> {
   const observedSidecarLines: string[] = [];
   fs.mkdirSync(runtimeDist, { recursive: true });
   const distJsFiles = [
+    "anchor-store.js",
+    "archiver.js",
     "large-payload.js",
     "compactor.js",
     "config.js",
@@ -776,14 +776,29 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.0", "package.json version should be 0.3.0");
-  assert.equal(manifest.version, "0.3.0", "openclaw.plugin.json version should be 0.3.0");
-  assert.equal(
-    (manifest.configSchema as any).properties.contextThreshold.default,
-    0.85,
-    "openclaw.plugin.json should expose contextThreshold as a 0.85 ratio default"
+  assert.equal(pkg.version, "0.3.1", "package.json version should be 0.3.1");
+  assert.equal(manifest.version, "0.3.1", "openclaw.plugin.json version should be 0.3.1");
+  assert.ok(
+    !("contextThreshold" in (manifest.configSchema as any).properties),
+    "openclaw.plugin.json should no longer expose contextThreshold"
   );
-  assert.match(changelog, /\[0\.3\.0\]/, "CHANGELOG should mention v0.3.0");
+  assert.ok(
+    !("freshTailCount" in (manifest.configSchema as any).properties),
+    "openclaw.plugin.json should no longer expose freshTailCount"
+  );
+  assert.ok(
+    !("recentKeep" in (manifest.configSchema as any).properties),
+    "openclaw.plugin.json should no longer expose recentKeep"
+  );
+  assert.ok(
+    !("anchorPrompt" in (manifest.configSchema as any).properties),
+    "openclaw.plugin.json should no longer expose anchorPrompt"
+  );
+  assert.ok(
+    !("compactionPrompt" in (manifest.configSchema as any).properties),
+    "openclaw.plugin.json should no longer expose compactionPrompt"
+  );
+  assert.match(changelog, /\[0\.3\.1\]/, "CHANGELOG should mention v0.3.1");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,
@@ -796,48 +811,23 @@ async function main() {
   );
   assert.match(
     configSource,
-    /contextThreshold:\s*Math\.max\(0\.70,\s*clampUnitInterval\(rawConfig\?\.contextThreshold,\s*0\.85\)\)/,
-    "loadConfig should clamp contextThreshold with a 0.70 lower bound and a default of 0.85"
-  );
-  assert.match(
-    configSource,
     /anchorInjectionAssembles:\s*Math\.max\(1,\s*rawConfig\?\.anchorInjectionAssembles\s*\?\?\s*1\)/,
     "anchorInjectionAssembles should default to 1 and stay clamped in src/config.ts"
   );
-  assert.match(
+  assert.doesNotMatch(
     configSource,
-    /const freshTailCount = rawConfig\?\.freshTailCount\s*\?\?\s*rawConfig\?\.recentKeep\s*\?\?\s*96/,
-    "freshTailCount should be canonical and fall back to recentKeep in src/config.ts"
+    /contextThreshold|anchorPrompt|compactionPrompt|freshTailCount|recentKeep/,
+    "src/config.ts should no longer expose compaction-era config fields"
   );
-  assert.match(
-    configSource,
-    /anchorPrompt: typeof rawConfig\?\.anchorPrompt === "string" \? rawConfig\.anchorPrompt : DEFAULT_ANCHOR_PROMPT/,
-    "loadConfig should default anchorPrompt to the built-in bridge template"
-  );
-  assert.match(
-    configSource,
-    /compactionPrompt: typeof rawConfig\?\.compactionPrompt === "string" \? rawConfig\.compactionPrompt : DEFAULT_COMPACTION_PROMPT/,
-    "loadConfig should default compactionPrompt to the built-in bridge template"
-  );
-  assert.match(
+  assert.doesNotMatch(
     indexSource,
-    /contextThreshold: Type\.Optional\(Type\.Number\(\{[\s\S]*minimum: 0,[\s\S]*maximum: 1,[\s\S]*default: 0\.85/ ,
-    "plugin schema should expose contextThreshold as a 0..1 setting"
+    /contextThreshold|anchorPrompt|compactionPrompt|freshTailCount|recentKeep/,
+    "plugin schema should no longer expose compaction-era config fields"
   );
-  assert.match(
-    indexSource,
-    /const contextThreshold = Math\.max\(0, Math\.min\(1, cfg\.contextThreshold \?\? 0\.85\)\);[\s\S]*const pressureThreshold = Math\.floor\(totalBudget \* contextThreshold\);[\s\S]*currentTokens > pressureThreshold/s,
-    "assemble should trigger proactive compaction from token pressure using contextThreshold"
-  );
-  assert.match(
-    indexSource,
-    /anchorPrompt: Type\.Optional\(Type\.String\(\{[\s\S]*DEFAULT_ANCHOR_PROMPT[\s\S]*\}\)\)/,
-    "plugin schema should expose anchorPrompt with the built-in default"
-  );
-  assert.match(
-    indexSource,
-    /compactionPrompt: Type\.Optional\(Type\.String\(\{[\s\S]*DEFAULT_COMPACTION_PROMPT[\s\S]*\}\)\)/,
-    "plugin schema should expose compactionPrompt with the built-in default"
+  assert.doesNotMatch(
+    typesSource,
+    /contextThreshold|anchorPrompt|compactionPrompt|freshTailCount|recentKeep/,
+    "types.ts should no longer declare compaction-era config fields"
   );
   assert.match(
     compactorSource,
@@ -848,11 +838,6 @@ async function main() {
     compactorSource,
     /export const DEFAULT_COMPACTION_PROMPT =/,
     "compactor should export the built-in compaction prompt template"
-  );
-  assert.match(
-    configSource,
-    /freshTailCount,\s*[\r\n\s]*recentKeep:\s*freshTailCount/,
-    "loadConfig should expose both freshTailCount and recentKeep using the same resolved value"
   );
   assert.doesNotMatch(
     configSource,
@@ -921,8 +906,8 @@ async function main() {
   );
   assert.match(
     indexSource,
-    /if \(result\.ok && result\.compacted && result\.result\) \{\s*activateAnchorInjection\(state, result\.result\);\s*\}/,
-    "compaction should arm the temporary anchor injection state without changing unrelated phases"
+    /const anchorText = await state\.anchorStore\.read\(agentWs\);\s*if \(anchorText\) \{\s*activateAnchorInjection\(state, \{ anchor: anchorText, summary: "" \}\);\s*await state\.anchorStore\.consume\(agentWs\);\s*console\.log\("\[Episodic Memory\] after_compaction: anchor injected\."\);/s,
+    "after_compaction should arm the temporary anchor injection state from anchor.md without relying on compact() result"
   );
   assert.match(
     indexSource,

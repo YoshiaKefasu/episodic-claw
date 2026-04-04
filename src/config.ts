@@ -1,5 +1,4 @@
 import { EpisodicPluginConfig, RecallCalibration } from "./types";
-import { DEFAULT_ANCHOR_PROMPT, DEFAULT_COMPACTION_PROMPT } from "./compactor";
 
 function clampUnitInterval(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -13,22 +12,15 @@ function clampUnitInterval(value: unknown, fallback: number): number {
  * Handles the configSchema defined in openclaw.plugin.json.
  */
 export function loadConfig(rawConfig: any): EpisodicPluginConfig {
-  const freshTailCount = rawConfig?.freshTailCount ?? rawConfig?.recentKeep ?? 96;
-
   return {
     tombstoneRetentionDays: rawConfig?.tombstoneRetentionDays ?? 14,
     enableBackgroundWorkers: rawConfig?.enableBackgroundWorkers ?? true,
     lexicalPreFilterLimit: rawConfig?.lexicalPreFilterLimit ?? 1000,
     reserveTokens: rawConfig?.reserveTokens ?? 2048,
-    contextThreshold: Math.max(0.70, clampUnitInterval(rawConfig?.contextThreshold, 0.85)),
-    anchorPrompt: typeof rawConfig?.anchorPrompt === "string" ? rawConfig.anchorPrompt : DEFAULT_ANCHOR_PROMPT,
-    compactionPrompt: typeof rawConfig?.compactionPrompt === "string" ? rawConfig.compactionPrompt : DEFAULT_COMPACTION_PROMPT,
     autoInjectGuardMinScore: clampUnitInterval(rawConfig?.autoInjectGuardMinScore, 0.86),
     // Phase 3 lifetime is consumed only by eligible prompt-build passes that actually
     // reach anchor-injection evaluation. A budget-truncated early return does not spend it.
     anchorInjectionAssembles: Math.max(1, rawConfig?.anchorInjectionAssembles ?? 1),
-    freshTailCount,
-    recentKeep: freshTailCount,
     dedupWindow: rawConfig?.dedupWindow ?? 5,
     maxBufferChars: Math.max(500, rawConfig?.maxBufferChars ?? 7200),
     maxCharsPerChunk: Math.max(500, rawConfig?.maxCharsPerChunk ?? 9000),

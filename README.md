@@ -170,14 +170,13 @@ Before the context window gets bloated, the Agent can write down the key decisio
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
 
-In v0.3.0, we exposed the AI's brain chemistry to the UI. The defaults are already heavily tuned, but here is what happens if you mess with them.
+In v0.3.1, we exposed the AI's brain chemistry to the UI. The defaults are already heavily tuned, but here is what happens if you mess with them.
+
+Compaction itself is now host-owned, so the old compaction knobs (`contextThreshold`, `freshTailCount`, `recentKeep`) are no longer exposed here.
 
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
 | `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
-| `contextThreshold` | `0.85` | Ratio of the active token budget at which proactive compaction should kick in. **Too high:** compaction starts too late and the prompt gets crowded. **Too low:** compaction churns too often. |
-| `freshTailCount` | `96` | Canonical key for how many freshest raw messages survive compaction. **Too high:** Eats your API token limit instantly. **Too low:** The AI loses the flow of the current chat and acts confused. |
-| `recentKeep` | `96` | Legacy alias for `freshTailCount`. Existing configs still work during the transition. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |
 | `maxBufferChars` | `7200` | **Too high:** You risk losing a massive chunk of chat if the PC crashes. **Too low:** The AI murders your hard drive by saving tiny files every second. |
 | `maxCharsPerChunk` | `9000` | **Too high:** Heavy text blocks choke the database. **Too low:** Long chats get chopped into random pieces, ruining search context. |

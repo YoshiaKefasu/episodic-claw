@@ -39,29 +39,11 @@ export interface EpisodicPluginConfig {
   enableBackgroundWorkers?: boolean;
   lexicalPreFilterLimit?: number;
   reserveTokens?: number;
-  /** Ratio of token budget at which proactive compaction should trigger. */
-  contextThreshold?: number;
-  /**
-   * Pre-compaction instruction given to the Agent just before the anchor system
-   * message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}.
-   * Tells the Agent what to record/preserve before the context window is trimmed.
-   */
-  anchorPrompt?: string;
-  /**
-   * Pre-compaction instruction given to the Agent just before the compaction
-   * summary system message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}.
-   * Tells the Agent how to summarise the range that is about to be evicted.
-   */
-  compactionPrompt?: string;
   /** Minimum 0..1 score required before degraded HNSW fallback results may auto-inject. */
   autoInjectGuardMinScore?: number;
   /** How many eligible prompt builds may inject the latest compaction anchor+summary.
    *  This is not "every assemble call" — budget-truncated early returns do not consume it. */
   anchorInjectionAssembles?: number;
-  /** Canonical config key for how many freshest raw messages survive compaction. */
-  freshTailCount?: number;
-  /** Legacy alias retained for backward compatibility during the v0.3.0 transition. */
-  recentKeep?: number;
   /** processTurn() dedup フィルタのウィンドウサイズ（デフォルト 5）。
    *  フォールバック回数が多い環境では大きくする（例: 10）。 */
   dedupWindow?: number;

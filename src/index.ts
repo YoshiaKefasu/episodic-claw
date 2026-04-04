@@ -301,12 +301,6 @@ const PluginConfigSchema = Type.Object(
     anchorInjectionAssembles: Type.Optional(Type.Integer({
       description: "How many eligible prompt builds may temporarily inject the latest compaction anchor + summary (default 1). Budget-truncated early returns do not consume this window."
     })),
-    freshTailCount: Type.Optional(Type.Integer({
-      description: "Canonical config key. Number of freshest raw messages to retain during compaction (default 96)."
-    })),
-    recentKeep: Type.Optional(Type.Integer({
-      description: "Legacy alias for freshTailCount. Kept for backward compatibility during the v0.3.0 transition."
-    })),
     dedupWindow: Type.Optional(Type.Integer({
       description: "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
     })),
@@ -503,7 +497,7 @@ const episodicClawPlugin = {
         result?: { anchor?: string; summary: string }
       ) => {
         // after_compaction is only a host notification hook. The payload carrier and
-        // activation boundary live here in the plugin's compact() success path.
+        // activation boundary live here in the plugin's notification path.
         const anchorText = result?.anchor?.trim() || "";
         const summaryText = result?.summary?.trim() || "";
         if (!anchorText && !summaryText) {
