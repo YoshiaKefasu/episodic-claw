@@ -109,6 +109,9 @@ v0.2.1 was production-grade. v0.3.0 is a paranoid survivor that absolutely refus
 - **Proactive Brain Management (Pressure Monitor)**: Instead of waiting for the AI's context limit to explode, it constantly monitors the token pressure (`contextThreshold`). When it senses the AI's brain getting too full, it proactively starts organizing (compacting) the chat while things are still smooth.
 - **Smart Filtering & Insane Search (Externalization & Hybrid Search)**: Massive, useless text dumps (like directory listings) are automatically stubbed out with `[Externalized]` so they don't clog your database. It uses lightning-fast text filters (Bleve) to trash irrelevant stuff, then uses deep semantic meaning (HNSW Backfill) to find the exact perfect memory. It can recall up to 64,000 tokens of past history instantly.
 
+> **Special Thanks: lossless-claw**
+> The insane paranoic resilience in v0.3.0—the auto-repairing transcripts and the never-surrender rate limit handling (Phase 7)—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.
+
 ---
 
 ## <img src="./assets/icons/package.svg" width="24" align="center" alt="" /> Install
