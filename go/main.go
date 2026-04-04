@@ -1853,6 +1853,7 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 	// MED-4: Normalize cache key for case-insensitivity
 	query := strings.TrimSpace(strings.ToLower(params.Query))
 	var emb []float32
+	recallFallbackReason := ""
 
 	if cached, ok := recallCache.Load(query); ok {
 		entry := cached.(recallCacheEntry)
@@ -1884,6 +1885,7 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 			if ai.IsRateLimitError(err) || strings.Contains(err.Error(), "deadline exceeded") {
 				EmitLog("Recall: API rate limit or timeout (%v). Falling back to Lexical search only.", err)
 				emb = make([]float32, 3072) // Provide Zero-vector for graceful fallback
+				recallFallbackReason = "embed_fallback_lexical_only"
 			} else {
 				sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Failed to embed query: " + err.Error()}, ID: req.ID})
 				return
@@ -1895,7 +1897,7 @@ func handleRecall(conn net.Conn, req RPCRequest) {
 	}
 
 	now := time.Now()
-	results, err := vstore.RecallWithQuery(params.Query, emb, params.K, now, params.Topics, strictTopics, params.Calibration)
+	results, err := vstore.RecallWithQuery(params.Query, emb, params.K, now, params.Topics, strictTopics, params.Calibration, recallFallbackReason)
 	if err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Recall failed: " + err.Error()}, ID: req.ID})
 		return

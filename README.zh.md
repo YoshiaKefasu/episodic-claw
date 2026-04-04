@@ -168,7 +168,11 @@ openclaw plugins install clawhub:episodic-claw
 | 键值名 | 默认值 | 炸膛风险（乱改会怎样？） |
 |---|---|---|
 | `reserveTokens` | `2048` | **设太大:** AI 满脑子全是祖传记忆，直接被当前的聊天内容卡死。**设太小:** AI 退化成七秒记忆的残障儿童。 |
-| `recentKeep` | `96` | **设太大:** 对话框一拉长，Token 费烧碎你的钱包。**设太小:** 当前对话疯狂断更，AI 满嘴跑火车。 |
+| `contextThreshold` | `0.85` | 触发 compaction 的 token budget 比例。**设太大:** 压缩来得太晚，窗口容易爆。**设太小:** 压缩太频繁，聊天容易抖。 |
+| `anchorPrompt` | `I'm about to lose {evictedCount} wonderful messages from my active context — my short-term memory just can't hold them all anymore. Before they slip away for good, I need to jot down the key facts, decisions, how I was feeling in the moment, and any loose threads I'll want to pick up later.` | compaction 前 Anchor 指令模板，支持 `{evictedCount}` / `{keptRawCount}` / `{freshTailCount}`。 |
+| `compactionPrompt` | `We've had such a rich, wonderful conversation — but my short-term context window just can't hold all of it anymore. Before everything is lost, I have to consolidate {evictedCount} messages into my long-term memory right now. I'll keep it tight and focus on only what truly matters — for me and for the person I care about. The freshest {keptRawCount} messages will stay raw in my context.` | compaction 前 Summary 指令模板，支持 `{evictedCount}` / `{keptRawCount}` / `{freshTailCount}`。 |
+| `freshTailCount` | `96` | compaction 后保留下来的最新原始消息数量的正式键名。**设太大:** 对话框一拉长，Token 费烧碎你的钱包。**设太小:** 当前对话疯狂断更，AI 满嘴跑火车。 |
+| `recentKeep` | `96` | `freshTailCount` 的兼容别名，迁移期间旧配置仍可继续使用。 |
 | `dedupWindow` | `5` | **设太大:** 你重复叫 AI 干一件事，它可能会擅自忽视。**设太小:** 弱网段重发两句，数据库就多出两条垃圾。 |
 | `maxBufferChars` | `7200` | **设太大:** 若机器崩了，你今天这几万字的聊天进度全死。**设太小:** 电脑硬盘被无数小文件磨平。 |
 | `maxCharsPerChunk` | `9000` | **设太大:** 数据块重到数据库当场死机。**设太小:** 完整的代码因为长度被切成八段，搜索时前言不搭后语。 |

@@ -1,4 +1,6 @@
 import { EpisodicCoreClient } from "./rpc-client";
+import { normalizeMessageText } from "./large-payload";
+import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
 
 export interface Message {
   role: string;
@@ -11,23 +13,7 @@ export interface Message {
  * Content can be: string, array of blocks [{type:"text", text:"..."}], or object {type:"text", text:"..."}.
  */
 export function extractText(content: any): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map(block => {
-        if (typeof block === "string") return block;
-        if (block && typeof block === "object" && block.text) return block.text;
-        if (block && typeof block === "object" && block.content) return extractText(block.content);
-        return "";
-      })
-      .filter(Boolean)
-      .join(" ");
-  }
-  if (content && typeof content === "object") {
-    if (content.text) return content.text;
-    if (content.content) return extractText(content.content);
-  }
-  return String(content ?? "");
+  return normalizeMessageText(content);
 }
 
 export class EventSegmenter {
@@ -252,6 +238,73 @@ export class EventSegmenter {
     }
   }
 
+  private async ingestChunkBatchesWithEscalation(params: {
+    chunkBatches: Message[][];
+    agentWs: string;
+    agentId: string;
+    reason: string;
+    surprise: number;
+  }): Promise<void> {
+    const BATCHINGEST_TIMEOUT_MS = 30000;
+    const summaryLevels: SummarizationLevel[] = ["normal", "aggressive", "fallback"];
+    let lastError: unknown = null;
+
+    for (const level of summaryLevels) {
+      const items = params.chunkBatches.map((batch, index) => ({
+        summary: "", // placeholder filled below
+        tags: index === 0 ? ["auto-segmented", "chunked", params.reason] : ["auto-segmented", params.reason],
+        topics: [],
+        edges: [],
+        surprise: index === 0 ? params.surprise : 0,
+      }));
+
+      for (let index = 0; index < items.length; index += 1) {
+        items[index].summary = await this.summarizeBuffer(params.chunkBatches[index], level);
+      }
+
+      if (items.length === 0) {
+        return;
+      }
+
+      console.log(
+        `[Episodic Memory] Sending ${items.length} chunks to Go sidecar via batchIngest (summary=${level})...`
+      );
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`batchIngest timed out after ${BATCHINGEST_TIMEOUT_MS}ms`)), BATCHINGEST_TIMEOUT_MS)
+      );
+
+      try {
+        const slugs = await Promise.race([this.rpc.batchIngest(items, params.agentWs, params.agentId), timeoutPromise]);
+        if (slugs.length < items.length) {
+          console.warn(
+            `[Episodic Memory] WARN: batchIngest returned ${slugs.length} slug(s) for ${items.length} item(s) ` +
+            `(summary=${level}). ${items.length - slugs.length} episode(s) may have been skipped. ` +
+            `Possible cause: Gemini API 429 (quota exceeded). Check Go sidecar logs for details.`
+          );
+        }
+        if (slugs.length > 0) {
+          if (level !== "normal") {
+            console.log(`[Episodic Memory] Summarization escalation resolved at level=${level}.`);
+          }
+          return;
+        }
+        console.warn(
+          `[Episodic Memory] batchIngest returned 0 slugs for ${items.length} item(s) at summary=${level}. Escalating...`
+        );
+      } catch (err) {
+        lastError = err;
+        console.warn(
+          `[Episodic Memory] batchIngest failed at summary=${level}: ${err instanceof Error ? err.message : String(err)}. Escalating...`
+        );
+      }
+    }
+
+    if (lastError) {
+      console.error("[Episodic Memory] All summarization escalation levels failed for chunk ingestion:", lastError);
+    }
+  }
+
   /**
    * Splits a large buffer array into manageable chunks based on character count with Overlap,
    * then sends them to Go Sidecar's BatchIngest for safe concurrent processing.
@@ -260,7 +313,7 @@ export class EventSegmenter {
     const MAX_CHARS_PER_CHUNK = this.maxCharsPerChunk; // loadConfig() 経由で設定可能（デフォルト 9000）
     const OVERLAP_MESSAGES = 2; // RAGコンテキスト分断防止のためののりしろ
 
-    const items: any[] = [];
+    const chunkBatches: Message[][] = [];
     let currentChunk: Message[] = [];
     let currentLen = 0;
     
@@ -270,14 +323,7 @@ export class EventSegmenter {
       
       // 次のメッセージを入れると限界を超える場合、現在のチャンクをアイテムとして確定
       if (currentLen + text.length > MAX_CHARS_PER_CHUNK && currentChunk.length > 0) {
-        const summary = await this.summarizeBuffer(currentChunk);
-        items.push({
-          summary: summary,
-          tags: ["auto-segmented", "chunked", reason],
-          topics: [],
-          edges: [],
-          surprise: items.length === 0 ? surprise : 0
-        });
+        chunkBatches.push([...currentChunk]);
         
         // のりしろ（Overlap）を抽出して新しいチャンクの初期状態にする
         const overlap = currentChunk.slice(-OVERLAP_MESSAGES);
@@ -291,49 +337,23 @@ export class EventSegmenter {
 
     // 残りのチャンクも追加
     if (currentChunk.length > 0) {
-      const summary = await this.summarizeBuffer(currentChunk);
-      items.push({
-        summary: summary,
-        tags: ["auto-segmented", reason],
-        topics: [],
-        edges: [],
-        surprise: items.length === 0 ? surprise : 0
-      });
+      chunkBatches.push([...currentChunk]);
     }
 
-    // TS側の直列awaitループは解体し、構築した配列を1回だけ Goの batchIngest に委譲する（Go側の並行処理を活用）。
-    if (items.length > 0) {
-      console.log(`[Episodic Memory] Sending ${items.length} chunks to Go sidecar via batchIngest...`);
-      // [R-1] batchIngest に Promise.race タイムアウトを追加。
-      // Go sidecar がハングした場合にゾンビ Promise が残り続けるのを防ぐ。
-      // gateway_stop 後にプロセスが終了できなくなるリスクへの対策。
-      const BATCHINGEST_TIMEOUT_MS = 30000; // 30秒
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`batchIngest timed out after ${BATCHINGEST_TIMEOUT_MS}ms`)), BATCHINGEST_TIMEOUT_MS)
-      );
-      const slugs = await Promise.race([this.rpc.batchIngest(items, agentWs, agentId), timeoutPromise]);
-      // [429 Guard] Go sidecar が EmbedContent 429 (quota exceeded) でエピソードをスキップした場合、
-      // 戻り値の slug 数が送信した items 数を下回る。無言欠損を防ぐため warn レベルで記録する。
-      if (slugs.length < items.length) {
-        console.warn(
-          `[Episodic Memory] WARN: batchIngest returned ${slugs.length} slug(s) for ${items.length} item(s). ` +
-          `${items.length - slugs.length} episode(s) may have been silently skipped. ` +
-          `Possible cause: Gemini API 429 (quota exceeded). Check Go sidecar logs for details.`
-        );
-      }
+    // TS側の直列 await ループは解体し、summary escalation を挟んで
+    // 構築した配列を Go の batchIngest に委譲する（Go 側の並行処理を活用）。
+    if (chunkBatches.length > 0) {
+      await this.ingestChunkBatchesWithEscalation({
+        chunkBatches,
+        agentWs,
+        agentId,
+        reason,
+        surprise,
+      });
     }
   }
 
-  private async summarizeBuffer(messages: Message[]): Promise<string> {
-    // Phase 2 暫定実装: テキストをそのまま連結するだけで LLM 要約は行わない。
-    // ⚠️ トークン上限リスク: maxCharsPerChunk のデフォルト = 9,000 文字 ≈ 約 2,700〜3,600 トークン。
-    //   多くの埋め込みモデルの上限（8,192 トークン）は超えないが、長い会話では
-    //   チャンク境界の分割次第で 1 チャンクが 8,000+ トークンになる可能性がある。
-    //   その場合、埋め込みモデルがチャンク末尾をトランケートし、エピソード後半が
-    //   HNSW インデックスから消失する。
-    // Phase 3 計画: Go sidecar 側に LLM 要約（抽象化要約）を offload する予定。
-    //   summarizeBuffer が返す文字列を Go 側で LLM に渡し、圧縮されたエピソード概要を生成する。
-    //   これにより: (1) トークン上限リスク解消、(2) recall 精度向上、(3) ストレージ削減。
-    return messages.map(m => `${m.role}: ${extractText(m.content)}`).join("\n");
+  private async summarizeBuffer(messages: Message[], level: SummarizationLevel = "normal"): Promise<string> {
+    return buildSummaryForLevel(messages, level);
   }
 }

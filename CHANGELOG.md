@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.3.0] — 2026-04-04
+
+### Added
+- **Anchor Compaction Architecture** (Phases 1-4): Compaction now preserves a heuristic Anchor and summary alongside the protected fresh tail, so agents retain a coherent session bridge after old turns are pruned.
+- **Anchor Injection Lifecycle** (Phase 3): After compaction, Anchor + summary are temporarily injected via `prependSystemContext` for a configurable `anchorInjectionAssembles` window, then expire automatically.
+- **Recall Diagnostics** (Phase 5): `matchedBy`, `fallbackReason`, and score breakdown fields are now surfaced on `ScoredEpisode` through Go RPC, making retrieval decisions observable.
+- **Semantic Backfill** (Phase 6A): When lexical-first retrieval returns fewer candidates than the requested top-K, the remaining slots are backfilled from HNSW semantic search.
+- **Summarization Escalation** (Phase 7A): Three-tier escalation (Normal -> Aggressive -> Deterministic Fallback) prevents memory loss when the embedding API returns 429 during `batchIngest`.
+- **Large Payload Externalization** (Phase 7B): Directory listings, large code blocks, and similar noisy payloads are replaced with `[Externalized: N chars...]` stubs before segmentation.
+- **Transcript Repair** (Phase 7C): Pre-compaction `tool_use`/`tool_result` pairing repair, ported from lossless-claw, fixes orphaned, missing, and duplicate tool result messages.
+- **Proactive Context Pressure Monitor** (Phase 7D): `assemble()` now evaluates token pressure via `contextThreshold` (default 0.85, min 0.70) and triggers compaction proactively when the active context exceeds the threshold.
+- **`contextThreshold` config surface**: Exposed in `openclaw.plugin.json` with runtime wiring in `config.ts` and `index.ts`.
+- **Degraded HNSW Confidence Guard**: Auto-inject is suppressed when retrieval quality is degraded (`embed_fallback_lexical_only` + low score), with `reason=degraded_low_confidence` logged.
+
+### Changed
+- `anchorPrompt` and `compactionPrompt` now serve as pre-compaction instruction templates (not bridge text). Bridge templates are internal defaults, not user-configurable.
+- `contextThreshold` is clamped to `[0.70, 1.0]` with a default of 0.85 to absorb CJK token estimation drift.
+- `estimateTokens()` computation is deferred inside the `totalBudget > 0` guard, eliminating wasted CPU when `tokenBudget` is not provided by the host.
+- `isCompacting` is now a proper private field with a public getter, protecting TOCTOU race conditions during proactive compaction.
+- Phase 6B (constant-parallel hybrid, RRF, freshness metrics) is explicitly deferred to v0.3.X.
+- All v0.3.0 Phase plan documents now include implementation-complete notes.
+
+### Fixed
+- Fixed `tokenBudget === 0` false trigger: pressure checks now skip entirely when the host provides zero or undefined token budget.
+- Fixed content-block-level `tool_use_id` detection in transcript repair.
+- Fixed empty-result diagnostics gap: Go sidecar now logs fallback metadata even when recall returns zero episodes.
+
 ## [0.2.6] — 2026-04-02
 
 ### Added

@@ -168,7 +168,11 @@ In v0.2.1, we exposed the AI's brain chemistry to the UI. The defaults are alrea
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
 | `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
-| `recentKeep` | `96` | **Too high:** Eats your API token limit instantly. **Too low:** The AI loses the flow of the current chat and acts confused. |
+| `contextThreshold` | `0.85` | Ratio of the active token budget at which proactive compaction should kick in. **Too high:** compaction starts too late and the prompt gets crowded. **Too low:** compaction churns too often. |
+| `anchorPrompt` | `I'm about to lose {evictedCount} wonderful messages from my active context — my short-term memory just can't hold them all anymore. Before they slip away for good, I need to jot down the key facts, decisions, how I was feeling in the moment, and any loose threads I'll want to pick up later.` | Pre-compaction instruction for the Anchor. Supports `{evictedCount}`, `{keptRawCount}`, `{freshTailCount}`. |
+| `compactionPrompt` | `We've had such a rich, wonderful conversation — but my short-term context window just can't hold all of it anymore. Before everything is lost, I have to consolidate {evictedCount} messages into my long-term memory right now. I'll keep it tight and focus on only what truly matters — for me and for the person I care about. The freshest {keptRawCount} messages will stay raw in my context.` | Pre-compaction instruction for the summary. Supports `{evictedCount}`, `{keptRawCount}`, `{freshTailCount}`. |
+| `freshTailCount` | `96` | Canonical key for how many freshest raw messages survive compaction. **Too high:** Eats your API token limit instantly. **Too low:** The AI loses the flow of the current chat and acts confused. |
+| `recentKeep` | `96` | Legacy alias for `freshTailCount`. Existing configs still work during the transition. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |
 | `maxBufferChars` | `7200` | **Too high:** You risk losing a massive chunk of chat if the PC crashes. **Too low:** The AI murders your hard drive by saving tiny files every second. |
 | `maxCharsPerChunk` | `9000` | **Too high:** Heavy text blocks choke the database. **Too low:** Long chats get chopped into random pieces, ruining search context. |

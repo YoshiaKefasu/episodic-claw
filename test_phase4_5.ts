@@ -36,6 +36,586 @@ function assertLogOrder(text: string, needles: string[]): void {
   }
 }
 
+function loadCompactorCtor(): typeof import("./src/compactor.ts").Compactor {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-compactor-${process.pid}-`));
+  const tempCjsPath = path.join(tempDir, "compactor.cjs");
+  fs.copyFileSync(path.resolve("dist", "compactor.js"), tempCjsPath);
+  for (const file of [
+    "large-payload.js",
+    "rpc-client.js",
+    "segmenter.js",
+    "summary-escalation.js",
+    "transcript-repair.js",
+    "types.js",
+    "utils.js",
+  ]) {
+    fs.copyFileSync(path.join("dist", file), path.join(tempDir, file));
+  }
+  const require = createRequire(import.meta.url);
+  return require(tempCjsPath).Compactor;
+}
+
+function loadCompactorModule(): typeof import("./src/compactor.ts") {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-compactor-module-${process.pid}-`));
+  const tempCjsPath = path.join(tempDir, "compactor.cjs");
+  fs.copyFileSync(path.resolve("dist", "compactor.js"), tempCjsPath);
+  for (const file of [
+    "large-payload.js",
+    "rpc-client.js",
+    "segmenter.js",
+    "summary-escalation.js",
+    "transcript-repair.js",
+    "types.js",
+    "utils.js",
+  ]) {
+    fs.copyFileSync(path.join("dist", file), path.join(tempDir, file));
+  }
+  const require = createRequire(import.meta.url);
+  return require(tempCjsPath);
+}
+
+async function runAnchorInjectionSmoke(): Promise<void> {
+  const previousArgv = [...process.argv];
+  if (!process.argv.includes("test")) {
+    process.argv.push("test");
+  }
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-anchor-runtime-"));
+  const runtimeDist = path.join(runtimeRoot, "dist");
+  const require = createRequire(path.join(runtimeDist, "index.js"));
+  const singletonKey = Symbol.for("__episodic_claw_singleton__");
+  process.env.NODE_PATH = path.resolve("node_modules");
+  Module._initPaths();
+
+  fs.mkdirSync(runtimeDist, { recursive: true });
+  for (const file of [
+    "large-payload.js",
+    "compactor.js",
+    "config.js",
+    "index.js",
+    "retriever.js",
+    "rpc-client.js",
+    "summary-escalation.js",
+    "transcript-repair.js",
+    "segmenter.js",
+    "types.js",
+    "utils.js",
+  ]) {
+    fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
+  }
+
+  fs.writeFileSync(
+    path.join(runtimeDist, "rpc-client.js"),
+    `
+class EpisodicCoreClient {
+  async start() {}
+  async stop() {}
+  async startWatcher() { return "ok"; }
+  async rebuildIndex() { return "ok"; }
+  async setMeta() {}
+  async getWatermark() { return { dateSeq: "20260403-18", absIndex: 17 }; }
+  async setWatermark() {}
+  async triggerBackgroundIndex() { return "ok"; }
+  async batchIngest() { return []; }
+  async segmentScore() {
+    return {
+      rawSurprise: 0.05,
+      mean: 0.01,
+      std: 0.01,
+      threshold: 0.2,
+      z: 0,
+      isBoundary: false,
+      reason: "stub"
+    };
+  }
+  async recall() {
+    return [{
+      Record: {
+        id: "recall-1",
+        title: "Recall 1",
+        timestamp: "2026-04-03T00:00:00Z"
+      },
+      Body: "Remember the exam framing."
+    }];
+  }
+  async recallFeedback() { return "ok"; }
+}
+class FileEventDebouncer {
+  constructor() {}
+}
+module.exports = { EpisodicCoreClient, FileEventDebouncer };
+`,
+    "utf8"
+  );
+
+  const tempBase = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-anchor-"));
+  const agentRoot = path.join(tempBase, "workspace");
+  const agentWs = path.join(agentRoot, "episodes");
+  const sessionFile = path.join(tempBase, "session.json");
+  const messages = Array.from({ length: 18 }, (_value, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content:
+      index === 16
+        ? "Keep the newest study plan visible in the active window."
+        : index === 17
+          ? "Understood. I will preserve the freshest plan details."
+          : `Historical message ${index + 1} about the older exam context.`,
+  }));
+
+  fs.mkdirSync(agentWs, { recursive: true });
+  fs.writeFileSync(sessionFile, JSON.stringify({ messages }, null, 2), "utf8");
+
+  delete (globalThis as any)[singletonKey];
+
+  let contextEngineFactory: (() => any) | null = null;
+  let registerCommandCalls = 0;
+  const mockApi = {
+    on() {},
+    registerContextEngine(_id: string, factory: () => any) {
+      contextEngineFactory = factory;
+    },
+    registerCommand() {
+      registerCommandCalls += 1;
+    },
+    registerTool() {},
+    runtime: {
+      extensionAPI: {},
+      config: {
+        loadConfig() {
+          return {
+            anchorInjectionAssembles: 1,
+            freshTailCount: 15,
+            agents: {
+              list: [{ id: "main", default: true, workspace: agentRoot }],
+              defaults: { workspace: agentRoot },
+            },
+          };
+        },
+      },
+    },
+  };
+
+  try {
+    const pluginModule = require(path.join(runtimeDist, "index.js"));
+    const plugin = pluginModule.default ?? pluginModule;
+    const originalCwd = process.cwd();
+    process.chdir(runtimeRoot);
+    try {
+      plugin.register(mockApi as any);
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    assert.equal(registerCommandCalls, 0, "plugin should not register a competing /compact command");
+    assert.ok(contextEngineFactory, "context engine should be registered");
+    const engine = contextEngineFactory!();
+
+    const compactResult = await engine.compact({
+      sessionFile,
+      agentId: "main",
+      force: true,
+      compactionTarget: "threshold",
+      customInstructions: "Keep the compacted result focused on exam prep continuity.",
+    });
+    assert.equal(compactResult.ok, true, "compaction should succeed before temporary anchor injection");
+    assert.equal(compactResult.compacted, true, "compaction should arm the temporary anchor injection state");
+
+    const budgetZero = await engine.assemble({
+      agentId: "main",
+      tokenBudget: 2048,
+      messages: [
+        { role: "user", content: "What should I remember for the next exam practice?" },
+      ],
+    });
+    assert.doesNotMatch(
+      budgetZero.prependSystemContext ?? "",
+      /\[Compaction Anchor\]/,
+      "zero remaining episodic budget should skip temporary anchor injection without consuming it"
+    );
+
+    const firstEligible = await engine.assemble({
+      agentId: "main",
+      tokenBudget: 4096,
+      messages: [
+        { role: "user", content: "What should I remember for the next exam practice?" },
+      ],
+    });
+    assert.match(firstEligible.prependSystemContext ?? "", /\[Compaction Anchor\]/, "the next eligible prompt build should inject the compaction anchor");
+    assert.match(firstEligible.prependSystemContext ?? "", /\[Compaction Summary\]/, "the next eligible prompt build should inject the compaction summary");
+    assert.match(firstEligible.prependSystemContext ?? "", /--- My Memory ---/, "recall injection should remain active and separately merged");
+    assert.ok(
+      (firstEligible.prependSystemContext ?? "").indexOf("[Compaction Anchor]") < (firstEligible.prependSystemContext ?? "").indexOf("--- My Memory ---"),
+      "anchor injection should merge before recall injection in the final prependSystemContext"
+    );
+
+    const expired = await engine.assemble({
+      agentId: "main",
+      tokenBudget: 4096,
+      messages: [
+        { role: "user", content: "What should I remember for the next exam practice?" },
+      ],
+    });
+    assert.doesNotMatch(expired.prependSystemContext ?? "", /\[Compaction Anchor\]/, "temporary anchor injection should expire after the configured lifetime");
+    assert.match(expired.prependSystemContext ?? "", /--- My Memory ---/, "recall injection should continue after anchor injection expires");
+  } finally {
+    process.argv.length = 0;
+    process.argv.push(...previousArgv);
+    delete (globalThis as any)[singletonKey];
+  }
+}
+
+async function runDegradedFallbackGuardSmoke(): Promise<void> {
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-retriever-runtime-"));
+  const runtimeDist = path.join(runtimeRoot, "dist");
+  fs.mkdirSync(runtimeDist, { recursive: true });
+  for (const file of [
+    "large-payload.js",
+    "compactor.js",
+    "config.js",
+    "retriever.js",
+    "rpc-client.js",
+    "summary-escalation.js",
+    "transcript-repair.js",
+    "segmenter.js",
+    "types.js",
+    "utils.js",
+  ]) {
+    const target = file === "retriever.js"
+      ? path.join(runtimeDist, "retriever.cjs")
+      : path.join(runtimeDist, file);
+    fs.copyFileSync(path.join("dist", file), target);
+  }
+  const require = createRequire(import.meta.url);
+  const { EpisodicRetriever } = require(path.join(runtimeDist, "retriever.cjs"));
+  const lowConfidenceClient = {
+    async recall() {
+      return [{
+        Record: {
+          id: "fallback-low",
+          title: "Fallback Low",
+          timestamp: "2026-04-04T00:00:00Z",
+        },
+        Body: "This should not auto-inject because confidence is too low.",
+        matchedBy: "semantic",
+        fallbackReason: "embed_fallback_lexical_only",
+        Score: 0.42,
+      }];
+    },
+    async recallFeedback() {
+      return "ok";
+    },
+  };
+  const highConfidenceClient = {
+    async recall() {
+      return [{
+        Record: {
+          id: "fallback-high",
+          title: "Fallback High",
+          timestamp: "2026-04-04T00:00:00Z",
+        },
+        Body: "This should auto-inject because confidence cleared the guard.",
+        matchedBy: "semantic",
+        fallbackReason: "embed_fallback_lexical_only",
+        Score: 0.92,
+      }];
+    },
+    async recallFeedback() {
+      return "ok";
+    },
+  };
+
+  const lowRetriever = new EpisodicRetriever(lowConfidenceClient as any, undefined);
+  const lowOutcome = await lowRetriever.retrieveRelevantContext(
+    [{ role: "user", content: "Recall the exam memory." } as any],
+    "/tmp/episodes",
+    5,
+    2048
+  );
+  assert.equal(
+    lowOutcome.reason,
+    "degraded_low_confidence",
+    "low-confidence degraded semantic fallback should be suppressed from prependSystemContext"
+  );
+  assert.equal(lowOutcome.text, "", "guarded degraded fallback should not inject any text");
+  assert.deepEqual(
+    lowOutcome.diagnostics.fallbackReasons,
+    ["embed_fallback_lexical_only"],
+    "guarded degraded fallback should still expose fallback diagnostics"
+  );
+
+  const highRetriever = new EpisodicRetriever(highConfidenceClient as any, undefined);
+  const highOutcome = await highRetriever.retrieveRelevantContext(
+    [{ role: "user", content: "Recall the exam memory." } as any],
+    "/tmp/episodes",
+    5,
+    2048
+  );
+  assert.equal(highOutcome.reason, "injected", "high-confidence degraded fallback should still inject");
+  assert.match(
+    highOutcome.text,
+    /Fallback High/,
+    "high-confidence degraded fallback should remain available to prependSystemContext"
+  );
+
+  const relaxedRetriever = new EpisodicRetriever(lowConfidenceClient as any, {
+    autoInjectGuardMinScore: 0.4,
+  } as any);
+  const relaxedOutcome = await relaxedRetriever.retrieveRelevantContext(
+    [{ role: "user", content: "Recall the exam memory." } as any],
+    "/tmp/episodes",
+    5,
+    2048
+  );
+  assert.equal(
+    relaxedOutcome.reason,
+    "injected",
+    "autoInjectGuardMinScore should allow operators to lower the degraded fallback inject threshold"
+  );
+}
+
+async function runCompactionModelSmoke(): Promise<void> {
+  const tempBase = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-compaction-"));
+  const agentWs = path.join(tempBase, "episodes");
+  const sessionFile = path.join(tempBase, "session.json");
+  const messages = Array.from({ length: 18 }, (_value, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content:
+      index === 16
+        ? "Keep the newest study plan visible in the active window."
+        : index === 17
+          ? "Understood. I will preserve the freshest plan details."
+          : `Historical message ${index + 1} about the older exam context.`,
+  }));
+
+  fs.mkdirSync(agentWs, { recursive: true });
+  fs.writeFileSync(
+    sessionFile,
+    JSON.stringify(
+      {
+        messages,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  let lastWatermark: { dateSeq: string; absIndex: number } | null = null;
+  const rpcClient = {
+    async getWatermark() {
+      return { dateSeq: "20260403-18", absIndex: 17 };
+    },
+    async setWatermark(_workspace: string, watermark: { dateSeq: string; absIndex: number }) {
+      lastWatermark = watermark;
+    },
+    async triggerBackgroundIndex() {
+      return "ok";
+    },
+    async batchIngest() {
+      return [];
+    },
+  };
+  const segmenter = {
+    async forceFlush() {},
+  };
+
+  const { Compactor, DEFAULT_ANCHOR_BRIDGE_TEMPLATE, DEFAULT_COMPACTION_BRIDGE_TEMPLATE } = loadCompactorModule();
+  const compactor = new Compactor(rpcClient as any, segmenter as any, 15);
+  const result = await compactor.compact({
+    sessionFile,
+    resolvedAgentWs: agentWs,
+    agentId: "main",
+  });
+
+  assert.equal(result.ok, true, "compaction should succeed");
+  assert.equal(result.compacted, true, "compaction should rewrite the session");
+  assert.match(result.result?.anchor ?? "", /\[Compaction Anchor\]/, "anchor payload should be returned");
+  assert.match(result.result?.summary ?? "", /\[Compaction Summary\]/, "summary payload should be returned");
+  // The bridge text embedded in the session file comes from the bridge templates, not the instruction prompts.
+  assert.match(
+    result.result?.anchor ?? "",
+    new RegExp(DEFAULT_ANCHOR_BRIDGE_TEMPLATE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("\\{evictedCount\\}", "3").replace("\\{keptRawCount\\}", "15")),
+    "default anchor bridge template should be embedded in the session anchor system message"
+  );
+  assert.match(
+    result.result?.summary ?? "",
+    new RegExp(DEFAULT_COMPACTION_BRIDGE_TEMPLATE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("\\{evictedCount\\}", "3")),
+    "default compaction bridge template should be embedded in the session summary system message"
+  );
+
+  const rewritten = JSON.parse(fs.readFileSync(sessionFile, "utf8"));
+  assert.equal(rewritten.messages.length, 17, "session should keep exactly anchor + summary + fresh tail");
+  assert.equal(rewritten.messages[0]?.role, "system", "anchor should be first");
+  assert.equal(rewritten.messages[1]?.role, "system", "summary should be second");
+  assert.match(rewritten.messages[0]?.content ?? "", /\[Compaction Anchor\]/);
+  assert.match(rewritten.messages[1]?.content ?? "", /\[Compaction Summary\]/);
+  assert.equal(
+    rewritten.messages[15]?.content,
+    "Keep the newest study plan visible in the active window.",
+    "fresh tail should preserve the newest user message"
+  );
+  assert.equal(
+    rewritten.messages[16]?.content,
+    "Understood. I will preserve the freshest plan details.",
+    "fresh tail should preserve the newest assistant message"
+  );
+  assert.deepEqual(
+    lastWatermark?.absIndex,
+    16,
+    "watermark should reset to the new anchor + summary + fresh tail boundary"
+  );
+  assert.match(
+    lastWatermark?.dateSeq ?? "",
+    /^\d{8}-0$/,
+    "watermark should emit a compacted dateSeq with the processed-gap count"
+  );
+
+  const customSessionFile = path.join(tempBase, "session-custom.json");
+  fs.writeFileSync(customSessionFile, JSON.stringify({ messages }, null, 2), "utf8");
+  // anchorPrompt / compactionPrompt are now pre-compaction instructions, not bridge text.
+  // The bridge embedded in the session always comes from the fixed bridge templates.
+  // Verify the compactor accepts custom instruction prompts without throwing.
+  const customCompactor = new Compactor(rpcClient as any, segmenter as any, 15, {
+    anchorPrompt: "Before trimming {evictedCount} messages, record the key decisions for later retrieval.",
+    compactionPrompt: "Summarise {evictedCount} messages now entering episodic memory; {keptRawCount} messages remain hot.",
+  });
+  const customResult = await customCompactor.compact({
+    sessionFile: customSessionFile,
+    resolvedAgentWs: agentWs,
+    agentId: "main",
+  });
+  // Bridge text in the output is still from DEFAULT_ANCHOR_BRIDGE_TEMPLATE / DEFAULT_COMPACTION_BRIDGE_TEMPLATE.
+  assert.match(customResult.result?.anchor ?? "", /\[Compaction Anchor\]/, "custom-prompt compaction: anchor marker must be present");
+  assert.match(customResult.result?.summary ?? "", /\[Compaction Summary\]/, "custom-prompt compaction: summary marker must be present");
+  assert.match(
+    customResult.result?.anchor ?? "",
+    new RegExp(DEFAULT_ANCHOR_BRIDGE_TEMPLATE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("\\{evictedCount\\}", "3").replace("\\{keptRawCount\\}", "15")),
+    "custom-prompt compaction: anchor bridge text still comes from fixed bridge template"
+  );
+  assert.match(
+    customResult.result?.summary ?? "",
+    new RegExp(DEFAULT_COMPACTION_BRIDGE_TEMPLATE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("\\{evictedCount\\}", "3")),
+    "custom-prompt compaction: summary bridge text still comes from fixed bridge template"
+  );
+
+}
+
+async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-phase7-runtime-"));
+  const runtimeDist = path.join(runtimeRoot, "dist");
+  fs.mkdirSync(runtimeDist, { recursive: true });
+  for (const file of [
+    "large-payload.js",
+    "rpc-client.js",
+    "segmenter.js",
+    "summary-escalation.js",
+    "transcript-repair.js",
+    "types.js",
+    "utils.js",
+  ]) {
+    fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
+  }
+  const require = createRequire(import.meta.url);
+  const { extractText } = require(path.join(runtimeDist, "segmenter.js"));
+  const { buildSummaryForLevel } = require(path.join(runtimeDist, "summary-escalation.js"));
+  const { sanitizeToolUseResultPairing } = require(path.join(runtimeDist, "transcript-repair.js"));
+
+  const directoryListing = Array.from({ length: 420 }, (_, index) => `./workspace/episodes/2026/04/${String(index % 30 + 1).padStart(2, "0")}/item-${index}.md`).join("\n");
+  const externalized = extractText(directoryListing);
+  assert.match(
+    externalized,
+    /\[Large directory listing:/,
+    "extractText should externalize oversized directory listings instead of passing raw noise through"
+  );
+
+  const noisyTranscript = [
+    { role: "user", content: "Initial note." },
+    { role: "assistant", content: "thinking:\nwe should inspect the archive\n[DEBUG] internal noise" },
+    { role: "assistant", content: "Follow-up with the important bit." },
+    { role: "user", content: "More context that should survive." },
+  ];
+  const normalSummary = buildSummaryForLevel(noisyTranscript, "normal");
+  const aggressiveSummary = buildSummaryForLevel(noisyTranscript, "aggressive");
+  const fallbackSummary = buildSummaryForLevel(noisyTranscript, "fallback");
+  assert.match(normalSummary, /Initial note\./, "normal summary should keep the full transcript shape");
+  assert.doesNotMatch(aggressiveSummary, /thinking:|^\[DEBUG\]/m, "aggressive summary should strip reasoning/debug noise");
+  assert.ok(
+    aggressiveSummary.length <= normalSummary.length,
+    "aggressive summary should not be longer than the normal summary"
+  );
+  assert.ok(
+    fallbackSummary.length <= normalSummary.length,
+    "fallback summary should remain deterministic and compact"
+  );
+
+  const repaired = sanitizeToolUseResultPairing([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "call-1", name: "search" },
+      ],
+    },
+    {
+      role: "user",
+      content: "intervening user message",
+    },
+    {
+      role: "toolResult",
+      toolUseId: "call-1",
+      content: [{ type: "text", text: "late tool output" }],
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "call-2", name: "read" },
+      ],
+    },
+    {
+      role: "assistant",
+      content: "follow-up answer",
+    },
+  ] as any);
+
+  const repairedRoles = repaired.map((message: any) => message.role);
+  assert.ok(repairedRoles.includes("toolResult"), "sanitizer should preserve or synthesize tool results");
+  assert.ok(
+    repaired.find((message: any) => message.role === "toolResult" && (message.toolCallId === "call-2" || message.toolUseId === "call-2")),
+    "sanitizer should insert a synthetic tool result when a tool_use has no matching result"
+  );
+  assert.ok(
+    repaired.indexOf(repaired.find((message: any) => message.role === "toolResult" && (message.toolCallId === "call-1" || message.toolUseId === "call-1")) as any) >
+      repaired.indexOf(repaired.find((message: any) => message.role === "assistant" && Array.isArray(message.content)) as any),
+    "tool results should be reattached after their assistant tool_use"
+  );
+
+  const repairedContentBlock = sanitizeToolUseResultPairing([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "call-3", name: "lookup" },
+      ],
+    },
+    {
+      role: "toolResult",
+      content: [
+        { type: "tool_result", tool_use_id: "call-3", text: "content-block tool output" },
+      ],
+    },
+  ] as any);
+  assert.ok(
+    repairedContentBlock.find((message: any) => {
+      if (message.role !== "toolResult") return false;
+      // Message-level fields may not exist for content-block-level matching.
+      // Verify the message is retained by checking its content-block carries call-3.
+      if (message.toolCallId === "call-3" || message.toolUseId === "call-3") return true;
+      if (Array.isArray(message.content)) {
+        return message.content.some((b: any) => b?.tool_use_id === "call-3");
+      }
+      return false;
+    }),
+    "sanitizer should detect content-block-level tool_use_id"
+  );
+}
+
 async function runGatewayStartSmoke(): Promise<void> {
   const previousArgv = [...process.argv];
   if (!process.argv.includes("test")) {
@@ -57,6 +637,7 @@ async function runGatewayStartSmoke(): Promise<void> {
   const observedSidecarLines: string[] = [];
   fs.mkdirSync(runtimeDist, { recursive: true });
   const distJsFiles = [
+    "large-payload.js",
     "compactor.js",
     "config.js",
     "index.js",
@@ -64,7 +645,9 @@ async function runGatewayStartSmoke(): Promise<void> {
     "rpc-client.js",
     "runner_hardcoded.js",
     "runner.js",
+    "summary-escalation.js",
     "segmenter.js",
+    "transcript-repair.js",
     "types.js",
     "utils.js"
   ];
@@ -155,7 +738,8 @@ async function runGatewayStartSmoke(): Promise<void> {
       "Legacy nested episode tree isolated at",
       "Vector store is empty for",
     ]);
-    assertLogOrder(observedSidecarLines.join("\n"), [
+    const observedTimelineText = `${observedSidecarLines.join("\n")}\n${logText}`;
+    assertLogOrder(observedTimelineText, [
       "Method: watcher.start",
       "Legacy nested episode tree isolated at",
       "Vector store is empty for",
@@ -183,14 +767,23 @@ async function main() {
   const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
   const planSource = fs.readFileSync(path.resolve("docs", "v0.2.5_fix_plan.md"), "utf8");
   const configSource = fs.readFileSync(path.resolve("src", "config.ts"), "utf8");
+  const compactorSource = fs.readFileSync(path.resolve("src", "compactor.ts"), "utf8");
   const indexSource = fs.readFileSync(path.resolve("src", "index.ts"), "utf8");
   const retrieverSource = fs.readFileSync(path.resolve("src", "retriever.ts"), "utf8");
   const rpcClientSource = fs.readFileSync(path.resolve("src", "rpc-client.ts"), "utf8");
+  const typesSource = fs.readFileSync(path.resolve("src", "types.ts"), "utf8");
   const postinstallSource = fs.readFileSync(path.resolve("scripts", "postinstall.cjs"), "utf8");
+  const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
+  const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.2.6", "package.json version should be 0.2.6");
-  assert.equal(manifest.version, "0.2.6", "openclaw.plugin.json version should be 0.2.6");
-  assert.match(changelog, /\[0\.2\.6\]/, "CHANGELOG should mention v0.2.6");
+  assert.equal(pkg.version, "0.3.0", "package.json version should be 0.3.0");
+  assert.equal(manifest.version, "0.3.0", "openclaw.plugin.json version should be 0.3.0");
+  assert.equal(
+    (manifest.configSchema as any).properties.contextThreshold.default,
+    0.85,
+    "openclaw.plugin.json should expose contextThreshold as a 0.85 ratio default"
+  );
+  assert.match(changelog, /\[0\.3\.0\]/, "CHANGELOG should mention v0.3.0");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,
@@ -203,8 +796,63 @@ async function main() {
   );
   assert.match(
     configSource,
-    /recentKeep:\s*rawConfig\?\.recentKeep\s*\?\?\s*96/,
-    "recentKeep default should stay at 96 in src/config.ts"
+    /contextThreshold:\s*Math\.max\(0\.70,\s*clampUnitInterval\(rawConfig\?\.contextThreshold,\s*0\.85\)\)/,
+    "loadConfig should clamp contextThreshold with a 0.70 lower bound and a default of 0.85"
+  );
+  assert.match(
+    configSource,
+    /anchorInjectionAssembles:\s*Math\.max\(1,\s*rawConfig\?\.anchorInjectionAssembles\s*\?\?\s*1\)/,
+    "anchorInjectionAssembles should default to 1 and stay clamped in src/config.ts"
+  );
+  assert.match(
+    configSource,
+    /const freshTailCount = rawConfig\?\.freshTailCount\s*\?\?\s*rawConfig\?\.recentKeep\s*\?\?\s*96/,
+    "freshTailCount should be canonical and fall back to recentKeep in src/config.ts"
+  );
+  assert.match(
+    configSource,
+    /anchorPrompt: typeof rawConfig\?\.anchorPrompt === "string" \? rawConfig\.anchorPrompt : DEFAULT_ANCHOR_PROMPT/,
+    "loadConfig should default anchorPrompt to the built-in bridge template"
+  );
+  assert.match(
+    configSource,
+    /compactionPrompt: typeof rawConfig\?\.compactionPrompt === "string" \? rawConfig\.compactionPrompt : DEFAULT_COMPACTION_PROMPT/,
+    "loadConfig should default compactionPrompt to the built-in bridge template"
+  );
+  assert.match(
+    indexSource,
+    /contextThreshold: Type\.Optional\(Type\.Number\(\{[\s\S]*minimum: 0,[\s\S]*maximum: 1,[\s\S]*default: 0\.85/ ,
+    "plugin schema should expose contextThreshold as a 0..1 setting"
+  );
+  assert.match(
+    indexSource,
+    /const contextThreshold = Math\.max\(0, Math\.min\(1, cfg\.contextThreshold \?\? 0\.85\)\);[\s\S]*const pressureThreshold = Math\.floor\(totalBudget \* contextThreshold\);[\s\S]*currentTokens > pressureThreshold/s,
+    "assemble should trigger proactive compaction from token pressure using contextThreshold"
+  );
+  assert.match(
+    indexSource,
+    /anchorPrompt: Type\.Optional\(Type\.String\(\{[\s\S]*DEFAULT_ANCHOR_PROMPT[\s\S]*\}\)\)/,
+    "plugin schema should expose anchorPrompt with the built-in default"
+  );
+  assert.match(
+    indexSource,
+    /compactionPrompt: Type\.Optional\(Type\.String\(\{[\s\S]*DEFAULT_COMPACTION_PROMPT[\s\S]*\}\)\)/,
+    "plugin schema should expose compactionPrompt with the built-in default"
+  );
+  assert.match(
+    compactorSource,
+    /export const DEFAULT_ANCHOR_PROMPT =/,
+    "compactor should export the built-in anchor prompt template"
+  );
+  assert.match(
+    compactorSource,
+    /export const DEFAULT_COMPACTION_PROMPT =/,
+    "compactor should export the built-in compaction prompt template"
+  );
+  assert.match(
+    configSource,
+    /freshTailCount,\s*[\r\n\s]*recentKeep:\s*freshTailCount/,
+    "loadConfig should expose both freshTailCount and recentKeep using the same resolved value"
   );
   assert.doesNotMatch(
     configSource,
@@ -233,6 +881,51 @@ async function main() {
   );
   assert.match(
     indexSource,
+    /type AnchorInjectionState = \{[\s\S]*remainingEligibleAssembles: number;[\s\S]*source: "compaction";[\s\S]*\}/,
+    "index.ts should define a separate compaction anchor injection state"
+  );
+  assert.match(
+    indexSource,
+    /This returns before anchor evaluation, so the eligible injection lifetime is not spent\./,
+    "index.ts should document that budget-truncated early returns do not consume anchor injection lifetime"
+  );
+  assert.match(
+    indexSource,
+    /after_compaction is only a host notification hook\./,
+    "index.ts should document that after_compaction is notification-only and not the anchor payload carrier"
+  );
+  assert.match(
+    indexSource,
+    /anchorInjection:\s*null,/,
+    "agent runtime state should initialize anchor injection storage"
+  );
+  assert.match(
+    indexSource,
+    /anchorInjectionAssembles: Type\.Optional\(Type\.Integer\(/,
+    "plugin schema should expose anchorInjectionAssembles"
+  );
+  assert.match(
+    indexSource,
+    /console\.log\(`\[Episodic Memory\] anchorInjection \$\{parts\.join\(" "\)\}`\);/,
+    "anchor injection should log through a dedicated anchorInjection channel"
+  );
+  assert.match(
+    indexSource,
+    /const prependSystemContext = \[anchorPrependText, recallOutcome\.text\][\s\S]*?\.join\("\\n\\n"\);/s,
+    "assemble should combine anchor injection and recall injection at the final prependSystemContext merge point"
+  );
+  assert.match(
+    indexSource,
+    /const maxRecallTokens = Math\.max\(0, maxEpisodicTokens - anchorTokens\);/,
+    "recall injection should remain separate and use the remaining prompt budget after anchor injection"
+  );
+  assert.match(
+    indexSource,
+    /if \(result\.ok && result\.compacted && result\.result\) \{\s*activateAnchorInjection\(state, result\.result\);\s*\}/,
+    "compaction should arm the temporary anchor injection state without changing unrelated phases"
+  );
+  assert.match(
+    indexSource,
     /const results = \(primaryResults \?\? \[\]\)\.slice\(0, k\);/,
     "ep-recall should use only the agent workspace results"
   );
@@ -252,6 +945,111 @@ async function main() {
     "file change events should accept both Path and path casing"
   );
   assert.match(
+    rpcClientSource,
+    /async recall\([\s\S]*?\): Promise<RecallRpcEpisodeResult\[]> \{/,
+    "rpc-client recall should expose a minimal typed recall result surface"
+  );
+  assert.match(
+    typesSource,
+    /export type RecallMatchedBy = "semantic" \| "lexical" \| "both";/,
+    "types.ts should define RecallMatchedBy for recall diagnostics"
+  );
+  assert.match(
+    typesSource,
+    /fallbackReason\?: RecallFallbackReason \| "";/,
+    "types.ts should expose fallbackReason on the typed recall result"
+  );
+  assert.match(
+    retrieverSource,
+    /type RecallDiagnostics = \{[\s\S]*matchedByCounts: Record<RecallMatchedBy, number>;[\s\S]*fallbackReasons: RecallFallbackReason\[];[\s\S]*topicsFallbackCount: number;[\s\S]*\}/,
+    "retriever should retain recall diagnostics instead of collapsing everything to a string"
+  );
+  assert.match(
+    retrieverSource,
+    /const DEFAULT_AUTO_INJECT_GUARD_MIN_SCORE = 0\.86;/,
+    "retriever should default the degraded fallback auto-inject confidence threshold to 0.86"
+  );
+  assert.match(
+    retrieverSource,
+    /reason:\s*"injected" \| "no_messages" \| "max_tokens_zero" \| "empty_query" \| "recall_empty" \| "recall_failed" \| "degraded_low_confidence";/,
+    "retriever should expose degraded_low_confidence when fallback results are suppressed from auto-injection"
+  );
+  assert.match(
+    configSource,
+    /autoInjectGuardMinScore: clampUnitInterval\(rawConfig\?\.autoInjectGuardMinScore, 0\.86\)/,
+    "loadConfig should clamp autoInjectGuardMinScore into the 0..1 range with a default of 0.86"
+  );
+  assert.match(
+    indexSource,
+    /autoInjectGuardMinScore: Type\.Optional\(Type\.Number\(\{[\s\S]*minimum: 0,[\s\S]*maximum: 1,[\s\S]*default 0\.86/ ,
+    "plugin schema should expose autoInjectGuardMinScore as a 0..1 setting"
+  );
+  assert.match(
+    indexSource,
+    /topMatchedBy: recallOutcome\.diagnostics\.topMatchedBy,[\s\S]*matchedByCounts: recallOutcome\.diagnostics\.matchedByCounts,[\s\S]*fallbackReasons: recallOutcome\.diagnostics\.fallbackReasons,[\s\S]*topicsFallbackCount: recallOutcome\.diagnostics\.topicsFallbackCount,/,
+    "index.ts should log recall diagnostics separately from anchor injection"
+  );
+  assert.match(
+    storeSource,
+    /MatchedBy\s+string\s+`json:\"matchedBy,omitempty\"`/,
+    "ScoredEpisode should include matchedBy in the result items"
+  );
+  assert.match(
+    storeSource,
+    /FallbackReason\s+string\s+`json:\"fallbackReason,omitempty\"`/,
+    "ScoredEpisode should include fallbackReason in the result items"
+  );
+  assert.match(
+    storeSource,
+    /func matchedByForCandidate\(fromLexical bool, fallbackReason string\) string \{/,
+    "Go store should derive matchedBy from the actual candidate source"
+  );
+  assert.match(
+    storeSource,
+    /func composeRecallFallbackReason\(baseReason string, topicsFallback bool\) string \{/,
+    "Go store should compose fallback reasons without changing the top-level RPC shape"
+  );
+  assert.match(
+    storeSource,
+    /if allowedIDs != nil \{\s*if _, ok := allowedIDs\[candidateID\]; !ok \{\s*return\s*\}\s*\}/,
+    "store should count only topic-eligible candidates when deciding sparse-hit backfill"
+  );
+  assert.match(
+    storeSource,
+    /shouldBackfillSemantic := len\(candidates\) > 0 &&[\s\S]*len\(candidates\) < candidateK &&[\s\S]*!strings\.Contains\(fallbackReason, "embed_fallback_lexical_only"\)/,
+    "store should only backfill semantic candidates when lexical hits are sparse and embed fallback is not lexical-only"
+  );
+  assert.match(
+    storeSource,
+    /appendCandidateUnique := func\(candidate rawScore\) \{/,
+    "store should dedupe candidate collection safely before scoring"
+  );
+  assert.match(
+    storeSource,
+    /if len\(candidates\) == 0 \|\| shouldBackfillSemantic \{/,
+    "store should preserve the zero-hit HNSW fallback while adding sparse-hit backfill"
+  );
+  assert.match(
+    storeSource,
+    /\[Recall\] empty_result fallbackReason=%s topicsFallback=%t strictTopics=%t lexicalHits=%d candidateCount=%d queryPresent=%t/,
+    "store should log empty-result fallback diagnostics without expanding the RPC shape"
+  );
+  assert.match(
+    storeSource,
+    /MatchedBy is closer to scoring provenance than raw candidate origin:/,
+    "store should document matchedBy as scoring provenance rather than a pure source label"
+  );
+  assert.match(
+    mainGoSource,
+    /recallFallbackReason := ""/,
+    "handleRecall should track embed fallback reason explicitly"
+  );
+  assert.match(
+    mainGoSource,
+    /RecallWithQuery\(params\.Query, emb, params\.K, now, params\.Topics, strictTopics, params\.Calibration, recallFallbackReason\)/,
+    "handleRecall should pass fallback reason into the recall result items"
+  );
+  assert.match(
     postinstallSource,
     /const skipPostinstall = process\.env\.EPISODIC_SKIP_POSTINSTALL === "1";/,
     "postinstall should support EPISODIC_SKIP_POSTINSTALL"
@@ -267,6 +1065,10 @@ async function main() {
     "postinstall should not hard-fail npm install on download errors"
   );
 
+  await runCompactionModelSmoke();
+  await runPhase7EscalationAndRepairSmoke();
+  await runAnchorInjectionSmoke();
+  await runDegradedFallbackGuardSmoke();
   await runGatewayStartSmoke();
 
   console.log("phase4_5 smoke: ok");

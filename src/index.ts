@@ -7,13 +7,24 @@ import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
-import { Compactor } from "./compactor";
+import { Compactor, DEFAULT_ANCHOR_PROMPT, DEFAULT_COMPACTION_PROMPT } from "./compactor";
 import { estimateTokens } from "./utils";
+import { RecallFallbackReason, RecallMatchedBy } from "./types";
 
 export interface OpenClawPluginApi {
   // フック登録 — openclaw types.ts の PluginHookName に準拠
   on(
-    hookName: "gateway_start" | "gateway_stop" | "before_prompt_build" | "session_start" | "session_end" | "before_model_resolve" | "before_agent_start" | string,
+    hookName:
+      | "gateway_start"
+      | "gateway_stop"
+      | "before_prompt_build"
+      | "session_start"
+      | "session_end"
+      | "before_model_resolve"
+      | "before_agent_start"
+      | "before_compaction"
+      | "after_compaction"
+      | string,
     handler: (event?: any, ctx?: any) => void | Promise<void>,
     opts?: { priority?: number }
   ): void;
@@ -78,12 +89,23 @@ type RecallCacheState = {
   lastRecallFullKey: string;
 };
 
+type AnchorInjectionState = {
+  anchorText: string;
+  summaryText: string;
+  anchorId: string;
+  summaryId: string;
+  // Eligible prompt-build lifetime only. A budget-truncated early return does not consume this.
+  remainingEligibleAssembles: number;
+  source: "compaction";
+};
+
 type AgentRuntimeState = {
   agentId: string;
   lastAgentWs: string;
   segmenter: EventSegmenter;
   compactor: Compactor;
   recallCache: RecallCacheState;
+  anchorInjection: AnchorInjectionState | null;
   lastSetMetaTime: number;
 };
 
@@ -101,6 +123,10 @@ function logPrependSystemContextOutcome(args: {
   truncatedEpisodeCount: number;
   reason?: string;
   firstEpisodeId?: string;
+  topMatchedBy?: RecallMatchedBy | "";
+  matchedByCounts?: Record<RecallMatchedBy, number>;
+  fallbackReasons?: RecallFallbackReason[];
+  topicsFallbackCount?: number;
 }): void {
   const parts = [
     `status=${args.status}`,
@@ -112,8 +138,65 @@ function logPrependSystemContextOutcome(args: {
     `truncatedEpisodeCount=${args.truncatedEpisodeCount}`,
   ];
   if (args.firstEpisodeId) parts.push(`firstEpisodeId=${args.firstEpisodeId}`);
+  if (args.topMatchedBy) parts.push(`topMatchedBy=${args.topMatchedBy}`);
+  if (args.matchedByCounts) {
+    parts.push(
+      `matchedByCounts=semantic:${args.matchedByCounts.semantic},lexical:${args.matchedByCounts.lexical},both:${args.matchedByCounts.both}`
+    );
+  }
+  if (typeof args.topicsFallbackCount === "number" && args.topicsFallbackCount > 0) {
+    parts.push(`topicsFallbackCount=${args.topicsFallbackCount}`);
+  }
+  if (args.fallbackReasons && args.fallbackReasons.length > 0) {
+    parts.push(`fallbackReasons=${args.fallbackReasons.join("|")}`);
+  }
   if (args.reason) parts.push(`reason=${args.reason}`);
   console.log(`[Episodic Memory] prependSystemContext ${parts.join(" ")}`);
+}
+
+type AnchorInjectionStatus = "injected" | "skipped" | "expired";
+
+function logAnchorInjectionOutcome(args: {
+  status: AnchorInjectionStatus;
+  agentId: string;
+  agentWs: string;
+  source: "compaction";
+  anchorId?: string;
+  summaryId?: string;
+  estimatedTokens: number;
+  // Current remaining eligible prompt-build window for temporary anchor injection.
+  anchorInjectionWindow: number;
+  reason?: string;
+}): void {
+  const parts = [
+    `status=${args.status}`,
+    `source=${args.source}`,
+    `agentId=${args.agentId}`,
+    `agentWs=${args.agentWs}`,
+    `estimatedTokens=${args.estimatedTokens}`,
+    `anchorInjectionWindow=${args.anchorInjectionWindow}`,
+  ];
+  if (args.anchorId) parts.push(`anchorId=${args.anchorId}`);
+  if (args.summaryId) parts.push(`summaryId=${args.summaryId}`);
+  if (args.reason) parts.push(`reason=${args.reason}`);
+  console.log(`[Episodic Memory] anchorInjection ${parts.join(" ")}`);
+}
+
+function logCompactionEntry(args: {
+  agentId: string;
+  agentWs: string;
+  force: boolean;
+  compactionTarget?: string;
+  hasCustomInstructions: boolean;
+}): void {
+  const parts = [
+    `agentId=${args.agentId}`,
+    `agentWs=${args.agentWs}`,
+    `force=${args.force}`,
+    `compactionTarget=${args.compactionTarget || "unknown"}`,
+    `customInstructions=${args.hasCustomInstructions ? "present" : "absent"}`,
+  ];
+  console.log(`[Episodic Memory] compactEntry ${parts.join(" ")}`);
 }
 
 function resolveDefaultAgentId(cfgAgents: any): string {
@@ -208,8 +291,33 @@ const PluginConfigSchema = Type.Object(
     reserveTokens: Type.Optional(Type.Integer({
       description: "Max tokens reserved for injected episode memories in the system prompt (default 2048)."
     })),
+    contextThreshold: Type.Optional(Type.Number({
+      minimum: 0,
+      maximum: 1,
+      default: 0.85,
+      description: "Ratio of the active token budget at which proactive compaction should trigger (default 0.85)."
+    })),
+    anchorPrompt: Type.Optional(Type.String({
+      default: DEFAULT_ANCHOR_PROMPT,
+      description: "Pre-compaction instruction given to the Agent just before the anchor system message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}. Tells the Agent what to record before the context window is trimmed. Unset uses the current built-in wording."
+    })),
+    compactionPrompt: Type.Optional(Type.String({
+      default: DEFAULT_COMPACTION_PROMPT,
+      description: "Pre-compaction instruction given to the Agent just before the compaction summary system message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}. Tells the Agent how to summarise the range about to be evicted. Unset uses the current built-in wording."
+    })),
+    autoInjectGuardMinScore: Type.Optional(Type.Number({
+      minimum: 0,
+      maximum: 1,
+      description: "Minimum 0..1 score required before degraded HNSW fallback results may auto-inject into prependSystemContext (default 0.86)."
+    })),
+    anchorInjectionAssembles: Type.Optional(Type.Integer({
+      description: "How many eligible prompt builds may temporarily inject the latest compaction anchor + summary (default 1). Budget-truncated early returns do not consume this window."
+    })),
+    freshTailCount: Type.Optional(Type.Integer({
+      description: "Canonical config key. Number of freshest raw messages to retain during compaction (default 96)."
+    })),
     recentKeep: Type.Optional(Type.Integer({
-      description: "Number of recent turns to retain during compaction (default 30)."
+      description: "Legacy alias for freshTailCount. Kept for backward compatibility during the v0.3.0 transition."
     })),
     dedupWindow: Type.Optional(Type.Integer({
       description: "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
@@ -365,7 +473,10 @@ const episodicClawPlugin = {
             fallbackThreshold: cfg.segmentationFallbackThreshold,
           }
         );
-        const compactor = new Compactor(rpcClient, segmenter, cfg.recentKeep ?? 30);
+        const compactor = new Compactor(rpcClient, segmenter, cfg.freshTailCount ?? cfg.recentKeep ?? 96, {
+          anchorPrompt: cfg.anchorPrompt,
+          compactionPrompt: cfg.compactionPrompt,
+        });
           const state: AgentRuntimeState = {
             agentId,
             lastAgentWs: "",
@@ -376,6 +487,7 @@ const episodicClawPlugin = {
               lastRecallTime: 0,
               lastRecallFullKey: "",
             },
+            anchorInjection: null,
             lastSetMetaTime: 0,
           };
         _singleton!.agentStates.set(agentId, state);
@@ -386,6 +498,40 @@ const episodicClawPlugin = {
         state.recallCache.lastRecallResult = null;
         state.recallCache.lastRecallTime = 0;
         state.recallCache.lastRecallFullKey = "";
+      };
+
+      const clearAnchorInjection = (state: AgentRuntimeState) => {
+        state.anchorInjection = null;
+      };
+
+      const buildAnchorInjectionPayload = (state: AnchorInjectionState): string => {
+        return [state.anchorText, state.summaryText]
+          .map((part) => part.trim())
+          .filter((part) => part.length > 0)
+          .join("\n\n");
+      };
+
+      const activateAnchorInjection = (
+        state: AgentRuntimeState,
+        result?: { anchor?: string; summary: string }
+      ) => {
+        // after_compaction is only a host notification hook. The payload carrier and
+        // activation boundary live here in the plugin's compact() success path.
+        const anchorText = result?.anchor?.trim() || "";
+        const summaryText = result?.summary?.trim() || "";
+        if (!anchorText && !summaryText) {
+          clearAnchorInjection(state);
+          return;
+        }
+        const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        state.anchorInjection = {
+          anchorText,
+          summaryText,
+          anchorId: `anchor-${nonce}`,
+          summaryId: `summary-${nonce}`,
+          remainingEligibleAssembles: Math.max(1, cfg.anchorInjectionAssembles ?? 1),
+          source: "compaction",
+        };
       };
 
       const invalidateRecallCacheForWorkspace = (workspace: string) => {
@@ -489,6 +635,9 @@ const episodicClawPlugin = {
           info: {
             id: "episodic-claw",
             name: "Episodic Memory Engine",
+            // The plugin owns compaction execution once the host calls compact().
+            // Proactive pressure checks are handled in assemble(); manual `/compact`
+            // stays host-native and this engine remains the execution endpoint.
             ownsCompaction: true,
           },
         async ingest(ctx: any) {
@@ -532,8 +681,43 @@ const episodicClawPlugin = {
             console.log("[Episodic Memory] Segmenter error in assemble:", err);
           });
 
-          const totalBudget = ctx.tokenBudget || 8192;
+          const totalBudget = typeof ctx.tokenBudget === "number" && ctx.tokenBudget > 0
+            ? ctx.tokenBudget
+            : 0;
           const reserveTokens = cfg.reserveTokens ?? 2048;
+
+          // --- Task 7D: Context Pressure Monitor ---
+          // tokenBudget が正の値でない場合はホスト未初期化と判断しスキップ。
+          if (totalBudget > 0) {
+            const contextThreshold = Math.max(0, Math.min(1, cfg.contextThreshold ?? 0.85));
+            const pressureThreshold = Math.floor(totalBudget * contextThreshold);
+            const currentTokens = estimateTokens(
+              msgs.map((m) => extractText(m.content)).join("\n")
+            );
+            if (
+              typeof ctx.sessionFile === "string" &&
+              ctx.sessionFile.length > 0 &&
+              currentTokens > pressureThreshold &&
+              !state.compactor.isCompacting
+            ) {
+              console.log(
+                `[Episodic Memory] Context pressure detected: ${currentTokens} tokens > threshold ${pressureThreshold}. ` +
+                `Triggering proactive compaction.`
+              );
+              state.compactor.compact({
+                ...ctx,
+                resolvedAgentWs: agentWs,
+                force: false,
+              }).then(result => {
+                if (result.ok && result.compacted && result.result) {
+                  activateAnchorInjection(state, result.result);
+                }
+                clearRecallCache(state);
+              }).catch(err => {
+                console.error("[Episodic Memory] Proactive compaction failed:", err);
+              });
+            }
+          }
           const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
           const k = 5;
           const now = Date.now();
@@ -546,12 +730,23 @@ const episodicClawPlugin = {
             .filter(part => part.length > 0);
           const fullQuery = queryParts.join("\n").trim();
           const queryHash = fullQuery ? createHash("sha1").update(fullQuery).digest("hex") : "";
-          const fullKey = queryHash
-            ? `${agentId}::${agentWs}::${maxEpisodicTokens}::${k}::${queryHash}`
-            : "";
 
           if (maxEpisodicTokens <= 0) {
-            // budget_truncated_to_zero: 候補はあったが、reserve 後の budget が 0 以下で注入できない。
+            if (state.anchorInjection) {
+              logAnchorInjectionOutcome({
+                status: "skipped",
+                source: state.anchorInjection.source,
+                agentId,
+                agentWs,
+                anchorId: state.anchorInjection.anchorId,
+                summaryId: state.anchorInjection.summaryId,
+                estimatedTokens: 0,
+                anchorInjectionWindow: state.anchorInjection.remainingEligibleAssembles,
+                reason: "budget_truncated_to_zero",
+              });
+            }
+            // budget_truncated_to_zero: reserve 後の budget が 0 以下。
+            // This returns before anchor evaluation, so the eligible injection lifetime is not spent.
             logPrependSystemContextOutcome({
               status: "skipped",
               agentId,
@@ -565,6 +760,67 @@ const episodicClawPlugin = {
             return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
           }
 
+          let anchorPrependText = "";
+          let anchorTokens = 0;
+          const anchorState = state.anchorInjection;
+          if (anchorState) {
+            const anchorPayload = buildAnchorInjectionPayload(anchorState);
+            const anchorWindow = anchorState.remainingEligibleAssembles;
+            anchorState.remainingEligibleAssembles = Math.max(0, anchorState.remainingEligibleAssembles - 1);
+
+            if (!anchorPayload) {
+              logAnchorInjectionOutcome({
+                status: "skipped",
+                source: anchorState.source,
+                agentId,
+                agentWs,
+                anchorId: anchorState.anchorId,
+                summaryId: anchorState.summaryId,
+                estimatedTokens: 0,
+                anchorInjectionWindow: anchorWindow,
+                reason: "empty_payload",
+              });
+              clearAnchorInjection(state);
+            } else {
+              const estimatedAnchorTokens = estimateTokens(anchorPayload);
+              if (estimatedAnchorTokens > maxEpisodicTokens) {
+                logAnchorInjectionOutcome({
+                  status: "skipped",
+                  source: anchorState.source,
+                  agentId,
+                  agentWs,
+                  anchorId: anchorState.anchorId,
+                  summaryId: anchorState.summaryId,
+                  estimatedTokens: estimatedAnchorTokens,
+                  anchorInjectionWindow: anchorWindow,
+                  reason: "anchor_budget_exceeded",
+                });
+              } else {
+                anchorPrependText = anchorPayload;
+                anchorTokens = estimatedAnchorTokens;
+                logAnchorInjectionOutcome({
+                  status: "injected",
+                  source: anchorState.source,
+                  agentId,
+                  agentWs,
+                  anchorId: anchorState.anchorId,
+                  summaryId: anchorState.summaryId,
+                  estimatedTokens: estimatedAnchorTokens,
+                  anchorInjectionWindow: anchorWindow,
+                });
+              }
+
+              if (anchorState.remainingEligibleAssembles <= 0) {
+                clearAnchorInjection(state);
+              }
+            }
+          }
+
+          const maxRecallTokens = Math.max(0, maxEpisodicTokens - anchorTokens);
+          const fullKey = queryHash
+            ? `${agentId}::${agentWs}::${maxRecallTokens}::${k}::${queryHash}`
+            : "";
+
           let recallOutcome: RecallInjectionOutcome;
           const cache = state.recallCache;
           const isCacheHit = fullKey
@@ -575,7 +831,7 @@ const episodicClawPlugin = {
             recallOutcome = cache.lastRecallResult!;
             console.log(`[Episodic Memory] recall debounce: cache hit for same query (${now - cache.lastRecallTime}ms since last recall)`);
           } else {
-            recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxEpisodicTokens);
+            recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
             cache.lastRecallResult = recallOutcome;
             cache.lastRecallTime = now;
             cache.lastRecallFullKey = fullKey;
@@ -595,11 +851,19 @@ const episodicClawPlugin = {
             truncatedEpisodeCount: recallOutcome.truncatedEpisodeCount,
             reason: status === "skipped" ? recallOutcome.reason : undefined,
             firstEpisodeId: recallOutcome.firstEpisodeId,
+            topMatchedBy: recallOutcome.diagnostics.topMatchedBy,
+            matchedByCounts: recallOutcome.diagnostics.matchedByCounts,
+            fallbackReasons: recallOutcome.diagnostics.fallbackReasons,
+            topicsFallbackCount: recallOutcome.diagnostics.topicsFallbackCount,
           });
+          const prependSystemContext = [anchorPrependText, recallOutcome.text]
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0)
+            .join("\n\n");
           return {
             messages: msgs,
-            prependSystemContext: recallOutcome.text,
-            estimatedTokens,
+            prependSystemContext,
+            estimatedTokens: estimateTokens(prependSystemContext),
           };
           },
           async compact(ctx: any) {
@@ -610,8 +874,21 @@ const episodicClawPlugin = {
             const state = getAgentState(agentId);
             state.lastAgentWs = agentWs;
             ctx.resolvedAgentWs = agentWs;
+            logCompactionEntry({
+              agentId,
+              agentWs,
+              force: ctx?.force === true,
+              compactionTarget: typeof ctx?.compactionTarget === "string" ? ctx.compactionTarget : undefined,
+              hasCustomInstructions:
+                typeof ctx?.customInstructions === "string" && ctx.customInstructions.trim().length > 0,
+            });
             clearRecallCache(state);
             const result = await state.compactor.compact(ctx);
+            // The compaction payload is activated here, inside the plugin-owned compact path.
+            // Host after_compaction remains notification-only and does not carry anchor/summary payloads.
+            if (result.ok && result.compacted && result.result) {
+              activateAnchorInjection(state, result.result);
+            }
             clearRecallCache(state);
             return result;
           }

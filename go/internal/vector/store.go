@@ -102,6 +102,10 @@ type ScoredEpisode struct {
 	TopicsState         string        `json:"topicsState,omitempty"`
 	TopicsMatchCount    int           `json:"topicsMatchCount,omitempty"`
 	TopicsFallback      bool          `json:"topicsFallback,omitempty"`
+	// MatchedBy is closer to scoring provenance than raw candidate origin:
+	// "both" means lexical entry plus semantic score both influenced the final item.
+	MatchedBy           string        `json:"matchedBy,omitempty"`
+	FallbackReason      string        `json:"fallbackReason,omitempty"`
 	CandidateRank       int           `json:"candidateRank,omitempty"`
 	Rank                int           `json:"rank,omitempty"`
 }
@@ -1032,23 +1036,23 @@ func intOrDefault(value *int, fallback int) int {
 }
 
 func (s *Store) Recall(queryVector []float32, topK int, now time.Time) ([]ScoredEpisode, error) {
-	return s.baseRecall("", queryVector, topK, now, nil, true, nil)
+	return s.baseRecall("", queryVector, topK, now, nil, true, nil, "")
 }
 
 func (s *Store) RecallWithTopics(queryVector []float32, topK int, now time.Time, topics []string) ([]ScoredEpisode, error) {
 	// Backward-compatible default: topics means "strict facet filter".
-	return s.baseRecall("", queryVector, topK, now, topics, true, nil)
+	return s.baseRecall("", queryVector, topK, now, topics, true, nil, "")
 }
 
 func (s *Store) RecallWithTopicsMode(queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
-	return s.baseRecall("", queryVector, topK, now, topics, strictTopics, calibration)
+	return s.baseRecall("", queryVector, topK, now, topics, strictTopics, calibration, "")
 }
 
-func (s *Store) RecallWithQuery(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
-	return s.baseRecall(queryString, queryVector, topK, now, topics, strictTopics, calibration)
+func (s *Store) RecallWithQuery(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration, fallbackReason string) ([]ScoredEpisode, error) {
+	return s.baseRecall(queryString, queryVector, topK, now, topics, strictTopics, calibration, fallbackReason)
 }
 
-func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration) ([]ScoredEpisode, error) {
+func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, now time.Time, topics []string, strictTopics bool, calibration *RecallCalibration, fallbackReason string) ([]ScoredEpisode, error) {
 	if len(queryVector) != 3072 {
 		return nil, fmt.Errorf("query vector length mismatch: expected 3072, got %d", len(queryVector))
 	}
@@ -1128,6 +1132,30 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 	var candidates []rawScore
 	var bm25Scores map[string]float32
 	var maxBM25 float32
+	seenCandidateIDs := make(map[string]struct{})
+
+	appendCandidateUnique := func(candidate rawScore) {
+		var candidateID string
+		if candidate.id != "" {
+			candidateID = candidate.id
+		} else {
+			resolvedID, err := s.GetIDByUint32(candidate.uid)
+			if err != nil || resolvedID == "" {
+				return
+			}
+			candidateID = resolvedID
+		}
+		if allowedIDs != nil {
+			if _, ok := allowedIDs[candidateID]; !ok {
+				return
+			}
+		}
+		if _, exists := seenCandidateIDs[candidateID]; exists {
+			return
+		}
+		seenCandidateIDs[candidateID] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
 
 	if queryString != "" && s.lexical != nil {
 		req := bleve.NewSearchRequest(bleve.NewMatchQuery(queryString))
@@ -1139,24 +1167,32 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 					maxBM25 = float32(hit.Score)
 				}
 				bm25Scores[hit.ID] = float32(hit.Score)
-				candidates = append(candidates, rawScore{id: hit.ID, dist: -1})
+				appendCandidateUnique(rawScore{id: hit.ID, dist: -1})
 			}
 		} else if err != nil {
 			log.Printf("[LexicalEngine] Search failed, falling back to HNSW: %v\n", err)
 		}
 	}
 
-	if len(candidates) == 0 {
+	shouldBackfillSemantic := len(candidates) > 0 &&
+		len(candidates) < candidateK &&
+		!strings.Contains(fallbackReason, "embed_fallback_lexical_only")
+
+	if len(candidates) == 0 || shouldBackfillSemantic {
 		s.mutex.RLock()
 		pq := s.graph.Search(hnsw.Point(queryVector), candidateK*2, candidateK)
 		for pq.Len() > 0 {
 			item := pq.Pop()
-			candidates = append(candidates, rawScore{uid: uint32(item.ID), dist: item.D})
+			appendCandidateUnique(rawScore{uid: uint32(item.ID), dist: item.D})
+			if shouldBackfillSemantic && len(candidates) >= candidateK {
+				break
+			}
 		}
 		s.mutex.RUnlock()
 	}
 
 	var scored []ScoredEpisode
+	scoredIDs := make(map[string]struct{})
 
 	for candidateRank, cand := range candidates {
 		var idStr string
@@ -1181,6 +1217,10 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 		if err != nil {
 			continue
 		}
+		if _, exists := scoredIDs[idStr]; exists {
+			continue
+		}
+		scoredIDs[idStr] = struct{}{}
 
 		// Filter out archived nodes (Pattern Separation)
 		isArchived := false
@@ -1285,6 +1325,8 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 		if docErr == nil {
 			body = doc.Body
 		}
+		matchedBy := matchedByForCandidate(cand.id != "", fallbackReason)
+		callFallbackReason := composeRecallFallbackReason(fallbackReason, topicsFallback)
 
 		scored = append(scored, ScoredEpisode{
 			Record:              *rec,
@@ -1302,6 +1344,8 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 			TopicsState:         topicsState,
 			TopicsMatchCount:    topicsMatchCount,
 			TopicsFallback:      topicsFallback,
+			MatchedBy:           matchedBy,
+			FallbackReason:      callFallbackReason,
 			CandidateRank:       candidateRank + 1,
 		})
 	}
@@ -1318,7 +1362,43 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 		scored = scored[:topK]
 	}
 
+	if len(scored) == 0 && (fallbackReason != "" || topicsFallback) {
+		log.Printf(
+			"[Recall] empty_result fallbackReason=%s topicsFallback=%t strictTopics=%t lexicalHits=%d candidateCount=%d queryPresent=%t",
+			composeRecallFallbackReason(fallbackReason, topicsFallback),
+			topicsFallback,
+			strictTopics,
+			len(bm25Scores),
+			len(candidates),
+			queryString != "",
+		)
+	}
+
 	return scored, nil
+}
+
+func matchedByForCandidate(fromLexical bool, fallbackReason string) string {
+	if !fromLexical {
+		return "semantic"
+	}
+	if strings.Contains(fallbackReason, "embed_fallback_lexical_only") {
+		return "lexical"
+	}
+	return "both"
+}
+
+func composeRecallFallbackReason(baseReason string, topicsFallback bool) string {
+	embedFallback := strings.TrimSpace(baseReason)
+	switch {
+	case embedFallback != "" && topicsFallback:
+		return embedFallback + "+topics_fallback"
+	case embedFallback != "":
+		return embedFallback
+	case topicsFallback:
+		return "topics_fallback"
+	default:
+		return ""
+	}
 }
 
 func (s *Store) allowedIDsForTopics(topics []string, scanFallback bool) map[string]struct{} {

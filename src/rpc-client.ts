@@ -8,7 +8,7 @@ import * as os from "os";
 import * as fs from "fs";
 import * as https from "https";
 
-import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration } from "./types";
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult } from "./types";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
 const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
@@ -495,8 +495,8 @@ export class EpisodicCoreClient {
     topics: string[] = [],
     strictTopics?: boolean,
     calibration?: RecallCalibration
-  ): Promise<any[]> {
-    return this.request<any[]>("ai.recall", { query, k, agentWs, topics, strictTopics, calibration });
+  ): Promise<RecallRpcEpisodeResult[]> {
+    return this.request<RecallRpcEpisodeResult[]>("ai.recall", { query, k, agentWs, topics, strictTopics, calibration });
   }
 
   async recallFeedback(params: {

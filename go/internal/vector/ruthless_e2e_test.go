@@ -63,7 +63,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Verify count inside pebble explicitly via manual iteration or recall
-	results, err := s.baseRecall("", make([]float32, 3072), 5, time.Now(), nil, false, nil)
+	results, err := s.baseRecall("", make([]float32, 3072), 5, time.Now(), nil, false, nil, "")
 	if err != nil {
 		t.Fatalf("Failed baseRecall: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	// Scenario 2: 2-Stage Retrieval Fallback & Lexical Fusion
 	// -----------------------------------------------------
 	t.Log("==> Scenario 2: Querying Lexical Target...")
-	lexResults, err := s.baseRecall("architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil)
+	lexResults, err := s.baseRecall("architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil, "")
 	if err != nil {
 		t.Fatalf("Lexical baseRecall failed: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	// Simulate D1 consolidation
 	time.Sleep(6 * time.Second) // Wait for lexical sync (up to 5s exponential backoff now)
 
-	lexResultsMerged, _ := s.baseRecall("architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil)
+	lexResultsMerged, _ := s.baseRecall("architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil, "")
 	for _, res := range lexResultsMerged {
 		if res.Record.ID == "test_rec_100" {
 			t.Fatalf("Archived record 'test_rec_100' leaked into Lexical Engine results!")
@@ -212,7 +212,7 @@ func TestLexicalWALCrashRecovery(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// 5. Query Bleve explicitly! 
-	lexResults, err := s2.baseRecall("Crash test dummy architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil)
+	lexResults, err := s2.baseRecall("Crash test dummy architecture", make([]float32, 3072), 5, time.Now(), nil, false, nil, "")
 	if err != nil {
 		t.Fatalf("baseRecall failed: %v", err)
 	}
