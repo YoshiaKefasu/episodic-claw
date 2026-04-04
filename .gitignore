@@ -51,3 +51,5 @@ tsconfig.tsbuildinfo
 # OS artifacts
 .DS_Store
 Thumbs.db
+
+.npm-cache/

@@ -7,7 +7,8 @@ import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
-import { Compactor, DEFAULT_ANCHOR_PROMPT, DEFAULT_COMPACTION_PROMPT } from "./compactor";
+import { EpisodicArchiver } from "./archiver";
+import { AnchorStore } from "./anchor-store";
 import { estimateTokens } from "./utils";
 import { RecallFallbackReason, RecallMatchedBy } from "./types";
 
@@ -103,7 +104,8 @@ type AgentRuntimeState = {
   agentId: string;
   lastAgentWs: string;
   segmenter: EventSegmenter;
-  compactor: Compactor;
+  archiver: EpisodicArchiver;
+  anchorStore: AnchorStore;
   recallCache: RecallCacheState;
   anchorInjection: AnchorInjectionState | null;
   lastSetMetaTime: number;
@@ -291,20 +293,6 @@ const PluginConfigSchema = Type.Object(
     reserveTokens: Type.Optional(Type.Integer({
       description: "Max tokens reserved for injected episode memories in the system prompt (default 2048)."
     })),
-    contextThreshold: Type.Optional(Type.Number({
-      minimum: 0,
-      maximum: 1,
-      default: 0.85,
-      description: "Ratio of the active token budget at which proactive compaction should trigger (default 0.85)."
-    })),
-    anchorPrompt: Type.Optional(Type.String({
-      default: DEFAULT_ANCHOR_PROMPT,
-      description: "Pre-compaction instruction given to the Agent just before the anchor system message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}. Tells the Agent what to record before the context window is trimmed. Unset uses the current built-in wording."
-    })),
-    compactionPrompt: Type.Optional(Type.String({
-      default: DEFAULT_COMPACTION_PROMPT,
-      description: "Pre-compaction instruction given to the Agent just before the compaction summary system message is written. Supports {evictedCount}, {keptRawCount}, {freshTailCount}. Tells the Agent how to summarise the range about to be evicted. Unset uses the current built-in wording."
-    })),
     autoInjectGuardMinScore: Type.Optional(Type.Number({
       minimum: 0,
       maximum: 1,
@@ -473,15 +461,14 @@ const episodicClawPlugin = {
             fallbackThreshold: cfg.segmentationFallbackThreshold,
           }
         );
-        const compactor = new Compactor(rpcClient, segmenter, cfg.freshTailCount ?? cfg.recentKeep ?? 96, {
-          anchorPrompt: cfg.anchorPrompt,
-          compactionPrompt: cfg.compactionPrompt,
-        });
+        const archiver = new EpisodicArchiver(rpcClient, segmenter);
+        const anchorStore = new AnchorStore(rpcClient);
           const state: AgentRuntimeState = {
             agentId,
             lastAgentWs: "",
             segmenter,
-            compactor,
+            archiver,
+            anchorStore,
             recallCache: {
               lastRecallResult: null,
               lastRecallTime: 0,
@@ -630,15 +617,62 @@ const episodicClawPlugin = {
         }
       });
 
+
+      // ─── before_compaction hook ────────────────────────────────────────────────
+      // Fires immediately before OpenClaw's LLM compaction runs.
+      // Flush segmenter + archive all unprocessed messages losslessly.
+      api.on("before_compaction", async (_event?: any, ctx?: any) => {
+        const { agentId, agentWs } = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+        if (!agentWs) return;
+        await prepareWorkspaces({ agentId, agentWs, defaultAgentId: agentId, defaultWs: agentWs });
+        const state = getAgentState(agentId);
+        state.lastAgentWs = agentWs;
+        console.log("[Episodic Memory] before_compaction: protecting memories...");
+        try {
+          await state.archiver.forceFlush(agentWs, agentId);
+          const sessionFile = ctx?.sessionFile || _event?.sessionFile;
+          if (typeof sessionFile === "string" && sessionFile.length > 0) {
+            await state.archiver.archiveUnprocessed({ sessionFile, agentWs, agentId });
+          } else {
+            console.warn("[Episodic Memory] before_compaction: no sessionFile in ctx — skipping archive.");
+          }
+          clearRecallCache(state);
+          console.log("[Episodic Memory] before_compaction: memories protected.");
+        } catch (err) {
+          console.error("[Episodic Memory] before_compaction: error (non-fatal, compaction continues):", err);
+        }
+      });
+
+      // ─── after_compaction hook ─────────────────────────────────────────────────
+      // Fires after OpenClaw's LLM compaction completes.
+      // If an ep-anchor was written, read it and inject it into the next assemble().
+      api.on("after_compaction", async (_event?: any, ctx?: any) => {
+        const { agentId, agentWs } = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+        if (!agentWs) return;
+        const state = getAgentState(agentId);
+        console.log("[Episodic Memory] after_compaction: checking for anchor...");
+        try {
+          const anchorText = await state.anchorStore.read(agentWs);
+          if (anchorText) {
+            activateAnchorInjection(state, { anchor: anchorText, summary: "" });
+            await state.anchorStore.consume(agentWs);
+            console.log("[Episodic Memory] after_compaction: anchor injected.");
+          } else {
+            console.log("[Episodic Memory] after_compaction: no anchor found, proceeding without.");
+          }
+          clearRecallCache(state);
+        } catch (err) {
+          console.error("[Episodic Memory] after_compaction: error (non-fatal):", err);
+        }
+      });
+
       api.registerContextEngine("episodic-claw", () => {
         return {
           info: {
             id: "episodic-claw",
             name: "Episodic Memory Engine",
-            // The plugin owns compaction execution once the host calls compact().
-            // Proactive pressure checks are handled in assemble(); manual `/compact`
-            // stays host-native and this engine remains the execution endpoint.
-            ownsCompaction: true,
+                        // Compaction is fully delegated to OpenClaw default LLM compaction.
+            // episodic-claw reacts to before_compaction / after_compaction hooks.
           },
         async ingest(ctx: any) {
           const msgs = (ctx.messages || []) as Message[];
@@ -686,38 +720,8 @@ const episodicClawPlugin = {
             : 0;
           const reserveTokens = cfg.reserveTokens ?? 2048;
 
-          // --- Task 7D: Context Pressure Monitor ---
-          // tokenBudget が正の値でない場合はホスト未初期化と判断しスキップ。
-          if (totalBudget > 0) {
-            const contextThreshold = Math.max(0, Math.min(1, cfg.contextThreshold ?? 0.85));
-            const pressureThreshold = Math.floor(totalBudget * contextThreshold);
-            const currentTokens = estimateTokens(
-              msgs.map((m) => extractText(m.content)).join("\n")
-            );
-            if (
-              typeof ctx.sessionFile === "string" &&
-              ctx.sessionFile.length > 0 &&
-              currentTokens > pressureThreshold &&
-              !state.compactor.isCompacting
-            ) {
-              console.log(
-                `[Episodic Memory] Context pressure detected: ${currentTokens} tokens > threshold ${pressureThreshold}. ` +
-                `Triggering proactive compaction.`
-              );
-              state.compactor.compact({
-                ...ctx,
-                resolvedAgentWs: agentWs,
-                force: false,
-              }).then(result => {
-                if (result.ok && result.compacted && result.result) {
-                  activateAnchorInjection(state, result.result);
-                }
-                clearRecallCache(state);
-              }).catch(err => {
-                console.error("[Episodic Memory] Proactive compaction failed:", err);
-              });
-            }
-          }
+          // Context pressure monitoring removed — OpenClaw host manages compaction threshold.
+          // episodic-claw reacts to before_compaction / after_compaction hooks.
           const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
           const k = 5;
           const now = Date.now();
@@ -866,32 +870,6 @@ const episodicClawPlugin = {
             estimatedTokens: estimateTokens(prependSystemContext),
           };
           },
-          async compact(ctx: any) {
-            const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
-            const { agentId, agentWs } = resolution;
-            if (!agentWs) return { ok: false, compacted: false };
-            await prepareWorkspaces(resolution);
-            const state = getAgentState(agentId);
-            state.lastAgentWs = agentWs;
-            ctx.resolvedAgentWs = agentWs;
-            logCompactionEntry({
-              agentId,
-              agentWs,
-              force: ctx?.force === true,
-              compactionTarget: typeof ctx?.compactionTarget === "string" ? ctx.compactionTarget : undefined,
-              hasCustomInstructions:
-                typeof ctx?.customInstructions === "string" && ctx.customInstructions.trim().length > 0,
-            });
-            clearRecallCache(state);
-            const result = await state.compactor.compact(ctx);
-            // The compaction payload is activated here, inside the plugin-owned compact path.
-            // Host after_compaction remains notification-only and does not carry anchor/summary payloads.
-            if (result.ok && result.compacted && result.result) {
-              activateAnchorInjection(state, result.result);
-            }
-            clearRecallCache(state);
-            return result;
-          }
         };
       });
 

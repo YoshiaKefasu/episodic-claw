@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.1] - 2026-04-05
+
+### Added
+- **ep-anchor tool**: Agents can proactively write a dense session anchor at any time. Saved to {agentWs}/anchor.md and indexed in the DB. Auto-injected after compaction via after_compaction hook.
+- **before_compaction hook**: Flushes segmenter buffer and archives all unprocessed messages via batchIngest before OpenClaw's LLM compaction rewrites the session file.
+- **after_compaction hook**: Reads anchor.md after LLM compaction, injects it into the next assemble(), then consumes (deletes) the file.
+- **src/anchor-store.ts**: New module managing anchor.md lifecycle (write, read, consume) with non-fatal DB indexing.
+- **src/archiver.ts**: New EpisodicArchiver class (extracted from Compactor). Handles only forceFlush + archiveUnprocessed.
+
+### Changed
+- **Compaction delegated to OpenClaw host**: ownsCompaction: true and compact() removed. OpenClaw's LLM compaction now runs natively with full context for high-quality summarization.
+- **Context Pressure Monitor removed** from assemble(). Compaction lifecycle fully managed by the host.
+- **Config schema cleaned**: contextThreshold, anchorPrompt, compactionPrompt removed.
+- **peerDependencies compat extended** to >=2026.3.28 <=2026.4.2.
+
+### Removed
+- Compactor.compact() and session file rewrite logic.
+- logCompactionEntry() helper.
+- Context Pressure Monitor from assemble().
+
 ## [0.3.0] — 2026-04-04
 
 ### Added
