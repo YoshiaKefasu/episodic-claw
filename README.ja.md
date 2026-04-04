@@ -4,15 +4,15 @@
 
 > [English](./README.md) | 日本語 | [中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.2.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 会話をローカルにずっと保存して、必要なときに「キーワード」だけじゃなく「意味」で探し出し、今の会話にスッと混ぜ込んでくれるプラグインです。これで OpenClaw が「こないだ話したあれ」をちゃんと覚えてくれるようになります。
 
-今回の `v0.2.1` では、**「絶対に記憶を飛ばさない（Atomic Ingestion）」「どんなに記憶が増えても一瞬で探す（Lexical + Semantic ハイブリッド検索）」「API制限を食らっても自動で耐える（自己修復）」**など、裏側のシステムが本番レベルに進化しました。設定の制限も外れ、最大64,000トークンまで記憶を詰め込めるようになっています。
+今回の `v0.3.0` では、**「絶対に途切れさせない記憶の橋（Anchor Compaction）」「会話が壊れても自分で直す（Transcript Repair）」「API制限を食らっても絶対にロストしない（3段階のSummarization Escalation）」** など、`lossless-claw` という最強の防具を完全に吸収して進化しました。最大64,000トークンまで記憶を詰め込めるのはもちろん、脳内がパンクする前にトークン圧力を読み取って先回り整理する機能まで付いてます。
 
-v0.2.1 のロードマップやセキュリティ監査レポートは [コチラ](./docs/v0.2.1/v0.2.1_master_plan.md) を参照してください。
+v0.3.0 のロードマップやセキュリティ監査レポートは [コチラ](./docs/v0.3.0_master_plan.md) を参照してください。
 
 ---
 
@@ -98,14 +98,15 @@ sequenceDiagram
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.2.1 で何がヤバくなったのか
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.3.0 で何がヤバくなったのか
 
-v0.2.1 は「とりあえず動く」から「本番でガチで使える」レベルに進化しました。
+v0.2.1 の「本番でガチで使える」レベルから、今回は「どんな逆境でも絶対に記憶をロストしない完璧超人」に進化しました。
 
-- **絶対に記憶を飛ばさない (Atomic Batch Ingestion)**: 処理の途中でPCの電源を引っこ抜いても、データが壊れたり記憶が消えたりしません（WALキューの導入）。
-- **ハイブリッド検索 (Lexical Filter Engine)**: 意味(Semantic)だけじゃなく、単語の一致(Lexical)でも高速に絞り込めるようになりました（`lexicalPreFilterLimit`）。記憶が10万件あっても一瞬です。
-- **最強の耐久力 (Circuit Breaker & Self-Healing)**: Embedding API が制限（Rate Limit）を食らってもシステムがパニックにならず、勝手に落ち着いて待ち、回復したら自動で再開します。
-- **桁違いの記憶容量上限 (64,000 Tokens)**: 今回から、最大 64,000 トークンもの記憶を一気に思い出せるようになりました（デフォルト設定を大幅引き上げ）。マジでずっと覚えていられます。
+- **過去と現在を接着する記憶の橋 (Anchor Compaction)**: 過去ログを圧縮して消す時、ただ消すんじゃなくて「さっきまでの話の要点（Anchor）」を作って、今の会話に一時的に注入し続けます。これでAIが「ん？ 今なんの話してたっけ？」とボケることが完全に無くなりました。
+- **絶対に記憶を飛ばさない・壊さない (Atomic Ingestion & Transcript Repair)**: 電源を引っこ抜いてもデータが壊れない（WALキュー）のはもちろん、ツールの使用ログがおかしくなっても、記憶に保存する前にシステムが勝手に直してくれます（`lossless-claw`から完全移植！）。
+- **どんな逆境でも諦めない保存力 (Self-Healing & Summarization Escalation)**: APIが制限（429 Rate Limit）を食らってもパニックにならず、少し待ってから「じゃあこの方法で」「だめならこの方法で」と3段階の作戦（Normal -> Aggressive -> Fallback）で粘り強くアタック。絶対に記憶ロスを防ぎます。
+- **先回りして脳内整理 (Proactive Pressure Monitor)**: AIの脳内（コンテキスト）がパンクするまで待つんじゃなく、トークン圧力を常に監視（`contextThreshold`）。「あ、そろそろ限界来そうだな」ってのを察知して、余裕があるうちに静かに記憶の整理（Compaction）を始めます。
+- **無駄な記憶の一掃と、超高速な意味検索 (Externalization & Hybrid Search)**: ディレクトリのファイル一覧みたいなデカくて無駄な情報は自動で `[省略]` してスリム化。さらに、超速な文字一致検索（Bleve）でゴミを弾いた後、意味検索（HNSW Semantic Backfill）で完璧な記憶のピースを探してきて脳内に注入します。最大64,000トークンもの思い出を、いつでも一瞬で思い出せます。
 
 ---
 
@@ -125,7 +126,7 @@ AIエージェントがインストール時に予期せぬ挙動（ハルシネ
 
 > **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 >
-> 以下の手順と制約を「絶対に」守って、あなた自身の長期記憶拡張プラグイン（episodic-claw v0.2.1）をインストールしてください。自己判断での別コマンド実行や他ファイルの編集は厳禁です。
+> 以下の手順と制約を「絶対に」守って、あなた自身の長期記憶拡張プラグイン（episodic-claw v0.3.0）をインストールしてください。自己判断での別コマンド実行や他ファイルの編集は厳禁です。
 >
 > **【 実行ステップ 】**
 > 1. **事前確認:** ターミナルで `openclaw --version` を実行し、OpenClaw CLIが利用可能か確認してください。（失敗した場合はそこで停止し、私に報告してください）
@@ -162,7 +163,7 @@ AIが自主的に使うこともあれば、あなたが指示して使わせる
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> 設定一覧 (openclaw.plugin.json)
 
-v0.2.1から、AIの脳の働きをいじる設定がUIから丸見えになりました。最初はデフォルトで最高に動くように設定してあります。
+v0.3.0から、AIの脳の働きをいじる設定がUIから丸見えになりました。最初はデフォルトで最高に動くように設定してあります。
 
 | キー | デフォルト | 爆発範囲 (いじりすぎるとどうなる？) |
 |---|---|---|

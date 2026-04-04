@@ -4,16 +4,15 @@
 
 > [English](./README.md) | [日本語](./README.ja.md) | 中文
 
-[![version](https://img.shields.io/badge/version-0.2.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 它会把你们的对话全都静悄悄存在本地。聊天时，它不像传统搜索那样只对“关键词”，而是靠“意思”去把相关的旧记忆翻出来，然后在 AI 回复你之前，偷偷塞进系统提示词里。这样你的 OpenClaw 就能真正记住你们之前聊过的梗和重大决定，不用每次都像个失忆症一样重新解释。
 
-这次的 `v0.2.1` 版，架构直接拉满，从“能用的原型”变成了“生产级坦克”。
-**哪怕你电脑突然断电，记忆也不会丢（Atomic Ingestion / WAL防宕机坑机制）**；不管存了十万条还是百万条记忆，靠“文字+语义”双引擎（Lexical + Semantic）瞬间就能搜出来；就算遇到 API 限流报错狂弹，它也能自己冷静等待并自动恢复（Circuit Breaker / Self-Healing）。更夸张的是，现在记忆拉取上限直接默认飙到了 64,000 个 tokens，这下它的脑容量是真的大得离谱了。
+这次的 `v0.3.0` 版，引擎完全吸收了 `lossless-claw` 的抗灾属性。**它现在能在压缩旧记忆时搭建“记忆桥梁”（Anchor Compaction），确保聊天绝不断档；就算工具调用日志坏了也能自己修好（Transcript Repair）；哪怕 API 狂弹限流报错，它也会通过三阶段降级策略死保记忆不丢（Summarization Escalation）。** 不仅保留了 64,000 token 的夸张容量限制，现在甚至能在脑子被塞满前，自己提前把记忆整理好。
 
-v0.2.1 的完整路线图和安全审计报告可以看 [这里](./docs/v0.2.1/v0.2.1_master_plan.md)。
+v0.3.0 的完整路线图和规划报告可以看 [这里](./docs/v0.3.0_master_plan.md)。
 
 ---
 
@@ -101,14 +100,17 @@ sequenceDiagram
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.2.1 到底强在哪里
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> v0.3.0 到底强在哪里
 
-v0.2.1 摆脱了“好聪明的玩具”，变成了一个实打实的重型引擎。
+v0.3.0 摆脱了“好聪明的玩具”，变成了一个实打实的重型引擎。
 
-- **硬核防丢 (Atomic Batch Ingestion)**: 就算你拔电源，正在存的记忆也不会坏档（WAL 队列保命）。
-- **双重高速搜索 (Lexical Filter Engine)**: 记忆库哪怕堆上几十万条，它也会先用纯文本引擎进行光速去重（`lexicalPreFilterLimit`），然后再用高强度数学算法精搜。速度极快。
-- **自我愈合 (Circuit Breaker & Self-Healing)**: 若 API 突然抽风限流，插件不会崩溃摆烂。它会优雅地等一会，自动疗伤，然后静悄悄地继续处理记忆队列。
-- **神级容量上限 (64,000 Tokens)**: 容量上限彻底解放。默认直接允许给 AI 系统提示词硬塞最多 6 万 token 的往期回忆。真正的过目不忘。
+如果说 v0.2.1 是一台重型引擎，那 v0.3.0 就是一个绝对不肯丢掉一丝记忆的“生存狂”。
+
+- **连接过去的“记忆桥梁” (Anchor Compaction)**: 当旧聊天记录被压缩并清理出当前窗口时，它不会直接生硬地把历史扔掉。它会生成一个包含核心要点的“锚点总结（Anchor）”，然后在当前对话里偷偷临时注入。这样 AI 就绝不会出现“哎？咱们刚聊到哪儿了？”的失忆症状。
+- **硬核防丢与自我愈合 (Atomic Ingestion & Transcript Repair)**: 拔了电源数据也不会坏档（WAL 队列保命），甚至连聊天记录里的工具调用出 bug 了，系统都会在存进长期记忆之前自动帮你把残缺的日志修复好（直接从 `lossless-claw` 移植过来的黑科技！）。
+- **打死不丢数据的倔强 (Self-Healing & Summarization Escalation)**: 如果 API 狂弹限流报错（429 Rate Limit），系统绝不摆烂。它会安静等待，然后采取“正常 -> 激进 -> 强制兜底”的三级降级策略死死护住你的记忆数据，绝对不丢。
+- **防爆脑的先见之明 (Proactive Pressure Monitor)**: 它不再傻等着 AI 脑子（上下文窗口）彻底被塞爆。系统会实时监控 Token 压力阀值（`contextThreshold`），一旦发现快满载了，就在 AI 懵逼之前，主动且悄无声息地提前开始整理和压缩记忆。
+- **智能排雷与极限双搜 (Externalization & Hybrid Search)**: 那种把整个文件夹几千行跑出来的垃圾消息，会被自动精简成 `[已外置省略]`，省去塞爆数据库的风险。它还会先用极其暴力的文本去重过滤掉没用的废话，再用语义搜索（HNSW Semantic Backfill）无缝补齐最贴近上下文的旧记忆。它能瞬间回忆起高达 64,000 token 的庞大往事。
 
 ---
 
@@ -128,7 +130,7 @@ openclaw plugins install clawhub:episodic-claw
 
 > **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 >
-> 你现在需要为自己安装长期记忆扩展插件（episodic-claw v0.2.1）。请**严格**按照以下顺序执行。绝对禁止自行猜测并执行其他命令，绝对禁止未经允许修改用户文件。
+> 你现在需要为自己安装长期记忆扩展插件（episodic-claw v0.3.0）。请**严格**按照以下顺序执行。绝对禁止自行猜测并执行其他命令，绝对禁止未经允许修改用户文件。
 >
 > **【 执行步骤 】**
 > 1. **环境预检:** 在终端执行 `openclaw --version`，确认 OpenClaw CLI 可用。（如果报错，请立刻停下并向我报告）。

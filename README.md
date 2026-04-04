@@ -4,15 +4,15 @@
 
 > English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 
-[![version](https://img.shields.io/badge/version-0.2.1-blue)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](./LICENSE)
 [![platform](https://img.shields.io/badge/platform-OpenClaw-orange)](https://openclaw.ai)
 
 Conversations are saved locally. When you chat, it searches past history by "meaning" instead of just keyword matching, and slips the right memories into the AI's prompt before it even replies. This makes OpenClaw actually remember what you talked about last week without you having to re-explain it.
 
-With `v0.2.1`, the engine went from "pretty cool prototype" to "production-grade tank." **It literally never loses memory even if your PC unplugs (Atomic Ingestion)**, searches instantly through huge databases by combining exact word matches with fuzzy meaning matches (Lexical+Semantic Hybrid), and won't panic if APIs rate-limit it. Also, the context limit was exploded to 64,000 tokens so it remembers an insane amount of history at once.
+With `v0.3.0`, the engine absorbed the bulletproof resilience of `lossless-claw`. **It now bridges the gap between old and new chats without dropping context (Anchor Compaction), auto-repairs broken tool logs before saving them (Transcript Repair), and refuses to lose memories even when APIs scream rate-limit at you (Summarization Escalation).** It still boasts a colossal 64,000 token context limit, but now it proactively organizes its own brain before it even gets full.
 
-Check the `v0.2.1` roadmap and security audit [here](./docs/v0.2.1/v0.2.1_master_plan.md).
+Check the `v0.3.0` roadmap and master plan [here](./docs/v0.3.0_master_plan.md).
 
 ---
 
@@ -99,14 +99,15 @@ Because of this, your memories don't mush into one giant, pointless blob.
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.2.1 so insane
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.3.0 so insane
 
-v0.2.1 graduated from a cool idea to a production-ready engine.
+v0.2.1 was production-grade. v0.3.0 is a paranoid survivor that absolutely refuses to lose context.
 
-- **Atomic Batch Ingestion**: You can rip the power cord out of your PC and the AI won't lose the memory it was writing (WAL queue).
-- **Lexical Filter Engine**: Instead of throwing heavy math at 100,000 memories, it instantly filters out irrelevant text (`lexicalPreFilterLimit`) before doing the intense meaning search. Massively speeds up response times.
-- **Circuit Breaker & Self-Healing**: If your API provider throws a tantrum (Rate Limits), the plugin doesn't crash. It chills out, heals itself, and quietly resumes saving memories when the API wakes up.
-- **64,000 Token Cap**: We uncapped the default context limit. The AI can now inject a colossal 64,000 tokens of past history straight into its brain. It really won't forget.
+- **Bridging the Forgotten (Anchor Compaction)**: When old chats are compressed and removed from active context, it doesn't just delete them. It creates a tightly summarized "Anchor" and temporarily injects it into the ongoing conversation. The AI never loses track of the current topic, even after heavy pruning.
+- **Bulletproof & Auto-Healing (Atomic Ingestion & Transcript Repair)**: Not only will ripping the power cord out not corrupt your data (WAL queue), but if the AI hallucinates bad tool calls, the plugin auto-repairs the broken logs before saving them into long-term memory (ported straight from `lossless-claw`!).
+- **Never Surrenders to Rate Limits (Self-Healing & Summarization Escalation)**: If your API provider throws a 429 Rate Limit tantrum, the system doesn't crash or drop memories. It waits, then escalates through three different fallback strategies (Normal -> Aggressive -> Deterministic) to guarantee zero data loss.
+- **Proactive Brain Management (Pressure Monitor)**: Instead of waiting for the AI's context limit to explode, it constantly monitors the token pressure (`contextThreshold`). When it senses the AI's brain getting too full, it proactively starts organizing (compacting) the chat while things are still smooth.
+- **Smart Filtering & Insane Search (Externalization & Hybrid Search)**: Massive, useless text dumps (like directory listings) are automatically stubbed out with `[Externalized]` so they don't clog your database. It uses lightning-fast text filters (Bleve) to trash irrelevant stuff, then uses deep semantic meaning (HNSW Backfill) to find the exact perfect memory. It can recall up to 64,000 tokens of past history instantly.
 
 ---
 
@@ -126,7 +127,7 @@ AI agents can hallucinate or run destructive commmands if not guided properly. C
 
 > **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 >
-> You are to install the long-term memory extension plugin (episodic-claw v0.2.1) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
+> You are to install the long-term memory extension plugin (episodic-claw v0.3.0) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
 >
 > **[ Execution Steps ]**
 > 1. **Pre-check:** Run `openclaw --version` in the terminal to verify the CLI is available. (If this fails, STOP immediately and ask me for help).
@@ -163,7 +164,7 @@ If the AI reads a D1 summary but says "I need the exact code snippet from that",
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
 
-In v0.2.1, we exposed the AI's brain chemistry to the UI. The defaults are already heavily tuned, but here is what happens if you mess with them.
+In v0.3.0, we exposed the AI's brain chemistry to the UI. The defaults are already heavily tuned, but here is what happens if you mess with them.
 
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
