@@ -26,7 +26,7 @@ export interface OpenClawPluginApi {
       | "before_compaction"
       | "after_compaction"
       | string,
-    handler: (event?: any, ctx?: any) => void | Promise<void>,
+    handler: (event?: any, ctx?: any) => void | Promise<void> | Record<string, unknown> | Promise<Record<string, unknown>>,
     opts?: { priority?: number }
   ): void;
   registerContextEngine(id: string, factory: () => any): void;
@@ -673,6 +673,139 @@ const episodicClawPlugin = {
         }
       });
 
+      // ─── before_prompt_build フック: セグメンテーション + メモリ注入 ─────────────
+      // assemble() が呼ばれない環境（contextEngine slot が "legacy" など）でのフォールバック。
+      // OpenClaw の contextEngine slot 設定に関係なく毎ターン確実に呼ばれる。
+      // event: { prompt: string, messages: unknown[] }
+      // ctx: { runId, agentId, sessionKey, sessionId, workspaceDir, ... }
+      // 戻り値: { prependSystemContext?: string }
+      api.on("before_prompt_build", async (event: any, ctx: any) => {
+        const msgs = ((event && event.messages) || []) as Message[];
+        const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+        const { agentId, agentWs } = resolution;
+        if (!agentWs) return {};
+
+        await prepareWorkspaces(resolution);
+        const state = getAgentState(agentId);
+        state.lastAgentWs = agentWs;
+
+        // ── セグメンテーション（fire-and-forget）──
+        state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
+          console.log("[Episodic Memory] Fallback segmenter error in before_prompt_build:", err);
+        });
+
+        // ── メモリ注入（tokenBudget なし → 固定上限）──
+        // before_prompt_build は tokenBudget を受け取らないため、安全側の固定値を使う。
+        const ESTIMATED_MAX_EPISODIC_TOKENS = 1024;
+        const k = 5;
+
+        // アンカー注入（after_compaction でセットされた状態があれば）
+        let anchorPrependText = "";
+        let anchorTokens = 0;
+        const anchorState = state.anchorInjection;
+        if (anchorState) {
+          const anchorPayload = buildAnchorInjectionPayload(anchorState);
+          const anchorWindow = anchorState.remainingEligibleAssembles;
+          anchorState.remainingEligibleAssembles = Math.max(0, anchorState.remainingEligibleAssembles - 1);
+
+          if (!anchorPayload) {
+            logAnchorInjectionOutcome({
+              status: "skipped",
+              source: anchorState.source,
+              agentId,
+              agentWs,
+              anchorId: anchorState.anchorId,
+              summaryId: anchorState.summaryId,
+              estimatedTokens: 0,
+              anchorInjectionWindow: anchorWindow,
+              reason: "empty_payload",
+            });
+            clearAnchorInjection(state);
+          } else {
+            const estimatedAnchorTokens = estimateTokens(anchorPayload);
+            if (estimatedAnchorTokens > ESTIMATED_MAX_EPISODIC_TOKENS) {
+              logAnchorInjectionOutcome({
+                status: "skipped",
+                source: anchorState.source,
+                agentId,
+                agentWs,
+                anchorId: anchorState.anchorId,
+                summaryId: anchorState.summaryId,
+                estimatedTokens: estimatedAnchorTokens,
+                anchorInjectionWindow: anchorWindow,
+                reason: "anchor_budget_exceeded",
+              });
+            } else {
+              anchorPrependText = anchorPayload;
+              anchorTokens = estimatedAnchorTokens;
+              logAnchorInjectionOutcome({
+                status: "injected",
+                source: anchorState.source,
+                agentId,
+                agentWs,
+                anchorId: anchorState.anchorId,
+                summaryId: anchorState.summaryId,
+                estimatedTokens: estimatedAnchorTokens,
+                anchorInjectionWindow: anchorWindow,
+              });
+            }
+
+            if (anchorState.remainingEligibleAssembles <= 0) {
+              clearAnchorInjection(state);
+            }
+          }
+        }
+
+        const maxRecallTokens = Math.max(0, ESTIMATED_MAX_EPISODIC_TOKENS - anchorTokens);
+        if (maxRecallTokens <= 0) {
+          const prependSystemContext = anchorPrependText.trim();
+          return prependSystemContext ? { prependSystemContext } : {};
+        }
+
+        try {
+          const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
+          const status: PrependSystemContextStatus =
+            recallOutcome.reason === "injected"
+              ? (recallOutcome.truncatedEpisodeCount > 0 ? "truncated" : "injected")
+              : "skipped";
+
+          const queryParts = msgs.slice(-5)
+            .map(m => {
+              const content = extractText(m.content).trim();
+              return content ? `${m.role}: ${content}` : "";
+            })
+            .filter(part => part.length > 0);
+          const fullQuery = queryParts.join("\n").trim();
+          const queryHash = fullQuery ? createHash("sha1").update(fullQuery).digest("hex") : "";
+
+          logPrependSystemContextOutcome({
+            status,
+            agentId,
+            agentWs,
+            queryHash: recallOutcome.queryHash || queryHash,
+            estimatedTokens: estimateTokens(recallOutcome.text),
+            injectedEpisodeCount: recallOutcome.injectedEpisodeCount,
+            truncatedEpisodeCount: recallOutcome.truncatedEpisodeCount,
+            reason: status === "skipped" ? recallOutcome.reason : undefined,
+            firstEpisodeId: recallOutcome.firstEpisodeId,
+            topMatchedBy: recallOutcome.diagnostics.topMatchedBy,
+            matchedByCounts: recallOutcome.diagnostics.matchedByCounts,
+            fallbackReasons: recallOutcome.diagnostics.fallbackReasons,
+            topicsFallbackCount: recallOutcome.diagnostics.topicsFallbackCount,
+          });
+
+          const prependSystemContext = [anchorPrependText, recallOutcome.text]
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0)
+            .join("\n\n");
+
+          return prependSystemContext ? { prependSystemContext } : {};
+        } catch (err) {
+          console.log("[Episodic Memory] before_prompt_build recall error:", err);
+          return anchorPrependText.trim() ? { prependSystemContext: anchorPrependText.trim() } : {};
+        }
+      });
+
       api.registerContextEngine("episodic-claw", () => {
         return {
           info: {
@@ -706,6 +839,12 @@ const episodicClawPlugin = {
         },
         async assemble(ctx: any) {
           const msgs = (ctx.messages || []) as Message[];
+          console.log(`[Episodic Memory] assemble() called (${msgs.length} messages) — contextEngine slot IS set to "episodic-claw"`);
+
+          // before_prompt_build が既にセグメンテーション+メモリ注入を担当しているため、
+          // assemble() では最小限の処理のみ行う（二重注入防止）。
+          // 万一 before_prompt_build がブロックされた場合の保険として、
+          // 簡易的なメモリ注入のみ実行する（トークン予算は ctx.tokenBudget を使用）。
           const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
           const { agentId, agentWs } = resolution;
           if (!agentWs) {
@@ -715,167 +854,65 @@ const episodicClawPlugin = {
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
 
-          // ⚠️ OpenClaw は ingest() をメモリフラッシュ時にしか呼ばないため、
-          // 毎ターン確実に呼ばれる assemble() 内でセグメンテーションを発火させる。
-          // fire-and-forget で assemble のレスポンス速度に影響しないようにする。
+          // セグメンテーションは before_prompt_build で既に実行済みだが、
+          // assemble() が呼ばれる = before_prompt_build がブロックされている可能性もあるため、
+          // 保険として再実行する。
           state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
-            console.log("[Episodic Memory] Segmenter error in assemble:", err);
+            console.log("[Episodic Memory] Segmenter error in assemble (fallback):", err);
           });
 
           const totalBudget = typeof ctx.tokenBudget === "number" && ctx.tokenBudget > 0
             ? ctx.tokenBudget
             : 0;
           const reserveTokens = cfg.reserveTokens ?? 2048;
-
-          // Context pressure monitoring removed — OpenClaw host manages compaction threshold.
-          // episodic-claw reacts to before_compaction / after_compaction hooks.
           const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
           const k = 5;
-          const now = Date.now();
-          const recentMessages = msgs.slice(-5);
-          const queryParts = recentMessages
-            .map(m => {
-              const content = extractText(m.content).trim();
-              return content ? `${m.role}: ${content}` : "";
-            })
-            .filter(part => part.length > 0);
-          const fullQuery = queryParts.join("\n").trim();
-          const queryHash = fullQuery ? createHash("sha1").update(fullQuery).digest("hex") : "";
 
           if (maxEpisodicTokens <= 0) {
-            if (state.anchorInjection) {
-              logAnchorInjectionOutcome({
-                status: "skipped",
-                source: state.anchorInjection.source,
-                agentId,
-                agentWs,
-                anchorId: state.anchorInjection.anchorId,
-                summaryId: state.anchorInjection.summaryId,
-                estimatedTokens: 0,
-                anchorInjectionWindow: state.anchorInjection.remainingEligibleAssembles,
-                reason: "budget_truncated_to_zero",
-              });
-            }
-            // budget_truncated_to_zero: reserve 後の budget が 0 以下。
-            // This returns before anchor evaluation, so the eligible injection lifetime is not spent.
-            logPrependSystemContextOutcome({
-              status: "skipped",
-              agentId,
-              agentWs,
-              queryHash,
-              estimatedTokens: 0,
-              injectedEpisodeCount: 0,
-              truncatedEpisodeCount: 0,
-              reason: "budget_truncated_to_zero",
-            });
             return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
           }
 
+          // アンカー注入
           let anchorPrependText = "";
           let anchorTokens = 0;
           const anchorState = state.anchorInjection;
           if (anchorState) {
             const anchorPayload = buildAnchorInjectionPayload(anchorState);
-            const anchorWindow = anchorState.remainingEligibleAssembles;
             anchorState.remainingEligibleAssembles = Math.max(0, anchorState.remainingEligibleAssembles - 1);
-
-            if (!anchorPayload) {
-              logAnchorInjectionOutcome({
-                status: "skipped",
-                source: anchorState.source,
-                agentId,
-                agentWs,
-                anchorId: anchorState.anchorId,
-                summaryId: anchorState.summaryId,
-                estimatedTokens: 0,
-                anchorInjectionWindow: anchorWindow,
-                reason: "empty_payload",
-              });
-              clearAnchorInjection(state);
-            } else {
+            if (anchorPayload) {
               const estimatedAnchorTokens = estimateTokens(anchorPayload);
-              if (estimatedAnchorTokens > maxEpisodicTokens) {
-                logAnchorInjectionOutcome({
-                  status: "skipped",
-                  source: anchorState.source,
-                  agentId,
-                  agentWs,
-                  anchorId: anchorState.anchorId,
-                  summaryId: anchorState.summaryId,
-                  estimatedTokens: estimatedAnchorTokens,
-                  anchorInjectionWindow: anchorWindow,
-                  reason: "anchor_budget_exceeded",
-                });
-              } else {
+              if (estimatedAnchorTokens <= maxEpisodicTokens) {
                 anchorPrependText = anchorPayload;
                 anchorTokens = estimatedAnchorTokens;
-                logAnchorInjectionOutcome({
-                  status: "injected",
-                  source: anchorState.source,
-                  agentId,
-                  agentWs,
-                  anchorId: anchorState.anchorId,
-                  summaryId: anchorState.summaryId,
-                  estimatedTokens: estimatedAnchorTokens,
-                  anchorInjectionWindow: anchorWindow,
-                });
               }
-
-              if (anchorState.remainingEligibleAssembles <= 0) {
-                clearAnchorInjection(state);
-              }
+            }
+            if (anchorState.remainingEligibleAssembles <= 0) {
+              clearAnchorInjection(state);
             }
           }
 
           const maxRecallTokens = Math.max(0, maxEpisodicTokens - anchorTokens);
-          const fullKey = queryHash
-            ? `${agentId}::${agentWs}::${maxRecallTokens}::${k}::${queryHash}`
-            : "";
-
-          let recallOutcome: RecallInjectionOutcome;
-          const cache = state.recallCache;
-          const isCacheHit = fullKey
-            && fullKey === cache.lastRecallFullKey
-            && (now - cache.lastRecallTime < RECALL_DEBOUNCE_MS)
-            && cache.lastRecallResult;
-          if (isCacheHit) {
-            recallOutcome = cache.lastRecallResult!;
-            console.log(`[Episodic Memory] recall debounce: cache hit for same query (${now - cache.lastRecallTime}ms since last recall)`);
-          } else {
-            recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
-            cache.lastRecallResult = recallOutcome;
-            cache.lastRecallTime = now;
-            cache.lastRecallFullKey = fullKey;
+          if (maxRecallTokens <= 0) {
+            const prependSystemContext = anchorPrependText.trim();
+            return { messages: msgs, prependSystemContext, estimatedTokens: estimateTokens(prependSystemContext) };
           }
-          const estimatedTokens = estimateTokens(recallOutcome.text);
-          const status: PrependSystemContextStatus =
-            recallOutcome.reason === "injected"
-              ? (recallOutcome.truncatedEpisodeCount > 0 ? "truncated" : "injected")
-              : "skipped";
-          logPrependSystemContextOutcome({
-            status,
-            agentId,
-            agentWs,
-            queryHash: recallOutcome.queryHash || queryHash,
-            estimatedTokens,
-            injectedEpisodeCount: recallOutcome.injectedEpisodeCount,
-            truncatedEpisodeCount: recallOutcome.truncatedEpisodeCount,
-            reason: status === "skipped" ? recallOutcome.reason : undefined,
-            firstEpisodeId: recallOutcome.firstEpisodeId,
-            topMatchedBy: recallOutcome.diagnostics.topMatchedBy,
-            matchedByCounts: recallOutcome.diagnostics.matchedByCounts,
-            fallbackReasons: recallOutcome.diagnostics.fallbackReasons,
-            topicsFallbackCount: recallOutcome.diagnostics.topicsFallbackCount,
-          });
-          const prependSystemContext = [anchorPrependText, recallOutcome.text]
-            .map((part) => part.trim())
-            .filter((part) => part.length > 0)
-            .join("\n\n");
-          return {
-            messages: msgs,
-            prependSystemContext,
-            estimatedTokens: estimateTokens(prependSystemContext),
-          };
+
+          try {
+            const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
+            const prependSystemContext = [anchorPrependText, recallOutcome.text]
+              .map((part) => part.trim())
+              .filter((part) => part.length > 0)
+              .join("\n\n");
+            return {
+              messages: msgs,
+              prependSystemContext,
+              estimatedTokens: estimateTokens(prependSystemContext),
+            };
+          } catch (err) {
+            console.log("[Episodic Memory] assemble recall error:", err);
+            const prependSystemContext = anchorPrependText.trim();
+            return { messages: msgs, prependSystemContext, estimatedTokens: estimateTokens(prependSystemContext) };
+          }
           },
         };
       });

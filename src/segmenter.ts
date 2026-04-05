@@ -89,7 +89,10 @@ export class EventSegmenter {
    * If yes, triggers ingest to flush the old buffer.
    */
   async processTurn(currentMessages: Message[], agentWs: string, agentId: string = ""): Promise<boolean> {
-    if (currentMessages.length === 0) return false;
+    if (currentMessages.length === 0) {
+      console.log("[Episodic Memory] processTurn: empty message list, skipping.");
+      return false;
+    }
 
     // Detect context wipe/reset
     if (this.lastProcessedLength > currentMessages.length) {
@@ -103,7 +106,10 @@ export class EventSegmenter {
     }
 
     const newMessages = currentMessages.slice(this.lastProcessedLength);
-    if (newMessages.length === 0) return false;
+    if (newMessages.length === 0) {
+      console.log(`[Episodic Memory] processTurn: no new messages (lastProcessedLength=${this.lastProcessedLength}, current=${currentMessages.length})`);
+      return false;
+    }
 
     // ---- Fix 1: ツール出力の除外と tool_use の要約 ----
     const filteredNewMessages = newMessages
@@ -171,6 +177,7 @@ export class EventSegmenter {
 
     if (!newSlice) {
       // 画像・tool_use など text なしメッセージの場合も位置を進める（スタック防止）
+      console.log(`[Episodic Memory] processTurn: no text content in new messages (image-only or tool_use-only, ${dedupedMessages.length} message(s) filtered out)`);
       this.lastProcessedLength = currentMessages.length;
       return false;
     }

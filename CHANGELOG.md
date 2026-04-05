@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.4] - 2026-04-05
+
+### Fixed
+- **Automatic episode segmentation restored**: OpenClaw commit `235908c30e` (Mar 30) changed multi-kind plugin slot ownership logic, causing episodic-claw's `assemble()` to no longer be called. Segmentation and memory injection have been migrated to the `before_prompt_build` hook, which is called every turn regardless of `contextEngine` slot configuration.
+- **Segmentation diagnostic logging**: Added reason-coded logs to all four early-return paths in `segmenter.processTurn()` (empty messages, no new messages, all duplicates/empty, no text content) to enable future debugging.
+
+### Changed
+- **`assemble()` reduced to diagnostic + fallback**: The context engine's `assemble()` method now serves as a fallback only (with simplified anchor + recall injection), since `before_prompt_build` handles the primary segmentation and memory injection pipeline.
+- **Plugin API interface updated**: `OpenClawPluginApi.on()` handler return type extended to support `Record<string, unknown>` for `before_prompt_build` hook results.
+
+### Added
+- **`before_prompt_build` hook registration**: 120-line hook that handles segmentation (fire-and-forget), anchor injection, and recall-based memory injection with a fixed 1024-token budget (since `tokenBudget` is not available in this hook).
+
 ## [0.3.3] - 2026-04-05
 
 ### Added

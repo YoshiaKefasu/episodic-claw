@@ -3,22 +3,21 @@ import * as path from "path";
 
 const MAX_SIZE_BYTES = 50 * 1024; // 50KB を超えるエピソードは異常とみなす
 
-async function cleanupWorkspace(wsPath: string) {
-  const episodesDir = path.join(wsPath, "episodes");
-  if (!fs.existsSync(episodesDir)) {
-    console.log(`[Cleanup] Directory not found: ${episodesDir}`);
-    return;
-  }
-
-  const files = fs.readdirSync(episodesDir);
+function scanAndCleanup(dir: string): number {
   let deletedCount = 0;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
 
-  for (const file of files) {
-    if (!file.endsWith(".md")) continue;
-    
-    const filePath = path.join(episodesDir, file);
-    const stats = fs.statSync(filePath);
-    
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      deletedCount += scanAndCleanup(fullPath);
+      continue;
+    }
+
+    if (!entry.name.endsWith(".md")) continue;
+
+    const stats = fs.statSync(fullPath);
     let shouldDelete = false;
     let reason = "";
 
@@ -26,8 +25,7 @@ async function cleanupWorkspace(wsPath: string) {
       shouldDelete = true;
       reason = `Size exceeded (${(stats.size / 1024).toFixed(2)} KB)`;
     } else {
-      const content = fs.readFileSync(filePath, "utf-8");
-      // ツール実行結果の生出力が含まれているかチェック
+      const content = fs.readFileSync(fullPath, "utf-8");
       if (content.includes("toolResult:") || content.includes("tool_result:")) {
         shouldDelete = true;
         reason = "Contains toolResult / tool_result";
@@ -35,11 +33,23 @@ async function cleanupWorkspace(wsPath: string) {
     }
 
     if (shouldDelete) {
-      console.log(`[Cleanup] Deleting ${file} - Reason: ${reason}`);
-      fs.unlinkSync(filePath);
+      console.log(`[Cleanup] Deleting ${fullPath} - Reason: ${reason}`);
+      fs.unlinkSync(fullPath);
       deletedCount++;
     }
   }
+
+  return deletedCount;
+}
+
+async function cleanupWorkspace(wsPath: string) {
+  const episodesDir = path.join(wsPath, "episodes");
+  if (!fs.existsSync(episodesDir)) {
+    console.log(`[Cleanup] Directory not found: ${episodesDir}`);
+    return;
+  }
+
+  const deletedCount = scanAndCleanup(episodesDir);
 
   console.log(`[Cleanup] Finished. Deleted ${deletedCount} polluted episodes in ${wsPath}.`);
   console.log(`[Cleanup] 注意: GoサイドカーのベクトルDBに反映させるため、エージェントを再起動するか、episodes.db を削除してインデックスを再構築してください。`);

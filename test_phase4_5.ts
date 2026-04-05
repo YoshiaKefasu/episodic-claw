@@ -776,8 +776,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.3", "package.json version should be 0.3.3");
-  assert.equal(manifest.version, "0.3.3", "openclaw.plugin.json version should be 0.3.3");
+  assert.equal(pkg.version, "0.3.4", "package.json version should be 0.3.4");
+  assert.equal(manifest.version, "0.3.4", "openclaw.plugin.json version should be 0.3.4");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -798,7 +798,7 @@ async function main() {
     !("compactionPrompt" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose compactionPrompt"
   );
-  assert.match(changelog, /\[0\.3\.3\]/, "CHANGELOG should mention v0.3.3");
+  assert.match(changelog, /\[0\.3\.4\]/, "CHANGELOG should mention v0.3.4");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,
@@ -871,8 +871,8 @@ async function main() {
   );
   assert.match(
     indexSource,
-    /This returns before anchor evaluation, so the eligible injection lifetime is not spent\./,
-    "index.ts should document that budget-truncated early returns do not consume anchor injection lifetime"
+    /before_prompt_build.*セグメンテーション.*メモリ注入/,
+    "index.ts should register before_prompt_build hook for segmentation + memory injection fallback"
   );
   assert.match(
     indexSource,
