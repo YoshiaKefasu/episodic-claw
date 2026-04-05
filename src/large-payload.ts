@@ -125,11 +125,18 @@ export function summarizeLargePayload(text: string): string {
   ].join("\n");
 }
 
+function stripToolOutputPatterns(text: string): string {
+  if (text.startsWith("toolResult:") || text.startsWith("tool_result:")) {
+    return "";
+  }
+  return text;
+}
+
 /**
  * Normalize arbitrary message content to text and externalize if it is large.
  */
 export function normalizeMessageText(content: any): string {
-  const plain = extractPlainText(content).trim();
+  const plain = stripToolOutputPatterns(extractPlainText(content).trim());
   if (!plain) return "";
   return isLargePayload(plain) ? summarizeLargePayload(plain) : plain;
 }

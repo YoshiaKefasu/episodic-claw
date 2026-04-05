@@ -8,7 +8,7 @@ import {
   RecallMatchedBy,
   RecallRpcEpisodeResult,
 } from "./types";
-import { Message, extractText } from "./segmenter";
+import { Message, extractText, EXCLUDED_ROLES } from "./segmenter";
 import { estimateTokens } from "./utils";
 
 export type RecallDiagnostics = {
@@ -139,7 +139,9 @@ export class EpisodicRetriever {
     }
 
     // Build the query from the recent N messages
-    const recentMessages = currentMessages.slice(-5);
+    const recentMessages = currentMessages
+      .filter(m => !EXCLUDED_ROLES.has(m.role))
+      .slice(-5);
     const queryParts = recentMessages
       .map(m => {
         const content = extractText(m.content).trim();

@@ -2,6 +2,8 @@ import { EpisodicCoreClient } from "./rpc-client";
 import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
 
+export const EXCLUDED_ROLES = new Set(["toolResult", "tool_result"]);
+
 export interface Message {
   role: string;
   content: any; // OpenClaw uses object/array content blocks, not plain strings
@@ -103,6 +105,24 @@ export class EventSegmenter {
     const newMessages = currentMessages.slice(this.lastProcessedLength);
     if (newMessages.length === 0) return false;
 
+    // ---- Fix 1: ツール出力の除外と tool_use の要約 ----
+    const filteredNewMessages = newMessages
+      .filter(m => !EXCLUDED_ROLES.has(m.role))
+      .map(m => {
+        if (m.role === "tool_use") {
+          // 複数ツールの並列呼び出しに対応するため、すべてのツール名を抽出してカンマ区切りにする
+          let toolNames: string[] = [];
+          if (Array.isArray(m.content)) {
+            toolNames = m.content
+              .filter((b: any) => b.type === "tool_use" && b.name)
+              .map((b: any) => b.name);
+          }
+          const namesStr = toolNames.length > 0 ? toolNames.join(", ") : "unknown_tool";
+          return { ...m, content: `[Tool Used: ${namesStr}]` };
+        }
+        return m;
+      });
+
     // [Fix D-1] 重複メッセージ dedup（フォールバック連発対策）
     // フォールバック時に同一ユーザーメッセージが N 回送信されるため、
     // buffer 直近 dedupWindow 件と照合して重複・空メッセージを除去する。
@@ -112,7 +132,7 @@ export class EventSegmenter {
     const recentKeys = new Set(
       this.buffer.slice(-this.dedupWindow).map(m => `${m.role}:${extractText(m.content).trim()}`)
     );
-    const dedupedMessages = newMessages.filter(m => {
+    const dedupedMessages = filteredNewMessages.filter(m => {
       const text = extractText(m.content).trim();
       if (!text) return false;                    // 空メッセージ（失敗レスポンス）を除去
       const key = `${m.role}:${text}`;

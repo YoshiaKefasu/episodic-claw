@@ -1,4 +1,5 @@
 import { normalizeMessageText } from "./large-payload";
+import { EXCLUDED_ROLES } from "./segmenter";
 
 export type SummarizationLevel = "normal" | "aggressive" | "fallback";
 
@@ -89,13 +90,14 @@ export function buildSummaryForLevel(
   messages: SummaryMessageLike[],
   level: SummarizationLevel = "normal"
 ): string {
+  const filteredMessages = messages.filter(m => !EXCLUDED_ROLES.has(m.role));
   switch (level) {
     case "aggressive":
-      return buildAggressiveSummary(messages);
+      return buildAggressiveSummary(filteredMessages);
     case "fallback":
-      return buildFallbackSummary(messages);
+      return buildFallbackSummary(filteredMessages);
     case "normal":
     default:
-      return buildNormalSummary(messages);
+      return buildNormalSummary(filteredMessages);
   }
 }
