@@ -386,15 +386,28 @@ const episodicClawPlugin = {
   configSchema: PluginConfigSchema,
   register(api: OpenClawPluginApi) {
     try {
-      console.log("[Episodic Memory] Registering plugin...");
+      // ─── CLIモードログ重複防止（global フラグ）──────────
+      // register() が複数回呼ばれる環境で、初回のみログ出力する。
+      // モジュールキャッシュが無効化される場合でも global はプロセス内で永続するため揮発しない。
+      const CLI_SKIP_FLAG = Symbol.for("episodic.cli.skipped");
+      const CLI_REGISTER_FLAG = Symbol.for("episodic.cli.registered");
 
       // CLIモード判定：OpenClaw固有のデーモンコマンド（gateway / agent / test）の場合のみ初期化を行う。
       // "start" は npm start / yarn start でも argv に現れるため意図的に除外している。
       const DAEMON_CMDS = ["gateway", "agent", "test"];
       const isDaemon = DAEMON_CMDS.some(cmd => process.argv.includes(cmd));
       if (!isDaemon) {
-         console.log("[Episodic Memory] CLI mode detected. Skipping plugin initialization to prevent blocks.");
-         return;
+        if (!(global as any)[CLI_SKIP_FLAG]) {
+          console.log("[Episodic Memory] CLI mode detected. Skipping plugin initialization to prevent blocks.");
+          (global as any)[CLI_SKIP_FLAG] = true;
+        }
+        return;
+      }
+
+      // デーモンモード: 初回のみ登録ログを出力
+      if (!(global as any)[CLI_REGISTER_FLAG]) {
+        console.log("[Episodic Memory] Registering plugin...");
+        (global as any)[CLI_REGISTER_FLAG] = true;
       }
 
       // ─── プロセスレベルシングルトン初期化（BUG-1 修正 v2: global 経由）──────────
@@ -1035,7 +1048,70 @@ const episodicClawPlugin = {
           }
         }
       }));
-      
+
+      // ─── ep-anchor: セッションアンカーの保存 ───
+      const EpAnchorSchema = Type.Object({
+        anchorText: Type.String({
+          description: "The current session state, progress, and immediate next steps. Keep it focused on what the next context window needs to resume seamlessly. Max 4000 characters.",
+          maxLength: 4000
+        }),
+        summaryText: Type.Optional(Type.String({
+          description: "Optional broader context or background summary for longer-running sessions. Max 4000 characters.",
+          maxLength: 4000
+        }))
+      });
+
+      api.registerTool((ctx: any) => ({
+        name: "ep-anchor",
+        description: "Save a session anchor that persists across context compaction. Use this to record your current progress, session state, and immediate next steps so the next context window can resume without re-reading the full conversation. Different from ep-save: ep-anchor is for session continuity (auto-injected after compaction), ep-save is for long-term episodic memory (searchable via ep-recall). Max 4000 characters total.",
+        parameters: EpAnchorSchema,
+        execute: async (_toolCallId: string, params: any) => {
+          // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
+            return { content: [{ type: "text", text: "My memory isn't up yet — the gateway hasn't started. Try again in a moment." }] };
+          }
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
+          try {
+            const p = (params || {}) as Record<string, unknown>;
+            const anchorText: string = (p.anchorText as string) || "";
+            const summaryText: string = (p.summaryText as string) || "";
+
+            // 空文字バリデーション: 両方が空の場合は処理中断
+            if (!anchorText.trim() && !summaryText.trim()) {
+              return { content: [{ type: "text", text: "Nothing to anchor — both anchorText and summaryText were empty. Provide at least one." }] };
+            }
+
+            // コンテンツ結合
+            const combined = [anchorText.trim(), summaryText.trim()].filter(Boolean).join("\n\n");
+
+            // アンカーサイズ上限（4000文字）
+            const runes = Array.from(combined);
+            const content = runes.length > 4000 ? runes.slice(0, 4000).join("") + "\n...(truncated)" : combined;
+
+            // アンカー保存
+            const result = await state.anchorStore.write({
+              content,
+              agentWs,
+              agentId,
+            });
+
+            // 次のリコール時に最新キャッシュが使われるように無効化
+            invalidateRecallCacheForWorkspace(agentWs);
+
+            return {
+              content: [{ type: "text", text: `Anchor saved. Path: ${result.path}${result.slug ? `\nSlug: ${result.slug}` : ""}` }],
+              details: result
+            };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `Something went wrong saving the anchor: ${e.message}` }] };
+          }
+        }
+      }));
+
     } catch (err: any) {
       console.error("[Episodic Memory DEBUG] CRASH IN REGISTER:", err.stack || err);
       throw err;

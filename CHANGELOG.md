@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.3] - 2026-04-05
+
+### Added
+- **`ep-anchor` tool registration**: The `ep-anchor` tool is now properly registered in `src/index.ts`, enabling agents to proactively save session anchors that persist across context compaction. Anchors are stored via `AnchorStore.write()` with a 4000-character limit and automatic recall cache invalidation.
+
+### Fixed
+- **CLI mode duplicate log output**: The `register()` method now uses `global`-scoped `Symbol.for()` flags (`episodic.cli.skipped` and `episodic.cli.registered`) to prevent duplicate log messages when the plugin system calls `register()` multiple times. This resolves the issue where `[Episodic Memory] CLI mode detected. Skipping...` and `[Episodic Memory] Registering plugin...` were printed repeatedly in CLI mode.
+
 ## [0.3.1] - 2026-04-05
 
 ### Added
