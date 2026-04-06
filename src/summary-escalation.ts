@@ -26,7 +26,7 @@ function buildNormalSummary(messages: SummaryMessageLike[]): string {
       const text = normalizeMessageText(message.content).trim();
       return text ? `${message.role}: ${text}` : "";
     })
-    .filter((line) => line.length > 0)
+    .filter((line) => line.length > 0 && !/^(user|assistant|system):\s*$/.test(line))
     .join("\n")
     .trim();
 }
@@ -69,7 +69,7 @@ export function buildFallbackSummary(messages: SummaryMessageLike[]): string {
       const text = normalizeMessageText(message.content).trim();
       return text ? `${message.role}: ${text}` : "";
     })
-    .filter((line) => line.length > 0)
+    .filter((line) => line.length > 0 && !/^(user|assistant|system):\s*$/.test(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();

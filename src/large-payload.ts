@@ -133,10 +133,41 @@ function stripToolOutputPatterns(text: string): string {
 }
 
 /**
+ * Strip Telegram gateway metadata blocks from message content.
+ * The Telegram gateway injects JSON code blocks with keys like
+ * "Conversation info (untrusted metadata):", "Sender (untrusted metadata):",
+ * and "Replied message (untrusted, for context):" into the message text.
+ * These blocks waste token budget and add noise to recall/search.
+ */
+const TELEGRAM_META_PATTERNS: RegExp[] = [
+  // Conversation info (untrusted metadata): ... ```json ... ```
+  /Conversation info \(untrusted metadata\):[\s\S]*?```json[\s\S]*?```/gi,
+  // Sender (untrusted metadata): ... ```json ... ```
+  /Sender \(untrusted metadata\):[\s\S]*?```json[\s\S]*?```/gi,
+  // Replied message (untrusted, for context): ... ```json ... ```
+  /Replied message \(untrusted,? for context\):[\s\S]*?```json[\s\S]*?```/gi,
+  // Fallback: any remaining untrusted metadata + json blocks
+  /\(untrusted metadata\):[\s\S]*?```json[\s\S]*?```/gi,
+];
+
+function stripTelegramMetadata(text: string): string {
+  let cleaned = text;
+  for (const pattern of TELEGRAM_META_PATTERNS) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+  // Collapse multiple blank lines left behind by removals
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+  return cleaned;
+}
+
+/**
  * Normalize arbitrary message content to text and externalize if it is large.
  */
 export function normalizeMessageText(content: any): string {
   const plain = stripToolOutputPatterns(extractPlainText(content).trim());
   if (!plain) return "";
-  return isLargePayload(plain) ? summarizeLargePayload(plain) : plain;
+  // Strip Telegram gateway JSON metadata blocks
+  const cleaned = stripTelegramMetadata(plain);
+  if (!cleaned) return "";
+  return isLargePayload(cleaned) ? summarizeLargePayload(cleaned) : cleaned;
 }

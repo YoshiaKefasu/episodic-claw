@@ -1137,6 +1137,25 @@ func ensureSavedBy(in string) string {
 	return in
 }
 
+// stripTelegramMetadata removes Telegram gateway JSON metadata blocks from text.
+// These blocks are injected by the Telegram gateway and waste token budget.
+var telegramMetaPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)Conversation info \(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)Sender \(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)Replied message \(untrusted,? for context\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)\(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+}
+
+func stripTelegramMetadata(text string) string {
+	cleaned := text
+	for _, p := range telegramMetaPatterns {
+		cleaned = p.ReplaceAllString(cleaned, "")
+	}
+	// Collapse multiple blank lines left behind by removals
+	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
+	return strings.TrimSpace(cleaned)
+}
+
 func topicsForRecord(topics []string, legacyTags []string) []string {
 	clean, _ := vector.ValidateTopics(topics)
 	if len(clean) > 0 {
@@ -1178,6 +1197,9 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	}
 
 	savedBy := ensureSavedBy(params.SavedBy)
+
+	// Sanitize summary: strip Telegram gateway JSON metadata blocks
+	params.Summary = stripTelegramMetadata(params.Summary)
 
 	ctx := context.Background()
 
@@ -1354,6 +1376,11 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	}
 
 	savedBy := ensureSavedBy(params.SavedBy)
+
+	// Sanitize summaries: strip Telegram gateway JSON metadata blocks
+	for i := range params.Items {
+		params.Items[i].Summary = stripTelegramMetadata(params.Items[i].Summary)
+	}
 
 	ctx := context.Background()
 	rawEmbedProv := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")

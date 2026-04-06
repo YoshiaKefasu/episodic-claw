@@ -765,7 +765,7 @@ async function main() {
   const pkg = readJson("package.json");
   const manifest = readJson("openclaw.plugin.json");
   const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
-  const planSource = fs.readFileSync(path.resolve("docs", "v0.2.5_fix_plan.md"), "utf8");
+  const planSource = fs.readFileSync(path.resolve("docs", "plans", "v0.2.x", "v0.2.5_fix_plan.md"), "utf8");
   const configSource = fs.readFileSync(path.resolve("src", "config.ts"), "utf8");
   const compactorSource = fs.readFileSync(path.resolve("src", "compactor.ts"), "utf8");
   const indexSource = fs.readFileSync(path.resolve("src", "index.ts"), "utf8");
@@ -776,8 +776,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.4", "package.json version should be 0.3.4");
-  assert.equal(manifest.version, "0.3.4", "openclaw.plugin.json version should be 0.3.4");
+  assert.equal(pkg.version, "0.3.5", "package.json version should be 0.3.5");
+  assert.equal(manifest.version, "0.3.5", "openclaw.plugin.json version should be 0.3.5");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -798,7 +798,7 @@ async function main() {
     !("compactionPrompt" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose compactionPrompt"
   );
-  assert.match(changelog, /\[0\.3\.4\]/, "CHANGELOG should mention v0.3.4");
+  assert.match(changelog, /\[0\.3\.5\]/, "CHANGELOG should mention v0.3.5");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,

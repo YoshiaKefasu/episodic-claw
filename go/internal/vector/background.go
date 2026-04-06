@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +19,47 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// stripTelegramMetadata removes Telegram gateway JSON metadata blocks from text.
+var telegramMetaPatternsBg = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)Conversation info \(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)Sender \(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)Replied message \(untrusted,? for context\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+	regexp.MustCompile(`(?i)\(untrusted metadata\):[\s\S]*?` + "```json[\\s\\S]*?```"),
+}
+
+func stripTelegramMetadataBg(text string) string {
+	cleaned := text
+	for _, p := range telegramMetaPatternsBg {
+		cleaned = p.ReplaceAllString(cleaned, "")
+	}
+	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
+	return strings.TrimSpace(cleaned)
+}
+
+// CleanEpisodeFile checks if an episode file contains Telegram metadata blocks
+// and rewrites it with cleaned body content. Returns true if the file was modified.
+func CleanEpisodeFile(filePath string) bool {
+	doc, err := frontmatter.Parse(filePath)
+	if err != nil {
+		return false
+	}
+
+	cleaned := stripTelegramMetadataBg(doc.Body)
+	if cleaned == doc.Body {
+		return false
+	}
+
+	// Rewrite with cleaned body
+	doc.Body = cleaned
+	if err := frontmatter.Serialize(filePath, doc); err != nil {
+		fmt.Fprintf(os.Stderr, "[Healing] Failed to rewrite cleaned file %s: %v\n", filePath, err)
+		return false
+	}
+
+	fmt.Fprintf(os.Stderr, "[Healing] Cleaned Telegram metadata from %s (was %d chars, now %d chars)\n",
+		filePath, len(doc.Body), len(cleaned))
+	return true
+}
 
 type BacklogMessage struct {
 	Role    string `json:"role"`
@@ -26,7 +68,7 @@ type BacklogMessage struct {
 
 func ProcessBackgroundIndexing(filePaths []string, agentWs string, apiKey string, vstore *Store, embedLimiter *rate.Limiter) {
 	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
-	
+
 	for _, filePath := range filePaths {
 		if strings.HasSuffix(strings.ToLower(filePath), ".md") {
 			ProcessMDFileIndex(filePath, agentWs, apiKey, vstore, embedLimiter)
@@ -44,6 +86,16 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[MDIndex] Failed to parse %s: %v\n", filePath, err)
 		return
+	}
+
+	// Lazy Migration: Clean Telegram metadata blocks from existing files
+	if CleanEpisodeFile(filePath) {
+		// Re-parse after cleaning
+		doc, err = frontmatter.Parse(filePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[MDIndex] Failed to re-parse cleaned file %s: %v\n", filePath, err)
+			return
+		}
 	}
 
 	body := strings.TrimSpace(doc.Body)
@@ -69,21 +121,36 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 			if len(existingRec.Tags) != len(meta.Tags) {
 				metaChanged = true
 			} else {
-				for i, t := range meta.Tags { if existingRec.Tags[i] != t { metaChanged = true; break } }
+				for i, t := range meta.Tags {
+					if existingRec.Tags[i] != t {
+						metaChanged = true
+						break
+					}
+				}
 			}
 		}
 		if !metaChanged {
 			if len(existingRec.Topics) != len(meta.Topics) {
 				metaChanged = true
 			} else {
-				for i, t := range meta.Topics { if existingRec.Topics[i] != t { metaChanged = true; break } }
+				for i, t := range meta.Topics {
+					if existingRec.Topics[i] != t {
+						metaChanged = true
+						break
+					}
+				}
 			}
 		}
 		if !metaChanged {
 			if len(existingRec.Edges) != len(meta.RelatedTo) {
 				metaChanged = true
 			} else {
-				for i, t := range meta.RelatedTo { if existingRec.Edges[i] != t { metaChanged = true; break } }
+				for i, t := range meta.RelatedTo {
+					if existingRec.Edges[i] != t {
+						metaChanged = true
+						break
+					}
+				}
 			}
 		}
 
@@ -93,7 +160,7 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 		}
 
 		fmt.Fprintf(os.Stderr, "[MDIndex] Smart Dedup: metadata changed for %s — updating record without re-embed\n", filePath)
-		
+
 		id := existingRec.ID
 		created := meta.Created
 		if created.IsZero() {
@@ -197,7 +264,6 @@ func contentHash(s string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-
 func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStudioProvider, limiter *rate.Limiter, vstore *Store) {
 	fmt.Fprintf(os.Stderr, "[Background] Starting index of legacy file: %s\n", filePath)
 
@@ -237,7 +303,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 	for i, chunk := range chunks {
 		var sb strings.Builder
 		for _, m := range chunk {
-			sb.WriteString(m.Role + ": " + m.Content + "\n")
+			sb.WriteString(m.Role + ": " + stripTelegramMetadataBg(m.Content) + "\n")
 		}
 		summary := sb.String()
 		if strings.TrimSpace(summary) == "" {
@@ -285,11 +351,11 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 		}
 		prevVector = emb
 
-		dirPath := filepath.Join(agentWs, 
-			fmt.Sprintf("%04d", now.Year()), 
-			fmt.Sprintf("%02d", now.Month()), 
+		dirPath := filepath.Join(agentWs,
+			fmt.Sprintf("%04d", now.Year()),
+			fmt.Sprintf("%02d", now.Month()),
 			fmt.Sprintf("%02d", now.Day()))
-		
+
 		if mkErr := os.MkdirAll(dirPath, 0755); mkErr != nil {
 			fmt.Fprintf(os.Stderr, "[Background] Failed to create directory %s: %v\n", dirPath, mkErr)
 			continue
@@ -332,11 +398,11 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 
 		bgProgress := fmt.Sprintf("%d/%d chunks processed", i+1, len(chunks))
 		vstore.SetMeta("bg_progress", []byte(bgProgress))
-		
+
 		if (i+1)%10 == 0 || i == len(chunks)-1 {
 			fmt.Fprintf(os.Stderr, "[Background] Progress: %s\n", bgProgress)
 		}
 	}
-	
+
 	fmt.Fprintf(os.Stderr, "[Background] Completed indexing for legacy file %s\n", filePath)
 }

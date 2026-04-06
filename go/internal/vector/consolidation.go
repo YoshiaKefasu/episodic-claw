@@ -122,6 +122,56 @@ func processCluster(
 		return fmt.Errorf("generated empty D1 body")
 	}
 
+	// Generate topics from D1 body using LLM (same language as content).
+	// If LLM fails, fall back to aggregated topics from child D0s (d1Topics from L97).
+	topicsPrompt := fmt.Sprintf(`Extract 3-5 topic keywords from this memory summary.
+Use the same language as the content.
+Return ONLY a comma-separated list of topics, nothing else.
+
+%s`, d1Body[:min(len(d1Body), 500)])
+	topicsStr, topicsErr := llm.GenerateText(ctx, topicsPrompt)
+	if topicsErr == nil && strings.TrimSpace(topicsStr) != "" {
+		var llmTopics []string
+		for _, t := range strings.Split(topicsStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				llmTopics = append(llmTopics, t)
+			}
+		}
+		if validated, _ := ValidateTopics(llmTopics); len(validated) > 0 {
+			d1Topics = validated
+		}
+	}
+	// Final fallback: ensure at least one topic exists
+	if len(d1Topics) == 0 {
+		d1Topics = []string{"memory"}
+	}
+
+	// Generate a short, human-readable title (max ~8 words) from the D1 body.
+	// The title should be in the same language as the D1 body content.
+	titlePrompt := fmt.Sprintf(`Generate a very short title (max 8 words) for this memory summary.
+Use the same language as the content below.
+Return ONLY the title text, nothing else.
+
+%s`, d1Body[:min(len(d1Body), 500)])
+	titleStr, titleErr := llm.GenerateText(ctx, titlePrompt)
+	if titleErr != nil || strings.TrimSpace(titleStr) == "" {
+		// Fallback: use first ~60 chars of the body as title
+		truncated := strings.TrimSpace(d1Body)
+		if len(truncated) > 60 {
+			truncated = truncated[:60] + "..."
+		}
+		titleStr = truncated
+	}
+	d1Title := strings.TrimSpace(titleStr)
+	// Sanitize title: remove newlines, limit length
+	d1Title = strings.ReplaceAll(d1Title, "\n", " ")
+	d1Title = strings.ReplaceAll(d1Title, "\r", " ")
+	if len([]rune(d1Title)) > 120 {
+		runes := []rune(d1Title)
+		d1Title = string(runes[:120]) + "..."
+	}
+
 	slugPrompt := fmt.Sprintf("Generate a very short, url-safe identifier (using hyphens, max 4 words) representing this topic:\n%s", d1Body[:min(len(d1Body), 300)])
 	slugStr, slugErr := llm.GenerateText(ctx, slugPrompt)
 	if slugErr != nil {
@@ -153,7 +203,7 @@ func processCluster(
 
 	fm := frontmatter.EpisodeMetadata{
 		ID:               d1Slug,
-		Title:            "Semantic Consolidation: " + strings.ReplaceAll(d1Slug, "-", " "),
+		Title:            d1Title,
 		Tags:             []string{"d1-summary"},
 		Topics:           d1Topics,
 		SavedBy:          "auto",
@@ -194,6 +244,7 @@ func buildConsolidationPrompt(clusterText string, singleton bool) string {
 		return fmt.Sprintf(`Analyze the following episodic memory log (D0) as a single high-salience event.
 Keep the D1 summary narrow, concrete, and local to this one episode.
 Do not over-generalize beyond the event itself.
+IMPORTANT: Write the summary in the SAME LANGUAGE as the original content. If the content is in Japanese, write in Japanese. If in English, write in English. Do not translate or mix languages.
 Return ONLY the summary/rules markdown text without additional conversational filler.
 
 ---
@@ -205,6 +256,7 @@ Return ONLY the summary/rules markdown text without additional conversational fi
 	return fmt.Sprintf(`Analyze the following episodic memory logs (D0) representing detailed chronological events.
 Extract the overarching rules, facts, high-level summaries, and abstract concepts to form a long-term semantic memory (D1).
 Do not simply repeat the conversation. Synthesize it.
+IMPORTANT: Write the summary in the SAME LANGUAGE as the original content. If the content is in Japanese, write in Japanese. If in English, write in English. Do not translate or mix languages.
 Return ONLY the summary/rules markdown text without additional conversational filler.
 
 ---

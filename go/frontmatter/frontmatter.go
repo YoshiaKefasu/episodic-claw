@@ -83,6 +83,11 @@ func Parse(filePath string) (*MarkdownDocument, error) {
 func Serialize(filePath string, doc *MarkdownDocument) error {
 	var buf bytes.Buffer
 
+	// Ensure topics field is always emitted in YAML output (even when nil/empty)
+	if doc.Metadata.Topics == nil {
+		doc.Metadata.Topics = []string{}
+	}
+
 	// Write frontmatter
 	buf.WriteString("---\n")
 	encoder := yaml.NewEncoder(&buf)
