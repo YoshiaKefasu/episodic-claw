@@ -82,6 +82,10 @@ export interface EpisodicPluginConfig {
   recallTopicsMismatchPenalty?: number;
   /** Recall calibration: penalty when the record has no topics at all. Usually zero. */
   recallTopicsMissingPenalty?: number;
+  /** Recall re-injection guard: minimum turns that must pass before the same episode set may be re-injected.
+   *  Counts all messages (user + assistant). Default: 10 (≈5 user + 5 assistant turns).
+   *  Set to 0 to disable the guard. */
+  recallReInjectionCooldownTurns?: number;
 }
 
 export interface RecallCalibration {

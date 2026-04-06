@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.5-2] - 2026-04-06
+
+### Changed
+- **Recall re-injection guard default raised to 24 turns**: For 1M context window agents, 10 turns was too short. Default is now 24 total message turns (≈12 user + 12 assistant exchanges). Configurable via `recallReInjectionCooldownTurns` in plugin config.
+
 ## [0.3.5-1] - 2026-04-06
 
 ### Fixed

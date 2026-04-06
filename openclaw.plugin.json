@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.3.5-1",
+  "version": "0.3.5-2",
   "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -128,6 +128,11 @@
         "type": "integer",
         "minimum": 100,
         "description": "The max number of memories the lightning-fast Lexical (N-gram) engine filters before passing them to the heavy HNSW vector math. Default: 1000.\n⚠️ [Blast Radius] If too high: Your CPU burns up attempting heavy vector math on the entire database. If too low: Excellent memories get casually thrown out by the dumb text-filter, ruining search accuracy."
+      },
+      "recallReInjectionCooldownTurns": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Minimum total message turns (user + assistant) that must pass before the same recalled episode set may be re-injected into the system prompt. Default: 24 (≈12 user + 12 assistant exchanges). Set to 0 to disable.\n⚠️ [Blast Radius] If too high: Freshly relevant memories won't reappear even when the conversation naturally circles back. If too low: The same memories spam the prompt every turn, wasting tokens and confusing the agent."
       }
     }
   }

@@ -437,8 +437,10 @@ const episodicClawPlugin = {
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
 
       // 同一メモリ結果の再注入を防止するためのクールダウンターン数
-      // 10ターン = 約20往復の会話。LLMが十分な文脈を消費した後に再評価する。
-      const RECALL_REINJECTION_COOLDOWN_TURNS = 10;
+      // 12往復の会話（ユーザー12 + アシスタント12）。1Mコンテキスト窓では十分な間隔。
+      // openclaw.plugin.json の recallReInjectionCooldownTurns でユーザーが調整可能。
+      // 0 に設定するとガードが無効化される。
+      const recallReInjectionCooldownTurns = Math.max(0, cfg.recallReInjectionCooldownTurns ?? 10);
 
       // [Fix D-3] setMeta rate-limit（フォールバック連発対策）
       // ingest() が N 回呼ばれても setMeta は最大 5 秒に 1 回のみ発行する。
@@ -759,7 +761,7 @@ const episodicClawPlugin = {
           const currentMsgCount = msgs.length;
           const turnsSinceLastInjection = currentMsgCount - state.lastInjectionMessageCount;
           const isSameResult = currentHash && currentHash === state.lastInjectedResultHash;
-          const isWithinCooldown = turnsSinceLastInjection < RECALL_REINJECTION_COOLDOWN_TURNS;
+          const isWithinCooldown = recallReInjectionCooldownTurns > 0 && turnsSinceLastInjection < recallReInjectionCooldownTurns;
 
           if (isSameResult && isWithinCooldown) {
             console.log(`[Episodic Memory] recall re-injection guard: same ${episodeIds.length} episode(s), skipping (${turnsSinceLastInjection} turns since last injection)`);

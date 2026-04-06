@@ -776,8 +776,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.5-1", "package.json version should be 0.3.5-1");
-  assert.equal(manifest.version, "0.3.5-1", "openclaw.plugin.json version should be 0.3.5-1");
+  assert.equal(pkg.version, "0.3.5-2", "package.json version should be 0.3.5-2");
+  assert.equal(manifest.version, "0.3.5-2", "openclaw.plugin.json version should be 0.3.5-2");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -798,7 +798,7 @@ async function main() {
     !("compactionPrompt" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose compactionPrompt"
   );
-  assert.match(changelog, /\[0\.3\.5-1\]/, "CHANGELOG should mention v0.3.5-1");
+  assert.match(changelog, /\[0\.3\.5-2\]/, "CHANGELOG should mention v0.3.5-2");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,

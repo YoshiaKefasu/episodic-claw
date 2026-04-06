@@ -37,6 +37,7 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
     recallTopicsMatchBoost: rawConfig?.recallTopicsMatchBoost ?? 0.05,
     recallTopicsMismatchPenalty: rawConfig?.recallTopicsMismatchPenalty ?? 0.10,
     recallTopicsMissingPenalty: rawConfig?.recallTopicsMissingPenalty ?? 0.0,
+    recallReInjectionCooldownTurns: Math.max(0, rawConfig?.recallReInjectionCooldownTurns ?? 24),
   };
 }
 
