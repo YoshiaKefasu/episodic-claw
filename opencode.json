@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/qwen3.6-plus-free",
+  "default_agent": "kuraudo"
+}
