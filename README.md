@@ -16,9 +16,9 @@ With the `v0.3.5` era, the engine took a massive architectural leap. Instead of 
 
 Plus, background memories now perfectly match your native language! If you chat in Japanese, the AI's internal long-term memories stay in Japanese. We also added a smart 24-turn cooldown guard so the AI doesn't spam itself with the exact same memory over and over.
 
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 > Check the `v0.3.x` roadmap and master plan [here](./docs/v0.3.0_master_plan.md).
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 
 ---
 
@@ -70,9 +70,9 @@ And while you are chatting, new memories are being made in the background:
 
 ## <img src="./assets/icons/layers-3.svg" width="24" align="center" alt="" /> Memory Hierarchy (D0 / D1)
 
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 > **TL;DR:** D0 is a raw, messy diary entry. D1 is the neat summary you wrote later so you wouldn't have to read the whole diary.
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 
 ### <img src="./assets/icons/file-text.svg" width="24" align="center" alt="" /> D0 — Raw Episodes
 
@@ -110,10 +110,10 @@ We completely rethought the architecture here. Trying to do "everything" ourselv
 - **Inherited Bulletproof Defense**: All the insane durability from v0.3.0 (WAL queues, rate limit escalation strategies, auto-repair) is still intact. Your memories are safer than ever.
 - **Dropped the Clunky Stuff**: Since the Host now manages the memory limits, we deleted all our clunky "Context Pressure Monitor" logic. The plugin is leaner, meaner, and completely driven by stealthy hooks (`before_prompt_build`).
 
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 > **Special Thanks: lossless-claw**
 > The insane paranoic resilience in v0.3.0—the auto-repairing transcripts and the never-surrender rate limit handling (Phase 7)—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.
-> ‎
+> [ ­](https://github.com/YoshiaKefasu/episodic-claw)
 
 ---
 
