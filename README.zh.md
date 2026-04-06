@@ -16,7 +16,9 @@
 
 另外，后台的长效记忆现在做到了“语言绝对匹配”！如果你平时用中文跟它聊天，它在后台生成的记忆结晶也会原汁原味地保留成中文。我们还加上了聪明的 24 回合“冷却防刷屏”机制，避免 AI 一直把同一段记忆来回塞进提示词里浪费算力。
 
+> ‎
 > v0.3.x 的完整路线图和规划报告可以看 [这里](./docs/v0.3.0_master_plan.md)。
+> ‎
 
 ---
 
@@ -68,9 +70,9 @@ sequenceDiagram
 
 ## <img src="./assets/icons/layers-3.svg" width="24" align="center" alt="" /> 记忆两层结构（D0 / D1）
 
->⠀
+> ‎
 > **一句话总结：** D0 是原始的流水账日记，D1 是你事后总结的干货笔记。
->⠀
+> ‎
 
 ### <img src="./assets/icons/file-text.svg" width="24" align="center" alt="" /> D0 — 原始情节（Raw Episodes）
 
@@ -107,10 +109,10 @@ sequenceDiagram
 - **不败的祖传盾牌**: 上个版本（v0.3.0）里的神兵利器——WAL 并发队列、API 限流的三级防抖降级（Rate Limit Escalation），以及破损日志自愈功能——统统带过来了。安全方面依然稳如老狗。
 - **甩掉包袱**: 既然记忆压力的管理权都交回去了，我们直接砍掉了以前那些笨重繁琐的阈值监控代码。现在插件异常精简，专一硬核，全部依赖 `before_prompt_build` 等无缝钩子驱动。
 
->⠀
+> ‎
 > **Special Thanks: lossless-claw**
 > v0.3.0 中那种“绝对不丢记忆、坏了还能自己修”的变态级抗灾能力（Phase 7 的核心架构），全部是直接从我们的姐妹项目 `lossless-claw` 中移植并吸收过来的。如果不是在那边经历了无数次踩坑与血战，episodic-claw 绝对达不到今天这种完美度。
->⠀
+> ‎
 
 ---
 
