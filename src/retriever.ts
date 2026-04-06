@@ -20,6 +20,7 @@ export type RecallDiagnostics = {
 
 export type RecallInjectionOutcome = {
   text: string;
+  episodeIds: string[];
   reason: "injected" | "no_messages" | "max_tokens_zero" | "empty_query" | "recall_empty" | "recall_failed" | "degraded_low_confidence";
   queryHash: string;
   injectedEpisodeCount: number;
@@ -131,11 +132,11 @@ export class EpisodicRetriever {
     maxTokens: number = 4096
   ): Promise<RecallInjectionOutcome> {
     if (currentMessages.length === 0) {
-      return { text: "", reason: "no_messages", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "no_messages", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
     // max_tokens_zero: ここでの 0 は「入力時点で注入不能」。
     if (maxTokens <= 0) {
-      return { text: "", reason: "max_tokens_zero", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "max_tokens_zero", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
 
     // Build the query from the recent N messages
@@ -150,7 +151,7 @@ export class EpisodicRetriever {
       .filter(part => part.length > 0);
     const query = queryParts.join("\n").trim();
     if (!query) {
-      return { text: "", reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
     const queryHash = createHash("sha1").update(query).digest("hex");
     const calibration = this.config ? buildRecallCalibration(this.config) : undefined;
@@ -167,7 +168,7 @@ export class EpisodicRetriever {
         console.warn("[Episodic Memory] Recall failed for primary workspace:", err);
       }
       if (sourcedResults.length === 0) {
-        return { text: "", reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
       }
 
       // System hint: placed at the top so the model sees it before any episode content.
@@ -180,6 +181,7 @@ export class EpisodicRetriever {
       let truncatedEpisodeCount = 0;
       let firstEpisodeId = "";
       const injectedIdsByWs = new Map<string, string[]>();
+      const injectedEpisodeIds: string[] = [];
 
       const deduped = sourcedResults
         .slice()
@@ -223,6 +225,9 @@ export class EpisodicRetriever {
         assembled += bodyText + "\n\n";
         tokenCount += entryTokens;
         injectedEpisodeCount += 1;
+        if (episodeId) {
+          injectedEpisodeIds.push(episodeId);
+        }
         if (!firstEpisodeId && episodeId) {
           firstEpisodeId = episodeId;
         }
@@ -240,6 +245,7 @@ export class EpisodicRetriever {
           );
           return {
             text: "",
+            episodeIds: [],
             reason: "degraded_low_confidence",
             queryHash,
             injectedEpisodeCount: 0,
@@ -248,7 +254,7 @@ export class EpisodicRetriever {
             diagnostics,
           };
         }
-        return { text: "", reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics };
+        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics };
       }
 
       assembled += "--- End of Memory ---\n";
@@ -272,6 +278,7 @@ export class EpisodicRetriever {
 
       return {
         text: assembled,
+        episodeIds: injectedEpisodeIds,
         reason: "injected",
         queryHash,
         injectedEpisodeCount,
@@ -282,7 +289,7 @@ export class EpisodicRetriever {
 
     } catch (err) {
       console.error("[Episodic Memory] Retrieval failed:", err);
-      return { text: "", reason: "recall_failed", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "recall_failed", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
   }
 }

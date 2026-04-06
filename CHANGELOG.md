@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.5-1] - 2026-04-06
+
+### Fixed
+- **Recall re-injection guard (turn-based)**: Same episode set is no longer injected into the system prompt every turn. A turn-based cooldown (10 turns) prevents redundant memory injection while still allowing the retrieval engine to search for new results each turn.
+- **Dead code removal**: Removed unused `RecallCacheState`, `RECALL_DEBOUNCE_MS`, and `clearRecallCache()` that were defined but never called.
+- **Retriever episode ID tracking**: Added `episodeIds: string[]` to `RecallInjectionOutcome` so the caller can identify exactly which episodes were returned for deduplication.
+
 ## [0.3.5] - 2026-04-06
 
 ### Fixed

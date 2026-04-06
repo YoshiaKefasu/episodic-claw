@@ -776,8 +776,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.5", "package.json version should be 0.3.5");
-  assert.equal(manifest.version, "0.3.5", "openclaw.plugin.json version should be 0.3.5");
+  assert.equal(pkg.version, "0.3.5-1", "package.json version should be 0.3.5-1");
+  assert.equal(manifest.version, "0.3.5-1", "openclaw.plugin.json version should be 0.3.5-1");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -798,7 +798,7 @@ async function main() {
     !("compactionPrompt" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose compactionPrompt"
   );
-  assert.match(changelog, /\[0\.3\.5\]/, "CHANGELOG should mention v0.3.5");
+  assert.match(changelog, /\[0\.3\.5-1\]/, "CHANGELOG should mention v0.3.5-1");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,
@@ -846,8 +846,8 @@ async function main() {
   );
   assert.match(
     indexSource,
-    /clearRecallCache\(state\);\s*await state\.segmenter\.processTurn\(msgs, agentWs, agentId\);/s,
-    "ingest should clear recall cache before segmenting"
+    /state\.lastInjectedResultHash = ""[\s\S]*?await state\.segmenter\.processTurn\(msgs, agentWs, agentId\);/s,
+    "ingest should clear re-injection guard before segmenting"
   );
   assert.match(
     indexSource,

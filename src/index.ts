@@ -84,12 +84,6 @@ type WorkspaceResolution = {
   defaultWs: string;
 };
 
-type RecallCacheState = {
-  lastRecallResult: RecallInjectionOutcome | null;
-  lastRecallTime: number;
-  lastRecallFullKey: string;
-};
-
 type AnchorInjectionState = {
   anchorText: string;
   summaryText: string;
@@ -106,9 +100,11 @@ type AgentRuntimeState = {
   segmenter: EventSegmenter;
   archiver: EpisodicArchiver;
   anchorStore: AnchorStore;
-  recallCache: RecallCacheState;
   anchorInjection: AnchorInjectionState | null;
   lastSetMetaTime: number;
+  // 結果ベース再注入防止
+  lastInjectedResultHash: string;
+  lastInjectionMessageCount: number;
 };
 
 const WORKSPACE_CACHE_PREFIX = "episodic-claw-workspace";
@@ -440,12 +436,9 @@ const episodicClawPlugin = {
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
 
-      // [Fix D-2] assemble() recall debounce キャッシュ（フォールバック連発対策）
-      // 時間キーだけでは不十分（フォールバック間隔が 1〜2 分のため）。
-      // 最後のユーザーメッセージテキストをコンテンツキーとして追加し、
-      // 同一クエリなら時間に関わらず cache hit、異なるクエリなら即失効する。
-      // BUG-1 修正: _singleton 経由で状態を共有（二重 register() でもキャッシュが引き継がれる）
-      const RECALL_DEBOUNCE_MS = 5000; // 5秒以内の同一クエリ再試行をカバー（安全マージン）
+      // 同一メモリ結果の再注入を防止するためのクールダウンターン数
+      // 10ターン = 約20往復の会話。LLMが十分な文脈を消費した後に再評価する。
+      const RECALL_REINJECTION_COOLDOWN_TURNS = 10;
 
       // [Fix D-3] setMeta rate-limit（フォールバック連発対策）
       // ingest() が N 回呼ばれても setMeta は最大 5 秒に 1 回のみ発行する。
@@ -476,22 +469,13 @@ const episodicClawPlugin = {
             segmenter,
             archiver,
             anchorStore,
-            recallCache: {
-              lastRecallResult: null,
-              lastRecallTime: 0,
-              lastRecallFullKey: "",
-            },
             anchorInjection: null,
             lastSetMetaTime: 0,
+            lastInjectedResultHash: "",
+            lastInjectionMessageCount: 0,
           };
         _singleton!.agentStates.set(agentId, state);
         return state;
-      };
-
-      const clearRecallCache = (state: AgentRuntimeState) => {
-        state.recallCache.lastRecallResult = null;
-        state.recallCache.lastRecallTime = 0;
-        state.recallCache.lastRecallFullKey = "";
       };
 
       const clearAnchorInjection = (state: AgentRuntimeState) => {
@@ -532,7 +516,8 @@ const episodicClawPlugin = {
         if (!workspace) return;
         for (const state of _singleton!.agentStates.values()) {
           if (state.lastAgentWs === workspace) {
-            clearRecallCache(state);
+            state.lastInjectedResultHash = "";
+            state.lastInjectionMessageCount = 0;
           }
         }
       };
@@ -643,7 +628,8 @@ const episodicClawPlugin = {
           } else {
             console.warn("[Episodic Memory] before_compaction: no sessionFile in ctx — skipping archive.");
           }
-          clearRecallCache(state);
+          state.lastInjectedResultHash = "";
+          state.lastInjectionMessageCount = 0;
           console.log("[Episodic Memory] before_compaction: memories protected.");
         } catch (err) {
           console.error("[Episodic Memory] before_compaction: error (non-fatal, compaction continues):", err);
@@ -667,7 +653,8 @@ const episodicClawPlugin = {
           } else {
             console.log("[Episodic Memory] after_compaction: no anchor found, proceeding without.");
           }
-          clearRecallCache(state);
+          state.lastInjectedResultHash = "";
+          state.lastInjectionMessageCount = 0;
         } catch (err) {
           console.error("[Episodic Memory] after_compaction: error (non-fatal):", err);
         }
@@ -764,6 +751,28 @@ const episodicClawPlugin = {
 
         try {
           const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
+
+          // ── 結果ベース再注入防止 (ターン数ベース) ──
+          const episodeIds = recallOutcome.episodeIds || [];
+          const resultHash = episodeIds.sort().join("|");
+          const currentHash = resultHash ? createHash("sha1").update(resultHash).digest("hex") : "";
+          const currentMsgCount = msgs.length;
+          const turnsSinceLastInjection = currentMsgCount - state.lastInjectionMessageCount;
+          const isSameResult = currentHash && currentHash === state.lastInjectedResultHash;
+          const isWithinCooldown = turnsSinceLastInjection < RECALL_REINJECTION_COOLDOWN_TURNS;
+
+          if (isSameResult && isWithinCooldown) {
+            console.log(`[Episodic Memory] recall re-injection guard: same ${episodeIds.length} episode(s), skipping (${turnsSinceLastInjection} turns since last injection)`);
+            const prependSystemContext = anchorPrependText.trim();
+            return prependSystemContext ? { prependSystemContext } : {};
+          }
+
+          if (currentHash) {
+            state.lastInjectedResultHash = currentHash;
+            state.lastInjectionMessageCount = currentMsgCount;
+          }
+          // ── 再注入防止終了 ──
+
           const status: PrependSystemContextStatus =
             recallOutcome.reason === "injected"
               ? (recallOutcome.truncatedEpisodeCount > 0 ? "truncated" : "injected")
@@ -823,7 +832,8 @@ const episodicClawPlugin = {
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
           try {
-            clearRecallCache(state);
+            state.lastInjectedResultHash = "";
+            state.lastInjectionMessageCount = 0;
             await state.segmenter.processTurn(msgs, agentWs, agentId);
             // [Fix D-3] setMeta rate-limit: フォールバック連発時の spam を抑制
             const nowMeta = Date.now();
@@ -831,7 +841,8 @@ const episodicClawPlugin = {
               await rpcClient.setMeta("last_activity", nowMeta.toString(), agentWs);
               state.lastSetMetaTime = nowMeta;
             }
-            clearRecallCache(state);
+            state.lastInjectedResultHash = "";
+            state.lastInjectionMessageCount = 0;
           } catch (err) {
             console.error("[Episodic Memory] Error processing ingest:", err);
           }
