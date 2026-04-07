@@ -3,11 +3,12 @@ package vector
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"episodic-core/internal/logger"
 
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
@@ -29,7 +30,7 @@ func openLexicalIndex(dbDir string) (bleve.Index, error) {
 	// Create new index
 	mapping := bleve.NewIndexMapping()
 	docMapping := bleve.NewDocumentMapping()
-	
+
 	// Create a text field mapping
 	textFieldMapping := bleve.NewTextFieldMapping()
 	// Currently using standard analyzer due to CJK needing special dependencies.
@@ -68,14 +69,14 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 				UpperBound: []byte("sys_lexq;"), // ; is after :
 			})
 			if err != nil {
-				log.Printf("[LexicalWorker] Failed to create iter: %v", err)
+				logger.Info(logger.CatLexical, "Failed to create iter: %v", err)
 				timer.Reset(pollInterval)
 				continue
 			}
 
 			// Read up to 1000 tasks
 			batchKeys := make([][]byte, 0, 1000)
-			
+
 			type lexTask struct {
 				key    []byte
 				action string
@@ -86,7 +87,7 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 			for iter.First(); iter.Valid() && len(tasks) < 1000; iter.Next() {
 				keyCopy := append([]byte(nil), iter.Key()...)
 				valCopy := append([]byte(nil), iter.Value()...)
-				
+
 				// parse key sys_lexq:{ts}:{id}
 				parts := strings.SplitN(string(keyCopy), ":", 3)
 				if len(parts) == 3 {
@@ -119,15 +120,15 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 				timer.Reset(pollInterval)
 				continue
 			}
-			
+
 			pollInterval = 500 * time.Millisecond
 
 			bleveBatch := s.lexical.NewBatch()
-			
+
 			for _, task := range tasks {
 				batchKeys = append(batchKeys, task.key)
 				action := task.action
-				
+
 				if action == "ADD" || action == "UPDATE" {
 					epKey := append(append([]byte(nil), prefixEp...), []byte(task.id)...)
 					val, closer, err := s.db.Get(epKey)
@@ -135,17 +136,17 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 						bleveBatch.Delete(task.id)
 						continue
 					} else if err != nil {
-						log.Printf("[LexicalWorker] Error reading record %s: %v", task.id, err)
+						logger.Info(logger.CatLexical, "Error reading record %s: %v", task.id, err)
 						continue
 					}
-					
+
 					var rec EpisodeRecord
 					err = msgpack.Unmarshal(val, &rec)
 					closer.Close()
 					if err != nil {
 						continue
 					}
-					
+
 					// Pollution control
 					if rec.PruneState == "merged" || rec.PruneState == "tombstone" {
 						bleveBatch.Delete(task.id)
@@ -158,13 +159,13 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 							content += "\n\n" + string(bytes)
 						}
 					}
-		
+
 					data := struct {
 						Content string `json:"Content"`
 					}{Content: content}
-					
+
 					if err := bleveBatch.Index(task.id, data); err != nil {
-						log.Printf("[LexicalEngine] Failed to add index command for %s: %v", task.id, err)
+						logger.Info(logger.CatLexical, "Failed to add index command for %s: %v", task.id, err)
 					}
 				} else if action == "DELETE" {
 					bleveBatch.Delete(task.id)
@@ -173,7 +174,7 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 
 			// Try Commit to Bleve
 			if err := s.lexical.Batch(bleveBatch); err != nil {
-				log.Printf("[LexicalWorker] Failed to commit bleve batch: %v (Backing off %v)", err, backoff)
+				logger.Info(logger.CatLexical, "Failed to commit bleve batch: %v (Backing off %v)", err, backoff)
 				time.Sleep(backoff)
 				backoff *= 2
 				if backoff > maxBackoff {
@@ -189,10 +190,10 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 				dbBatch.Delete(k, nil)
 			}
 			if err := dbBatch.Commit(pebble.Sync); err != nil {
-				log.Printf("[LexicalWorker] Failed to clear DB WAL queue: %v", err)
+				logger.Info(logger.CatLexical, "Failed to clear DB WAL queue: %v", err)
 			}
 			dbBatch.Close()
-			
+
 			backoff = 1 * time.Second
 			if len(tasks) == 1000 {
 				timer.Reset(1 * time.Millisecond) // immediate

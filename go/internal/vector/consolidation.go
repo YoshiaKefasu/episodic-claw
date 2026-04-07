@@ -13,6 +13,7 @@ import (
 
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
+	"episodic-core/internal/logger"
 
 	"golang.org/x/time/rate"
 )
@@ -21,7 +22,7 @@ import (
 // It finds all unarchived D0 episodes, clusters them, generates D1 summaries using Gemma,
 // archives the D0 nodes, and adds semantic edges.
 func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore *Store, gemmaLimiter *rate.Limiter, embedLimiter *rate.Limiter) error {
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Starting Consolidation Job...\n")
+	logger.Info(logger.CatConsolidation, "Starting Consolidation Job...\n")
 
 	d0Nodes, err := collectActiveD0Nodes(vstore)
 	if err != nil {
@@ -29,11 +30,11 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 	}
 
 	if len(d0Nodes) == 0 {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] No unarchived D0 nodes found. Exiting.\n")
+		logger.Info(logger.CatConsolidation, "No unarchived D0 nodes found. Exiting.\n")
 		return nil
 	}
 
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Found %d unarchived D0 nodes to process.\n", len(d0Nodes))
+	logger.Info(logger.CatConsolidation, "Found %d unarchived D0 nodes to process.\n", len(d0Nodes))
 
 	llmRaw := ai.NewGoogleStudioProvider(apiKey, "gemma-3-27b-it")
 	embedRaw := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
@@ -48,7 +49,7 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 	if err != nil {
 		return fmt.Errorf("failed to build consolidation clusters: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Built %d consolidation cluster(s).\n", len(clusters))
+	logger.Info(logger.CatConsolidation, "Built %d consolidation cluster(s).\n", len(clusters))
 
 	existingKeys, err := loadExistingConsolidationKeys(vstore)
 	if err != nil {
@@ -57,16 +58,16 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 
 	for _, cluster := range clusters {
 		if err := processCluster(ctx, cluster, agentWs, vstore, llm, embed, cfg, existingKeys); err != nil {
-			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error processing cluster: %v\n", err)
+			logger.Info(logger.CatConsolidation, "Error processing cluster: %v\n", err)
 		}
 	}
 
 	// Run RefineSemanticEdges after D1 creation
 	if err := RefineSemanticEdges(agentWs, vstore); err != nil {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] RefineSemanticEdges error: %v\n", err)
+		logger.Info(logger.CatConsolidation, "RefineSemanticEdges error: %v\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Consolidation Job Completed.\n")
+	logger.Info(logger.CatConsolidation, "Consolidation Job Completed.\n")
 	return nil
 }
 
@@ -81,7 +82,7 @@ func processCluster(
 	existingKeys map[string]string,
 ) error {
 	if existingID := strings.TrimSpace(existingKeys[cluster.Fingerprint]); existingID != "" {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] Reusing existing D1 %s for fingerprint %s\n", existingID, cluster.Fingerprint)
+		logger.Info(logger.CatConsolidation, "Reusing existing D1 %s for fingerprint %s\n", existingID, cluster.Fingerprint)
 		_, selectedRecords, _, err := prepareClusterInputs(cluster, cfg, vstore)
 		if err != nil {
 			return err
@@ -235,7 +236,7 @@ Return ONLY the title text, nothing else.
 	_ = vstore.PromoteReplayStateToParent(childrenIDs, d1Slug, now)
 	existingKeys[cluster.Fingerprint] = d1Slug
 
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Generated D1: %s\n", d1Slug)
+	logger.Info(logger.CatConsolidation, "Generated D1: %s\n", d1Slug)
 	return linkClusterChildren(selectedRecords, d1Slug, vstore)
 }
 
@@ -279,7 +280,7 @@ func prepareClusterInputs(cluster d1ConsolidationCluster, cfg d1ClusterConfig, v
 		}
 		body := strings.TrimSpace(doc.Body)
 		if body == "" {
-			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Skipping empty D0 body for %s\n", rec.ID)
+			logger.Info(logger.CatConsolidation, "Skipping empty D0 body for %s\n", rec.ID)
 			quarantineConsolidationRecord(vstore, rec, "empty body")
 			continue
 		}
@@ -350,7 +351,7 @@ func linkClusterChildren(children []EpisodeRecord, parentID string, vstore *Stor
 					d0Doc.Metadata.RelatedTo = append(d0Doc.Metadata.RelatedTo, newEdge)
 				}
 				if err := frontmatter.Serialize(sourcePath, d0Doc); err != nil {
-					fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error serializing D0 node %s: %v\n", sourcePath, err)
+					logger.Info(logger.CatConsolidation, "Error serializing D0 node %s: %v\n", sourcePath, err)
 				}
 			}
 		}
@@ -367,7 +368,7 @@ func linkClusterChildren(children []EpisodeRecord, parentID string, vstore *Stor
 			rec.CanonicalParent = parentID
 			return nil
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[SleepConsolidation] Error updating D0 node %s: %v\n", cid, err)
+			logger.Info(logger.CatConsolidation, "Error updating D0 node %s: %v\n", cid, err)
 		}
 	}
 	return nil
@@ -475,7 +476,7 @@ func aggregateClusterTopics(cluster []EpisodeRecord) []string {
 // RefineSemanticEdges finds pairs of D1 nodes that are close in vector space
 // and links them with a "semantic" edge.
 func RefineSemanticEdges(agentWs string, vstore *Store) error {
-	fmt.Fprintf(os.Stderr, "[RefineSemantic] Checking semantic associations...\n")
+	logger.Info(logger.CatConsolidation, "Checking semantic associations...\n")
 
 	d1Nodes, err := vstore.ListByTag("d1-summary")
 	if err != nil {
@@ -537,7 +538,7 @@ func RefineSemanticEdges(agentWs string, vstore *Store) error {
 					rec.Edges = append(rec.Edges, newEdge)
 					return nil
 				}); err != nil {
-					fmt.Fprintf(os.Stderr, "[RefineSemantic] UpdateRecord failed for %s: %v\n", n1.ID, err)
+					logger.Info(logger.CatConsolidation, "UpdateRecord failed for %s: %v\n", n1.ID, err)
 					continue
 				}
 
@@ -556,17 +557,17 @@ func RefineSemanticEdges(agentWs string, vstore *Store) error {
 						if !fileHasEdge {
 							doc.Metadata.RelatedTo = append(doc.Metadata.RelatedTo, newEdge)
 							if err := frontmatter.Serialize(sourcePath, doc); err != nil {
-								fmt.Fprintf(os.Stderr, "[RefineSemantic] Error serializing node %s: %v\n", sourcePath, err)
+								logger.Info(logger.CatConsolidation, "Error serializing node %s: %v\n", sourcePath, err)
 							}
 						}
 					} else {
 						// In-memory edge was added but disk write skipped.
 						// DB and .md file are temporarily inconsistent until next HealingWorker pass.
-						fmt.Fprintf(os.Stderr, "[RefineSemantic] Parse failed for %s: %v (in-memory edge added, disk skipped)\n", sourcePath, docErr)
+						logger.Info(logger.CatConsolidation, "Parse failed for %s: %v (in-memory edge added, disk skipped)\n", sourcePath, docErr)
 					}
 				}
 
-				fmt.Fprintf(os.Stderr, "[RefineSemantic] Linked %s <-> %s\n", n1.ID, idStr)
+				logger.Info(logger.CatConsolidation, "Linked %s <-> %s\n", n1.ID, idStr)
 			}
 		}
 	}

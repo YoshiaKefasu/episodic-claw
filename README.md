@@ -12,7 +12,7 @@ English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 
 Conversations are saved locally. When you chat, it searches past history by "meaning" instead of just keyword matching, and slips the right memories into the AI's prompt before it even replies. This makes OpenClaw actually remember what you talked about last week without you having to re-explain it.
 
-With the `v0.3.5` era, the engine took a massive architectural leap. Instead of wrestling to compress memories ourselves, we now fully delegate the heavy-lifting of compaction back to OpenClaw's native LLM. But to ensure zero context loss, we use stealthy "Hooks". Right before memory is wiped, the `before_compaction` hook saves everything. The AI can also proactively write an `ep-anchor` throughout the chat. Once compaction wipes the mental slate clean, we secretly inject that anchor right back into the active prompt via the `after_compaction` hook so the AI never misses a beat.
+With the `v0.3.5` era, the engine took a massive architectural leap. Instead of wrestling to compress memories ourselves, we now fully delegate the heavy-lifting of compaction back to OpenClaw's native LLM. But to ensure zero context loss, we use automatic "Lifecycle Hooks". Right before memory is wiped, the `before_compaction` hook saves everything. The AI can also proactively write an `ep-anchor` throughout the chat. Once compaction wipes the mental slate clean, we seamlessly inject that anchor right back into the active prompt via the `after_compaction` hook so the AI never misses a beat.
 
 Plus, background memories now perfectly match your native language! If you chat in Japanese, the AI's internal long-term memories stay in Japanese. We also added a smart 24-turn cooldown guard so the AI doesn't spam itself with the exact same memory over and over.
 
@@ -30,13 +30,13 @@ Because of this split, **TypeScript smoothly runs the show while Go does the man
 
 ## <img src="./assets/icons/workflow.svg" width="24" align="center" alt="" /> How It Works
 
-Every time you send a message, it quickly looks up important past memories and whispers them to the AI before it replies.
+Every time you send a message, it quickly looks up important past memories and provides them as context to the AI before it replies.
 
 1. **Step 1 — You send a message.**
 2. **Step 2 — `before_prompt_build` fires.** The plugin intercepts the turn, takes the last few messages, and builds a "search theme."
 3. **Step 3 — Go sidecar embeds that query.** It hits the Gemini API to turn your text into a vector (a massive list of numbers that represents meaning).
 4. **Step 4 — Dual Search (Lexical + Semantic).** First, a super-fast text indexer (Bleve) throws out totally irrelevant garbage. Then, a crazy math algorithm (HNSW) finds the memories with the exact same *meaning* as your current chat.
-5. **Step 5 — Memory Injection.** The best matches are ranked and secretly slipped into the AI's system prompt within a strict token budget. To save tokens, an intelligent **24-turn cooldown** makes sure the same memory isn't repeatedly injected back-to-back. So when the AI reads your message, it already says "Oh right, we talked about this!"
+5. **Step 5 — Memory Injection.** The best matches are ranked and automatically prepended to the AI's system prompt within a strict token budget. To save tokens, an intelligent **24-turn cooldown** makes sure the same memory isn't repeatedly injected back-to-back. So when the AI reads your message, it already says "Oh right, we talked about this!"
 
 ```mermaid
 sequenceDiagram
@@ -96,15 +96,15 @@ Because of this, your memories don't mush into one giant, pointless blob.
 
 ## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.3.5 so insane (Delegation & Refinement Era)
 
-We completely rethought the architecture here. Trying to do "everything" ourselves was dropping the big picture. Now, we delegate the heavy lifting to the Host, and focus purely on being a stealthy memory bodyguard.
+We completely rethought the architecture here. Trying to do "everything" ourselves was dropping the big picture. Now, we delegate the heavy lifting to the Host, and focus purely on being a reliable memory bodyguard.
 
-- **Delegated Compaction & Ninja Hooks**: `episodic-claw` no longer hogs the compaction cycle. OpenClaw handles the heavy LLM crunching natively. We use a `before_compaction` hook to intercept the process 1ms before it gets wiped, and safely freeze all unsaved chats into the DB.
+- **Delegated Compaction & Automatic Hooks**: `episodic-claw` no longer hogs the compaction cycle. OpenClaw handles the heavy LLM crunching natively. We use a `before_compaction` hook to intercept the process 1ms before it gets wiped, and safely freeze all unsaved chats into the DB.
 - **Proactive Anchors (`ep-anchor`)**: The Agent can now decide "Oh, this is important" and use the `ep-anchor` tool to write a dense session summary on its own terms, whenever it wants.
-- **Auto-Injection (`after_compaction`)**: Right after OpenClaw wipes the chat window, we sneak back in via the `after_compaction` hook, grab the Anchor the agent wrote, and inject it straight back into the active prompt. The AI literally doesn't even feel the memory wipe.
+- **Auto-Injection (`after_compaction`)**: Right after OpenClaw wipes the chat window, we restore context via the `after_compaction` hook, grab the Anchor the agent wrote, and inject it straight back into the active prompt. The AI literally doesn't even feel the memory wipe.
 - **Native Language Matching**: D1 summaries, titles, and generated topics now strictly respect the language of the source text. Your memories stay in the language you speak!
 - **Smart Recall Cooldown Guard**: To save your agent's context window from getting spammed, the same memory will wait 24 turns before it can be injected again. The AI won't act like a broken record.
 - **Inherited Bulletproof Defense**: All the insane durability from v0.3.0 (WAL queues, rate limit escalation strategies, auto-repair) is still intact. Your memories are safer than ever.
-- **Dropped the Clunky Stuff**: Since the Host now manages the memory limits, we deleted all our clunky "Context Pressure Monitor" logic. The plugin is leaner, meaner, and completely driven by stealthy hooks (`before_prompt_build`).
+- **Dropped the Clunky Stuff**: Since the Host now manages the memory limits, we deleted all our clunky "Context Pressure Monitor" logic. The plugin is leaner, meaner, and completely driven by automatic hooks (`before_prompt_build`).
 
 
 > (**Special Thanks: lossless-claw**) The insane paranoic resilience in v0.3.0—the auto-repairing transcripts and the never-surrender rate limit handling (Phase 7)—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.

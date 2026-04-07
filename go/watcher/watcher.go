@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"episodic-core/internal/logger"
+
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -178,7 +180,7 @@ func (w *Watcher) Start() {
 				if !ok {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[Watcher] Error: %v\n", err)
+				logger.Warn(logger.CatWatcher, "Error: %v", err)
 			case <-w.Done:
 				w.fw.Close()
 				return

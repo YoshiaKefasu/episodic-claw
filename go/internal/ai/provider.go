@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"episodic-core/internal/logger"
 
 	"golang.org/x/time/rate"
 )
@@ -26,8 +27,8 @@ type LLMProvider interface {
 // APIError represents an HTTP error from an API provider.
 // Callers can type-assert to inspect the status code and decide whether to retry.
 type APIError struct {
-	StatusCode    int
-	Body          string
+	StatusCode int
+	Body       string
 	// RetryAfterDur is the server-mandated wait duration from the Retry-After response header.
 	// Set exclusively via WithRetryAfter() by google_studio.go; callers should use RetryAfter() method.
 	// Exported (P3) to allow direct field inspection in tests and structured logging.
@@ -118,7 +119,7 @@ func (r *RetryEmbedder) EmbedContent(ctx context.Context, text string) ([]float3
 		if ra := apiErr.RetryAfter(); ra > 0 {
 			wait = ra
 		}
-		fmt.Fprintf(os.Stderr, "[RetryEmbedder] HTTP %d (attempt %d/%d), retrying after %v\n",
+		logger.Warn(logger.CatAI, "[RetryEmbedder] HTTP %d (attempt %d/%d), retrying after %v",
 			apiErr.StatusCode, attempt+1, r.MaxRetries, wait)
 
 		select {
@@ -164,7 +165,7 @@ func (r *RetryLLM) GenerateText(ctx context.Context, prompt string) (string, err
 		if ra := apiErr.RetryAfter(); ra > 0 {
 			wait = ra
 		}
-		fmt.Fprintf(os.Stderr, "[RetryLLM] HTTP %d (attempt %d/%d), retrying after %v\n",
+		logger.Warn(logger.CatAI, "[RetryLLM] HTTP %d (attempt %d/%d), retrying after %v",
 			apiErr.StatusCode, attempt+1, r.MaxRetries, wait)
 
 		select {

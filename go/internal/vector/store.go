@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+
 	"math"
 	"os"
 	"path/filepath"
@@ -22,6 +22,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 
 	"episodic-core/frontmatter"
+	"episodic-core/internal/logger"
 )
 
 // EpisodeRecord encapsulates metadata and the raw embedding for persistent storage.
@@ -104,10 +105,10 @@ type ScoredEpisode struct {
 	TopicsFallback      bool          `json:"topicsFallback,omitempty"`
 	// MatchedBy is closer to scoring provenance than raw candidate origin:
 	// "both" means lexical entry plus semantic score both influenced the final item.
-	MatchedBy           string        `json:"matchedBy,omitempty"`
-	FallbackReason      string        `json:"fallbackReason,omitempty"`
-	CandidateRank       int           `json:"candidateRank,omitempty"`
-	Rank                int           `json:"rank,omitempty"`
+	MatchedBy      string `json:"matchedBy,omitempty"`
+	FallbackReason string `json:"fallbackReason,omitempty"`
+	CandidateRank  int    `json:"candidateRank,omitempty"`
+	Rank           int    `json:"rank,omitempty"`
 }
 
 // Watermark tracks the ingestion progress in the session.
@@ -122,16 +123,17 @@ type StoreConfig struct {
 }
 
 type Store struct {
-	config        StoreConfig
-	db            *pebble.DB
-	graph         *hnsw.Hnsw
-	topicIndex    map[string]map[string]struct{}
-	activeD0Index map[string]time.Time
-	lexical       bleve.Index
-	lexicalCancel context.CancelFunc
-	mutex         sync.RWMutex
-	maxID         uint32
-	IsRefining    atomic.Bool
+	config            StoreConfig
+	db                *pebble.DB
+	graph             *hnsw.Hnsw
+	topicIndex        map[string]map[string]struct{}
+	activeD0Index     map[string]time.Time
+	lexical           bleve.Index
+	lexicalCancel     context.CancelFunc
+	mutex             sync.RWMutex
+	maxID             uint32
+	IsRefining        atomic.Bool
+	rebuildInProgress atomic.Bool
 }
 
 // Prefix bytes for Pebble keys
@@ -155,17 +157,17 @@ func NewStore(dbDir string, cfg StoreConfig) (*Store, error) {
 	if err != nil {
 		errStr := strings.ToLower(err.Error())
 		if strings.Contains(errStr, "lock") || strings.Contains(errStr, "resource temporarily unavailable") || strings.Contains(errStr, "being used by another process") || strings.Contains(errStr, "in use") {
-			log.Printf("[Store] ❌ Pebble DB is locked (another instance running or dirty shutdown). Aborting to prevent API limit burst: %v", err)
+			logger.Info(logger.CatStore, "❌ Pebble DB is locked (another instance running or dirty shutdown). Aborting to prevent API limit burst: %v", err)
 			return nil, fmt.Errorf("pebble db is locked: %w", err)
 		}
 
-		log.Printf("[Store] ⚠️ Pebble DB corrupted or incompatible: %v", err)
+		logger.Info(logger.CatStore, "⚠️ Pebble DB corrupted or incompatible: %v", err)
 		corruptedPath := dbPath + ".corrupted." + time.Now().Format("20060102-150405")
-		log.Printf("[Store] 🗑️ Isolating corrupted DB: %s → %s", dbPath, corruptedPath)
+		logger.Info(logger.CatStore, "🗑️ Isolating corrupted DB: %s → %s", dbPath, corruptedPath)
 		if renameErr := os.Rename(dbPath, corruptedPath); renameErr != nil {
 			return nil, fmt.Errorf("db corrupted and isolation failed: %w", renameErr)
 		}
-		log.Printf("[Store] 🔄 Opening fresh DB (rebuild required)...")
+		logger.Info(logger.CatStore, "🔄 Opening fresh DB (rebuild required)...")
 		db, err = pebble.Open(dbPath, &pebble.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to open fresh pebble db after cleanup: %w", err)
@@ -276,7 +278,7 @@ func (s *Store) CleanOrphans() {
 	s.mutex.RUnlock()
 
 	if err != nil {
-		log.Printf("[Store] Orphan cleanup failed to initialize iter: %v", err)
+		logger.Info(logger.CatStore, "Orphan cleanup failed to initialize iter: %v", err)
 		return
 	}
 	defer iter.Close()
@@ -299,7 +301,7 @@ func (s *Store) CleanOrphans() {
 
 	// Now apply changes outside the global scan iterator
 	if len(toDelete) > 0 {
-		log.Printf("[Store] Orphan cleanup: found %d ghost records, deleting...", len(toDelete))
+		logger.Info(logger.CatStore, "Orphan cleanup: found %d ghost records, deleting...", len(toDelete))
 		for _, id := range toDelete {
 			s.Delete(id) // leverages the new pebble.Batch atomic deletion
 		}
@@ -327,7 +329,7 @@ func (s *Store) CleanOrphans() {
 		}
 	}
 	if migrated > 0 {
-		log.Printf("[Store] Orphan cleanup: migrated %d existing records to include p2i reverse index.", migrated)
+		logger.Info(logger.CatStore, "Orphan cleanup: migrated %d existing records to include p2i reverse index.", migrated)
 	}
 }
 
@@ -749,13 +751,13 @@ func (s *Store) DeleteByPaths(paths []string) error {
 		// If it exists, it means a bogus or out-of-order DELETE event arrived (e.g., from an atomic save/rename).
 		// We skip deleting from the DB to preserve the record.
 		if _, err := os.Stat(p); err == nil {
-			log.Printf("[Sync-Guard] Skipped deletion for %s (file physically exists)", p)
+			logger.Warn(logger.CatStore, "Skipped deletion for %s (file physically exists)", p)
 			continue
 		}
 
 		// Proceed with deletion since file is truly gone.
 		if err := s.DeleteByPath(p); err != nil {
-			log.Printf("[Store] Batch delete failed for %s: %v", p, err)
+			logger.Info(logger.CatStore, "Batch delete failed for %s: %v", p, err)
 		}
 	}
 
@@ -1170,7 +1172,7 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 				appendCandidateUnique(rawScore{id: hit.ID, dist: -1})
 			}
 		} else if err != nil {
-			log.Printf("[LexicalEngine] Search failed, falling back to HNSW: %v\n", err)
+			logger.Info(logger.CatLexical, "Search failed, falling back to HNSW: %v\n", err)
 		}
 	}
 
@@ -1363,7 +1365,7 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 	}
 
 	if len(scored) == 0 && (fallbackReason != "" || topicsFallback) {
-		log.Printf(
+		logger.Warn(logger.CatStore,
 			"[Recall] empty_result fallbackReason=%s topicsFallback=%t strictTopics=%t lexicalHits=%d candidateCount=%d queryPresent=%t",
 			composeRecallFallbackReason(fallbackReason, topicsFallback),
 			topicsFallback,
@@ -1731,7 +1733,7 @@ func (s *Store) ComputeStage2BatchScores(ctx context.Context) error {
 		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
 			rec.PruneState = "tombstone"
 			rec.TombstonedAt = now
-			log.Printf("[Hippocampus Dry-Run] Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
+			logger.Info(logger.CatStore, "Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
 		}
 
 		// Write back to DB via batch
@@ -1743,10 +1745,10 @@ func (s *Store) ComputeStage2BatchScores(ctx context.Context) error {
 
 	if updatedCount > 0 {
 		if err := batch.Commit(pebble.Sync); err != nil {
-			log.Printf("ComputeStage2BatchScores: Failed to commit batch: %v", err)
+			logger.Warn(logger.CatStore, "ComputeStage2BatchScores: Failed to commit batch: %v", err)
 			return err
 		}
-		log.Printf("ComputeStage2BatchScores: Successfully updated Stage 2 scores for %d records.", updatedCount)
+		logger.Info(logger.CatStore, "ComputeStage2BatchScores: Successfully updated Stage 2 scores for %d records.", updatedCount)
 	}
 
 	return nil
@@ -1789,12 +1791,71 @@ func (s *Store) RunGarbageCollector(ctx context.Context) error {
 	for _, rec := range deleteList {
 		if rec.SourcePath != "" {
 			if err := os.Remove(rec.SourcePath); err == nil || os.IsNotExist(err) {
-				log.Printf("[Hippocampus GC] Physically deleted tombstone memory file: %s", rec.SourcePath)
+				logger.Info(logger.CatStore, "Physically deleted tombstone memory file: %s", rec.SourcePath)
 			} else {
-				log.Printf("[Hippocampus GC] Failed to delete tombstone file %s: %v", rec.SourcePath, err)
+				logger.Info(logger.CatStore, "Failed to delete tombstone file %s: %v", rec.SourcePath, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// LexicalCount returns the number of documents in the Bleve lexical index.
+func (s *Store) LexicalCount() (uint64, error) {
+	if s.lexical == nil {
+		return 0, nil
+	}
+	return s.lexical.DocCount()
+}
+
+// RebuildInProgress returns the atomic bool guarding concurrent rebuilds.
+func (s *Store) RebuildInProgress() *atomic.Bool {
+	return &s.rebuildInProgress
+}
+
+// RebuildLexicalIndex scans all EpisodeRecord entries in PebbleDB and
+// re-enqueues them into the sys_lexq queue for the lexical worker to
+// index into Bleve. Safe to call on a live store — the worker processes
+// items asynchronously. Uses "UPDATE" action for idempotent upserts.
+func (s *Store) RebuildLexicalIndex() (int, error) {
+	if s.lexical == nil {
+		return 0, fmt.Errorf("lexical index not initialized")
+	}
+
+	// Scope lock narrowly — follow CleanOrphans pattern (store.go:272-277)
+	s.mutex.RLock()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefixEp,
+		UpperBound: []byte("ep;"),
+	})
+	s.mutex.RUnlock()
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	count := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		if rec.SourcePath == "" {
+			continue
+		}
+		if _, err := os.Stat(rec.SourcePath); os.IsNotExist(err) {
+			continue
+		}
+		s.enqueueSysLexq(batch, "UPDATE", rec.ID)
+		count++
+	}
+
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return 0, fmt.Errorf("failed to commit lexical rebuild batch: %w", err)
+	}
+	return count, nil
 }

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.6] - 2026-04-07
+
+### Added
+- **Lexical Index Self-Healing (Pass 5)**: HealingWorker now periodically checks for gaps in the Bleve Lexical index and auto-rebuilds if >10% of records are missing. Configurable via `lexicalRebuildIntervalDays` (default: 7 days).
+- **Cold-Start Ingestion**: On first install, existing `.jsonl` session transcripts are automatically converted to `.md` episodes. Supports multi-agent setups and respects `OPENCLAW_STATE_DIR`. Zero API cost for text-only fallback.
+- **`ai.rebuildLexical` RPC**: Manual trigger for lexical index rebuild via RPC.
+
+### Fixed
+- **Genesis Gap**: Pre-v0.2.1 episode files that were missing from the Lexical index are now automatically re-indexed.
+- **Temp file race condition**: Go sidecar now cleans up temp JSON files after processing, preventing silent data loss.
+- **Tag consistency**: Unified cold-start episode tags to `genesis-archive` across both API-key and zero-API paths.
+
 ## [0.3.5-2] - 2026-04-06
 
 ### Changed

@@ -188,6 +188,7 @@ export class EpisodicCoreClient {
       if (typeof cfg.tombstoneRetentionDays === "number") args.push("-tombstone-ttl", cfg.tombstoneRetentionDays.toString());
       if (cfg.enableBackgroundWorkers === false) args.push("-disable-workers");
       if (typeof cfg.lexicalPreFilterLimit === "number") args.push("-lexical-limit", cfg.lexicalPreFilterLimit.toString());
+      if (typeof cfg.lexicalRebuildIntervalDays === "number") args.push("-lexical-rebuild-interval", cfg.lexicalRebuildIntervalDays.toString());
     }
 
     if (usePrebuilt) {
@@ -729,3 +730,144 @@ export class FileEventDebouncer {
     }
   }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cold-Start Ingestion Helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * parseJsonlToMessages reads a .jsonl session file and extracts user/assistant messages.
+ * Handles both string and array-of-objects content formats.
+ */
+export function parseJsonlToMessages(sessionFile: string): Array<{ role: string; content: string }> {
+  const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
+  const messages: Array<{ role: string; content: string }> = [];
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type !== "message" || entry.message?.role === "system") continue;
+
+      const role = entry.message.role;
+      const rawContent = entry.message.content;
+      let text = "";
+
+      if (typeof rawContent === "string") {
+        text = rawContent;
+      } else if (Array.isArray(rawContent)) {
+        text = rawContent
+          .filter((c: any) => c.type === "text")
+          .map((c: any) => c.text)
+          .join("\n");
+      }
+
+      if (text.trim()) {
+        messages.push({ role, content: text });
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return messages;
+}
+
+/**
+ * ingestColdStartSession converts a .jsonl session into .md episodes via the existing pipeline.
+ * If API key is available, it uses triggerBackgroundIndex (high quality).
+ * If not, it falls back to direct .md file creation (text-only, zero API cost).
+ */
+export async function ingestColdStartSession(
+  sessionFile: string,
+  agentWs: string,
+  client: EpisodicCoreClient,
+  hasApiKey: boolean
+): Promise<number> {
+  const messages = parseJsonlToMessages(sessionFile);
+  if (messages.length === 0) return 0;
+
+  const chunkSize = 50;
+  const chunks: typeof messages[] = [];
+  for (let i = 0; i < messages.length; i += chunkSize) {
+    chunks.push(messages.slice(i, i + chunkSize));
+  }
+
+  if (hasApiKey) {
+    // High-quality path: use existing processBacklogFile pipeline
+    const tempDir = path.join(os.tmpdir(), `episodic-claw-coldstart-${Date.now()}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    for (let i = 0; i < chunks.length; i++) {
+      const tempFile = path.join(tempDir, `chunk-${i}.json`);
+      fs.writeFileSync(tempFile, JSON.stringify(chunks[i].map(m => ({ role: m.role, content: m.content }))));
+      await client.triggerBackgroundIndex([tempFile], agentWs);
+    }
+
+    // Cleanup temp files
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  } else {
+    // Zero-API fallback: create .md files directly
+    const now = new Date();
+    const dateDir = path.join(agentWs,
+      String(now.getFullYear()),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"));
+    fs.mkdirSync(dateDir, { recursive: true });
+
+    for (let i = 0; i < chunks.length; i++) {
+      const body = chunks[i].map(m => `${m.role}: ${m.content}`).join("\n\n");
+      const slug = `genesis-chunk-${String(i).padStart(4, "0")}`;
+      const mdPath = path.join(dateDir, `${slug}.md`);
+
+      const fm = [
+        "---",
+        `id: ${slug}`,
+        `title: "Genesis Session Chunk ${i + 1}"`,
+        `tags: [genesis-archive]`,
+        `saved_by: auto`,
+        "---",
+        "",
+        body
+      ].join("\n");
+
+      fs.writeFileSync(mdPath, fm, "utf8");
+    }
+  }
+
+  return messages.length;
+}
+
+/**
+ * resolveSessionFile attempts to find the active session.jsonl file for the specific agent.
+ * It respects OPENCLAW_STATE_DIR and legacy .clawdbot paths.
+ */
+export function resolveSessionFile(agentId: string): string | null {
+  // 1. Resolve State Directory (respecting env vars and legacy paths)
+  const stateDir = process.env.OPENCLAW_STATE_DIR
+    ? process.env.OPENCLAW_STATE_DIR
+    : path.join(os.homedir(), ".openclaw");
+
+  const sessionsDir = path.join(stateDir, "agents", agentId, "sessions");
+  
+  if (!fs.existsSync(sessionsDir)) return null;
+
+  try {
+    const files = fs.readdirSync(sessionsDir).filter(f => f.endsWith(".jsonl"));
+    if (files.length > 0) {
+      // Return the most recently modified file
+      files.sort((a, b) => {
+        const statA = fs.statSync(path.join(sessionsDir, a)).mtimeMs;
+        const statB = fs.statSync(path.join(sessionsDir, b)).mtimeMs;
+        return statB - statA;
+      });
+      return path.join(sessionsDir, files[0]);
+    }
+  } catch {
+    // Ignore permission errors etc.
+  }
+  return null;
+}
+
+// Set to track ingested sessions and prevent duplicates
+export const ingestedSessions = new Set<string>();

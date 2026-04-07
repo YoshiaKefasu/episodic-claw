@@ -3,7 +3,7 @@ import * as os from "os";
 import * as fs from "fs";
 import { createHash } from "crypto";
 import { Type } from "@sinclair/typebox";
-import { EpisodicCoreClient, FileEventDebouncer } from "./rpc-client";
+import { EpisodicCoreClient, FileEventDebouncer, resolveSessionFile, ingestColdStartSession, ingestedSessions } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
@@ -353,6 +353,15 @@ const PluginConfigSchema = Type.Object(
     recallTopicsMissingPenalty: Type.Optional(Type.Number({
       description: "Recall calibration: penalty when the record has no topics at all. Usually zero."
     })),
+    recallReInjectionCooldownTurns: Type.Optional(Type.Integer({
+      minimum: 0,
+      description: "Minimum total message turns before the same recalled episode set may be re-injected. Default: 24."
+    })),
+    lexicalRebuildIntervalDays: Type.Optional(Type.Integer({
+      minimum: 1,
+      maximum: 30,
+      description: "How often the HealingWorker checks for gaps in the Lexical index. Default: 7 days."
+    })),
   },
   { additionalProperties: false }
 );
@@ -588,6 +597,51 @@ const episodicClawPlugin = {
           const debouncer = getDebouncerForWorkspace(matched);
           debouncer.push(event);
         };
+
+        // ─── Cold-Start Ingestion ────────────────────────────────────────────────
+        // On first install, ingest existing .jsonl session into .md episodes.
+        // Fire-and-forget to avoid blocking startup.
+        (async () => {
+          // Get all configured agent IDs
+          const cfgAgents = openClawGlobalConfig?.agents;
+          const allAgentIds = cfgAgents?.list?.map((a: any) => a.id) ?? [defaultAgentId];
+
+          for (const targetAgentId of allAgentIds) {
+            const agentResolution = resolveAgentWorkspaces({ agentId: targetAgentId }, openClawGlobalConfig);
+            const { agentWs, agentId } = agentResolution;
+            if (!agentWs || !agentId) continue;
+            const sessionKey = `${agentId}`;
+            if (ingestedSessions.has(sessionKey)) continue;
+
+            // 永続チェック: 既に .md ファイルが存在する場合は「構築済み」とみなしてスキップ
+            try {
+              if (fs.existsSync(agentWs)) {
+                const entries = fs.readdirSync(agentWs, { withFileTypes: true });
+                const hasExistingEpisodes = entries.some(e => e.isDirectory() && /^\d{4}$/.test(e.name));
+                if (hasExistingEpisodes) {
+                  console.log(`[Episodic Memory] Cold-Start: episodes directory already exists for ${agentId}, skipping.`);
+                  ingestedSessions.add(sessionKey);
+                  continue;
+                }
+              }
+            } catch {
+              // Ignore permission errors
+            }
+
+            const sessionFile = resolveSessionFile(agentId);
+            if (!sessionFile) continue;
+
+            const hasApiKey = !!process.env.GEMINI_API_KEY;
+            console.log(`[Episodic Memory] Cold-Start: found session file ${sessionFile} for ${agentId} (API key: ${hasApiKey ? "yes" : "no"})`);
+            try {
+              const msgCount = await ingestColdStartSession(sessionFile, agentWs, rpcClient, hasApiKey);
+              console.log(`[Episodic Memory] Cold-Start: ingested ${msgCount} messages from session for ${agentId}.`);
+              ingestedSessions.add(sessionKey);
+            } catch (err) {
+              console.error(`[Episodic Memory] Cold-Start ingestion failed for ${agentId}:`, err);
+            }
+          }
+        })();
       });
 
       api.on("gateway_stop", async (event?: any, _ctx?: any) => {

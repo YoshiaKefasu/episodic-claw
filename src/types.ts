@@ -86,6 +86,9 @@ export interface EpisodicPluginConfig {
    *  Counts all messages (user + assistant). Default: 10 (≈5 user + 5 assistant turns).
    *  Set to 0 to disable the guard. */
   recallReInjectionCooldownTurns?: number;
+  /** How often the HealingWorker checks for gaps in the Lexical (Bleve) index and auto-rebuilds.
+   *  Default: 7 days. Set to 1-30. */
+  lexicalRebuildIntervalDays?: number;
 }
 
 export interface RecallCalibration {

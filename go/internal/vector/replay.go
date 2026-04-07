@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
+	"episodic-core/internal/logger"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/vmihailenco/msgpack/v5"
@@ -532,7 +532,6 @@ func (s *Store) ListDueReplayCandidates(now time.Time, limit int) ([]ReplayCandi
 			return nil
 		}
 
-
 		state, ok, err := s.GetReplayState(rec.ID)
 		if err != nil {
 			return err
@@ -635,7 +634,7 @@ Desired retention: %.2f
 }
 
 func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vstore *Store, limiter *rate.Limiter) error {
-	fmt.Fprintf(os.Stderr, "[ReplayScheduler] Starting replay scheduler for %s\n", agentWs)
+	logger.Info(logger.CatBackground, "Starting replay scheduler for %s\n", agentWs)
 
 	startedAt := time.Now()
 	now := startedAt
@@ -644,7 +643,7 @@ func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vsto
 		return fmt.Errorf("failed to list replay candidates: %w", err)
 	}
 	if len(candidates) == 0 {
-		fmt.Fprintf(os.Stderr, "[ReplayScheduler] No due replay candidates for %s\n", agentWs)
+		logger.Info(logger.CatBackground, "No due replay candidates for %s\n", agentWs)
 		summary := ReplayRunSummary{
 			WorkspaceID:   agentWs,
 			StartedAt:     startedAt,
@@ -717,16 +716,16 @@ func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vsto
 				DueLagSeconds: int64(time.Since(cand.State.DueAt).Seconds()),
 			}
 			if err := vstore.ApplyReplayObservation(obs); err != nil {
-				fmt.Fprintf(os.Stderr, "[ReplayScheduler] Failed to apply observation for %s: %v\n", cand.Record.ID, err)
+				logger.Info(logger.CatBackground, "Failed to apply observation for %s: %v\n", cand.Record.ID, err)
 				summary.ErrorCount++
 				return
 			}
 			if reviewErr != nil {
-				fmt.Fprintf(os.Stderr, "[ReplayScheduler] Replay review failed for %s: %v\n", cand.Record.ID, reviewErr)
+				logger.Info(logger.CatBackground, "Replay review failed for %s: %v\n", cand.Record.ID, reviewErr)
 				summary.ErrorCount++
 				return
 			}
-			fmt.Fprintf(os.Stderr, "[ReplayScheduler] Reviewed %s (%s)\n", cand.Record.ID, cand.Class)
+			logger.Info(logger.CatBackground, "Reviewed %s (%s)\n", cand.Record.ID, cand.Class)
 		}()
 	}
 

@@ -628,7 +628,7 @@ async function runGatewayStartSmoke(): Promise<void> {
   const agentWs = path.join(agentRoot, "episodes");
   const nestedFile = path.join(agentWs, "episodes", "2026", "03", "31", "legacy_backlog_20260331_000001.md");
   const quarantineRoot = path.join(agentRoot, ".episodic-quarantine");
-  const logPath = path.join(os.tmpdir(), "episodic-core.log");
+  const logPath = path.join(os.tmpdir(), "episodic-claw", new Date().toISOString().split("T")[0] + ".log");
   const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-runtime-"));
   const runtimeDist = path.join(runtimeRoot, "dist");
   const runtimeGo = path.join(runtimeRoot, "go");
@@ -720,9 +720,9 @@ async function runGatewayStartSmoke(): Promise<void> {
     const logText = await waitForLogContains(logPath, [
       "Legacy nested episode tree isolated at",
       "Vector store is empty for",
-      "triggering Auto-Rebuild from Markdown",
-      "HealingWorker: [Pass 3] Starting Stage 2 Batch Score update...",
-      "HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)...",
+      "Auto-Rebuild from Markdown",
+      "HealingWorker: [Pass 3] Starting Stage 2 Batch Score update",
+      "HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)",
     ]);
 
     assert.ok(!fs.existsSync(nestedFile), "nested tree should be removed from the active workspace");
@@ -776,8 +776,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.5-2", "package.json version should be 0.3.5-2");
-  assert.equal(manifest.version, "0.3.5-2", "openclaw.plugin.json version should be 0.3.5-2");
+  assert.equal(pkg.version, "0.3.6", "package.json version should be 0.3.6");
+  assert.equal(manifest.version, "0.3.6", "openclaw.plugin.json version should be 0.3.6");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -798,7 +798,7 @@ async function main() {
     !("compactionPrompt" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose compactionPrompt"
   );
-  assert.match(changelog, /\[0\.3\.5-2\]/, "CHANGELOG should mention v0.3.5-2");
+  assert.match(changelog, /\[0\.3\.6\]/, "CHANGELOG should mention v0.3.6");
   assert.match(
     planSource,
     /5\.1\) freshness contract[\s\S]*eventual freshness/,

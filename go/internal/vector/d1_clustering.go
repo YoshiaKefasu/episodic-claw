@@ -5,12 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"episodic-core/frontmatter"
+	"episodic-core/internal/logger"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/vmihailenco/msgpack/v5"
@@ -118,14 +118,14 @@ func quarantineConsolidationRecord(vstore *Store, rec EpisodeRecord, reason stri
 	if reason == "" {
 		reason = "unknown"
 	}
-	fmt.Fprintf(os.Stderr, "[SleepConsolidation] Quarantining D0 %s: %s\n", rec.ID, reason)
+	logger.Info(logger.CatConsolidation, "Quarantining D0 %s: %s\n", rec.ID, reason)
 
 	quarantineTags := []string{consolidationSkipTag, consolidationFailedTag}
 	if err := vstore.UpdateRecord(rec.ID, func(target *EpisodeRecord) error {
 		target.Tags = appendUniqueTags(target.Tags, quarantineTags...)
 		return nil
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] Failed to quarantine D0 %s in store: %v\n", rec.ID, err)
+		logger.Info(logger.CatConsolidation, "Failed to quarantine D0 %s in store: %v\n", rec.ID, err)
 	}
 
 	sourcePath := strings.TrimSpace(rec.SourcePath)
@@ -135,13 +135,13 @@ func quarantineConsolidationRecord(vstore *Store, rec EpisodeRecord, reason stri
 
 	doc, err := frontmatter.Parse(sourcePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] Failed to parse quarantined D0 %s for on-disk update: %v\n", rec.ID, err)
+		logger.Info(logger.CatConsolidation, "Failed to parse quarantined D0 %s for on-disk update: %v\n", rec.ID, err)
 		return
 	}
 	doc.Metadata.Tags = appendUniqueTags(doc.Metadata.Tags, quarantineTags...)
 	doc.Metadata.RefineFailed = true
 	if err := frontmatter.Serialize(sourcePath, doc); err != nil {
-		fmt.Fprintf(os.Stderr, "[SleepConsolidation] Failed to serialize quarantined D0 %s: %v\n", rec.ID, err)
+		logger.Info(logger.CatConsolidation, "Failed to serialize quarantined D0 %s: %v\n", rec.ID, err)
 	}
 }
 
@@ -318,8 +318,6 @@ func addScaledVector(dst []float32, src []float32, scale float32) {
 		dst[idx] += src[idx] * scale
 	}
 }
-
-
 
 func estimateNodeTokens(rec EpisodeRecord, cfg d1ClusterConfig) int {
 	estimate := rec.Tokens

@@ -15,6 +15,7 @@ import (
 
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
+	"episodic-core/internal/logger"
 
 	"golang.org/x/time/rate"
 )
@@ -52,11 +53,11 @@ func CleanEpisodeFile(filePath string) bool {
 	// Rewrite with cleaned body
 	doc.Body = cleaned
 	if err := frontmatter.Serialize(filePath, doc); err != nil {
-		fmt.Fprintf(os.Stderr, "[Healing] Failed to rewrite cleaned file %s: %v\n", filePath, err)
+		logger.Error(logger.CatBackground, "Failed to rewrite cleaned file %s: %v\n", filePath, err)
 		return false
 	}
 
-	fmt.Fprintf(os.Stderr, "[Healing] Cleaned Telegram metadata from %s (was %d chars, now %d chars)\n",
+	logger.Error(logger.CatBackground, "Cleaned Telegram metadata from %s (was %d chars, now %d chars)\n",
 		filePath, len(doc.Body), len(cleaned))
 	return true
 }
@@ -84,7 +85,7 @@ func ProcessBackgroundIndexing(filePaths []string, agentWs string, apiKey string
 func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *Store, embedLimiter *rate.Limiter) {
 	doc, err := frontmatter.Parse(filePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[MDIndex] Failed to parse %s: %v\n", filePath, err)
+		logger.Info(logger.CatBackground, "Failed to parse %s: %v\n", filePath, err)
 		return
 	}
 
@@ -93,14 +94,14 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 		// Re-parse after cleaning
 		doc, err = frontmatter.Parse(filePath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[MDIndex] Failed to re-parse cleaned file %s: %v\n", filePath, err)
+			logger.Info(logger.CatBackground, "Failed to re-parse cleaned file %s: %v\n", filePath, err)
 			return
 		}
 	}
 
 	body := strings.TrimSpace(doc.Body)
 	if body == "" {
-		fmt.Fprintf(os.Stderr, "[MDIndex] Skipping empty body: %s\n", filePath)
+		logger.Info(logger.CatBackground, "Skipping empty body: %s\n", filePath)
 		return
 	}
 
@@ -155,11 +156,11 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 		}
 
 		if !metaChanged {
-			fmt.Fprintf(os.Stderr, "[MDIndex] Smart Dedup: body and metadata unchanged for %s — skipping embed\n", filePath)
+			logger.Info(logger.CatBackground, "Smart Dedup: body and metadata unchanged for %s — skipping embed\n", filePath)
 			return
 		}
 
-		fmt.Fprintf(os.Stderr, "[MDIndex] Smart Dedup: metadata changed for %s — updating record without re-embed\n", filePath)
+		logger.Info(logger.CatBackground, "Smart Dedup: metadata changed for %s — updating record without re-embed\n", filePath)
 
 		id := existingRec.ID
 		created := meta.Created
@@ -185,10 +186,10 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 		}
 
 		if delErr := vstore.DeleteByPath(normalizedPath); delErr != nil {
-			fmt.Fprintf(os.Stderr, "[MDIndex] Failed to remove stale record for %s: %v\n", filePath, delErr)
+			logger.Info(logger.CatBackground, "Failed to remove stale record for %s: %v\n", filePath, delErr)
 		}
 		if err := vstore.Add(context.Background(), rec); err != nil {
-			fmt.Fprintf(os.Stderr, "[MDIndex] Failed to update metadata for %s: %v\n", filePath, err)
+			logger.Info(logger.CatBackground, "Failed to update metadata for %s: %v\n", filePath, err)
 		}
 		return
 	}
@@ -200,13 +201,13 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 	waitErr := embedLimiter.Wait(bgCtx)
 	bgCancel()
 	if waitErr != nil {
-		fmt.Fprintf(os.Stderr, "[MDIndex] Rate limiter timeout for %s: %v\n", filePath, waitErr)
+		logger.Info(logger.CatBackground, "Rate limiter timeout for %s: %v\n", filePath, waitErr)
 		return
 	}
 
 	emb, err := provider.EmbedContent(context.Background(), body)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[MDIndex] Embed failed for %s: %v\n", filePath, err)
+		logger.Info(logger.CatBackground, "Embed failed for %s: %v\n", filePath, err)
 		return
 	}
 
@@ -246,16 +247,16 @@ func ProcessMDFileIndex(filePath string, agentWs string, apiKey string, vstore *
 	// If a record already exists for this path, delete it first (Upsert semantics).
 	if fetchErr == nil {
 		if delErr := vstore.DeleteByPath(normalizedPath); delErr != nil {
-			fmt.Fprintf(os.Stderr, "[MDIndex] Failed to remove stale record for %s: %v\n", filePath, delErr)
+			logger.Info(logger.CatBackground, "Failed to remove stale record for %s: %v\n", filePath, delErr)
 		}
 	}
 
 	if err := vstore.Add(context.Background(), rec); err != nil {
-		fmt.Fprintf(os.Stderr, "[MDIndex] Failed to add record for %s: %v\n", filePath, err)
+		logger.Info(logger.CatBackground, "Failed to add record for %s: %v\n", filePath, err)
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "[MDIndex] Indexed %s (hash=%s)\n", filePath, newHash)
+	logger.Info(logger.CatBackground, "Indexed %s (hash=%s)\n", filePath, newHash)
 }
 
 // contentHash returns the first 16 hex characters of the SHA-256 of s.
@@ -265,23 +266,23 @@ func contentHash(s string) string {
 }
 
 func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStudioProvider, limiter *rate.Limiter, vstore *Store) {
-	fmt.Fprintf(os.Stderr, "[Background] Starting index of legacy file: %s\n", filePath)
+	logger.Info(logger.CatBackground, "Starting index of legacy file: %s\n", filePath)
 
 	const maxBacklogBytes = 50 * 1024 * 1024 // 50MB guard against OOM
 	if info, statErr := os.Stat(filePath); statErr == nil && info.Size() > maxBacklogBytes {
-		fmt.Fprintf(os.Stderr, "[Background] Skipping oversized backlog file %s (%d bytes > 50MB)\n", filePath, info.Size())
+		logger.Info(logger.CatBackground, "Skipping oversized backlog file %s (%d bytes > 50MB)\n", filePath, info.Size())
 		return
 	}
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Background] Failed to read backlog file %s: %v\n", filePath, err)
+		logger.Info(logger.CatBackground, "Failed to read backlog file %s: %v\n", filePath, err)
 		return
 	}
 
 	var msgs []BacklogMessage
 	if err := json.Unmarshal(data, &msgs); err != nil {
-		fmt.Fprintf(os.Stderr, "[Background] Failed to parse backlog file %s: %v\n", filePath, err)
+		logger.Info(logger.CatBackground, "Failed to parse backlog file %s: %v\n", filePath, err)
 		return
 	}
 
@@ -307,7 +308,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 		}
 		summary := sb.String()
 		if strings.TrimSpace(summary) == "" {
-			fmt.Fprintf(os.Stderr, "[Background] Skipping empty chunk %d in %s\n", i, filePath)
+			logger.Info(logger.CatBackground, "Skipping empty chunk %d in %s\n", i, filePath)
 			prevVector = nil
 			continue
 		}
@@ -322,7 +323,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 
 		// Idempotency check: Skip if already processed in Pebble DB
 		if rec, err := vstore.Get(slug); err == nil {
-			fmt.Fprintf(os.Stderr, "[Background] Chunk %d (%s) already processed, skipping\n", i, slug)
+			logger.Info(logger.CatBackground, "Chunk %d (%s) already processed, skipping\n", i, slug)
 			prevVector = rec.Vector
 			continue
 		}
@@ -332,13 +333,13 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 		waitErr := limiter.Wait(bgCtx)
 		bgCancel()
 		if waitErr != nil {
-			fmt.Fprintf(os.Stderr, "[Background] Limiter Wait error: %v\n", waitErr)
+			logger.Info(logger.CatBackground, "Limiter Wait error: %v\n", waitErr)
 			continue
 		}
 
 		emb, err := provider.EmbedContent(context.Background(), summary)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Background] Failed to embed chunk %d: %v\n", i, err)
+			logger.Info(logger.CatBackground, "Failed to embed chunk %d: %v\n", i, err)
 			prevVector = nil // Break surprise context chain on embed failure to prevent artificial spike later
 			continue
 		}
@@ -357,7 +358,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 			fmt.Sprintf("%02d", now.Day()))
 
 		if mkErr := os.MkdirAll(dirPath, 0755); mkErr != nil {
-			fmt.Fprintf(os.Stderr, "[Background] Failed to create directory %s: %v\n", dirPath, mkErr)
+			logger.Info(logger.CatBackground, "Failed to create directory %s: %v\n", dirPath, mkErr)
 			continue
 		}
 		outFilePath := filepath.Join(dirPath, slug+".md")
@@ -376,7 +377,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 			Body:     summary,
 		}
 		if err := frontmatter.Serialize(outFilePath, doc); err != nil {
-			fmt.Fprintf(os.Stderr, "[Background] Failed to serialize chunk %s: %v\n", slug, err)
+			logger.Info(logger.CatBackground, "Failed to serialize chunk %s: %v\n", slug, err)
 			continue
 		}
 
@@ -392,7 +393,7 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 			Tokens:     frontmatter.EstimateTokens(summary),
 			Surprise:   surprise,
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[Background] Failed to add %s to vector store: %v\n", slug, err)
+			logger.Info(logger.CatBackground, "Failed to add %s to vector store: %v\n", slug, err)
 			continue
 		}
 
@@ -400,9 +401,14 @@ func processBacklogFile(filePath string, agentWs string, provider *ai.GoogleStud
 		vstore.SetMeta("bg_progress", []byte(bgProgress))
 
 		if (i+1)%10 == 0 || i == len(chunks)-1 {
-			fmt.Fprintf(os.Stderr, "[Background] Progress: %s\n", bgProgress)
+			logger.Info(logger.CatBackground, "Progress: %s\n", bgProgress)
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "[Background] Completed indexing for legacy file %s\n", filePath)
+	logger.Info(logger.CatBackground, "Completed indexing for legacy file %s\n", filePath)
+
+	// Clean up the temp backlog file after processing (fixes race condition with TS-side deletion)
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		logger.Info(logger.CatBackground, "Failed to cleanup temp file %s: %v\n", filePath, err)
+	}
 }

@@ -14,11 +14,13 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
+	"episodic-core/internal/logger"
 	"episodic-core/internal/vector"
 	"episodic-core/watcher"
 	"sync"
@@ -28,9 +30,10 @@ import (
 )
 
 var (
-	tombstoneTTL   *int
-	disableWorkers *bool
-	lexicalLimit   *int
+	tombstoneTTL           *int
+	disableWorkers         *bool
+	lexicalLimit           *int
+	lexicalRebuildInterval *int
 
 	storeMutex      sync.Mutex
 	isConsolidating int32
@@ -61,6 +64,7 @@ func init() {
 	tombstoneTTL = flag.Int("tombstone-ttl", 14, "Days to keep tombstones before deleting")
 	disableWorkers = flag.Bool("disable-workers", false, "Disable background healing and consolidation workers")
 	lexicalLimit = flag.Int("lexical-limit", 1000, "Max lexical pre-filter limit")
+	lexicalRebuildInterval = flag.Int("lexical-rebuild-interval", 7, "Days between lexical index consistency checks")
 }
 
 type recallCacheEntry struct {
@@ -448,43 +452,13 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
-// A global logger writing to file for observability
-var logFile *os.File
-var logger *json.Encoder
-
 func InitLogger() {
-	// Attempt to create /tmp or OS specific temp directory file
-	path := filepath.Join(os.TempDir(), "episodic-core.log")
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		logFile = f
-		logger = json.NewEncoder(f)
-		EmitLog("Observability initialized. Writing structured logs to %s", path)
-	} else {
-		EmitLog("Failed to initialize observability logger: %v", err)
-	}
+	logger.Init()
+	logger.Info(logger.CatCore, "Observability initialized. Writing structured logs to %s", filepath.Join(os.TempDir(), "episodic-claw"))
 }
 
-var logMu sync.Mutex
-
 func EmitLog(format string, a ...interface{}) {
-	msg := fmt.Sprintf("[Episodic-Core] "+format, a...)
-
-	// Always write to stderr so TS can intercept or print
-	fmt.Fprintln(os.Stderr, msg)
-
-	// If file logger is available, write structured JSON payload asynchronously
-	if logger != nil {
-		go func(m string) {
-			logMu.Lock()
-			defer logMu.Unlock()
-			logger.Encode(map[string]interface{}{
-				"timestamp": time.Now().Format(time.RFC3339),
-				"level":     "info",
-				"message":   m,
-			})
-		}(msg)
-	}
+	logger.Info(logger.CatCore, format, a...)
 }
 
 func sendResponse(conn net.Conn, resp RPCResponse) {
@@ -1832,6 +1806,53 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	} else {
 		EmitLog("HealingWorker: [Pass 4] Completed Garbage Collection.")
 	}
+
+	// ----------------------------------------------------
+	// Pass 5: Lexical Consistency Check (Self-Healing)
+	// ----------------------------------------------------
+	// Throttle: check only once per interval (default 7 days)
+	intervalDays := 7
+	if lexicalRebuildInterval != nil {
+		intervalDays = *lexicalRebuildInterval
+	}
+
+	lastCheck, closer, _ := vstore.GetRawMeta([]byte("meta:last_lexical_check"))
+	shouldCheck := true
+	if lastCheck != nil {
+		ts, err := strconv.ParseInt(string(lastCheck), 10, 64)
+		if err == nil && time.Now().Unix()-ts < int64(intervalDays)*86400 {
+			shouldCheck = false
+		}
+	}
+	if closer != nil {
+		closer.Close()
+	}
+
+	if shouldCheck {
+		total := vstore.Count()
+		lexical, _ := vstore.LexicalCount()
+
+		// If >10% missing (conservative threshold since Count() returns maxID)
+		if total > 0 && lexical < uint64(float64(total)*0.9) {
+			if !vstore.RebuildInProgress().CompareAndSwap(false, true) {
+				EmitLog("HealingWorker: [Pass 5] Lexical rebuild already in progress, skipping.")
+			} else {
+				go func(ws string, vs *vector.Store) {
+					defer vs.RebuildInProgress().Store(false)
+					EmitLog("HealingWorker: [Pass 5] Lexical gap detected (%d/%d). Triggering rebuild.", lexical, total)
+					count, err := vs.RebuildLexicalIndex()
+					if err != nil {
+						EmitLog("HealingWorker: [Pass 5] Rebuild failed for %s: %v", ws, err)
+					} else {
+						EmitLog("HealingWorker: [Pass 5] Rebuild complete for %s. Enqueued %d records.", ws, count)
+					}
+				}(agentWs, vstore)
+			}
+		}
+
+		// Update timestamp regardless of gap detection
+		vstore.SetMeta("last_lexical_check", []byte(fmt.Sprintf("%d", time.Now().Unix())))
+	}
 }
 
 func handleRecall(conn net.Conn, req RPCRequest) {
@@ -2407,6 +2428,37 @@ func handleExpand(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 }
 
+func handleRebuildLexical(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+	if params.AgentWs == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	count, err := vstore.RebuildLexicalIndex()
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]interface{}{
+		"enqueued": count,
+		"message":  fmt.Sprintf("Enqueued %d records for lexical indexing", count),
+	}, ID: req.ID})
+}
+
 func handleDeleteEpisode(conn net.Conn, req RPCRequest) {
 	var params struct {
 		AgentWs string `json:"agentWs"`
@@ -2604,6 +2656,8 @@ func handleConnection(conn net.Conn) {
 			go handleReplay(conn, req)
 		case "ai.expand":
 			go handleExpand(conn, req)
+		case "ai.rebuildLexical":
+			go handleRebuildLexical(conn, req)
 		case "ai.deleteEpisode":
 			go handleDeleteEpisode(conn, req)
 		case "ai.batchDeleteEpisodes":
