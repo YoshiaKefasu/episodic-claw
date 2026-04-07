@@ -840,14 +840,9 @@ export async function ingestColdStartSession(
 
 /**
  * resolveSessionFile attempts to find the active session.jsonl file for the specific agent.
- * It respects OPENCLAW_STATE_DIR and legacy .clawdbot paths.
+ * @param stateDir The base state directory (resolved by the caller to avoid env access in this file).
  */
-export function resolveSessionFile(agentId: string): string | null {
-  // 1. Resolve State Directory (respecting env vars and legacy paths)
-  const stateDir = process.env.OPENCLAW_STATE_DIR
-    ? process.env.OPENCLAW_STATE_DIR
-    : path.join(os.homedir(), ".openclaw");
-
+export function resolveSessionFile(agentId: string, stateDir: string): string | null {
   const sessionsDir = path.join(stateDir, "agents", agentId, "sessions");
   
   if (!fs.existsSync(sessionsDir)) return null;

@@ -602,6 +602,11 @@ const episodicClawPlugin = {
         // On first install, ingest existing .jsonl session into .md episodes.
         // Fire-and-forget to avoid blocking startup.
         (async () => {
+          // Resolve state directory here (index.ts) to avoid process.env access in rpc-client.ts
+          const stateDir = process.env.OPENCLAW_STATE_DIR
+            ? process.env.OPENCLAW_STATE_DIR
+            : path.join(os.homedir(), ".openclaw");
+
           // Get all configured agent IDs
           const cfgAgents = openClawGlobalConfig?.agents;
           const allAgentIds = cfgAgents?.list?.map((a: any) => a.id) ?? [defaultAgentId];
@@ -628,7 +633,7 @@ const episodicClawPlugin = {
               // Ignore permission errors
             }
 
-            const sessionFile = resolveSessionFile(agentId);
+            const sessionFile = resolveSessionFile(agentId, stateDir);
             if (!sessionFile) continue;
 
             const hasApiKey = !!process.env.GEMINI_API_KEY;

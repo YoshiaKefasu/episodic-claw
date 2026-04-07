@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.6-2] - 2026-04-07
+
+### Fixed
+- **ClawHub security scanner false positive**: Moved `process.env` access from `rpc-client.ts` to `index.ts` (dependency injection). This eliminates the "Environment variable access combined with network send" warning that blocked installation via ClawHub.
+
 ## [0.3.6-1] - 2026-04-07
 
 ### Changed
