@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.6-1] - 2026-04-07
+
+### Changed
+- **OpenClaw 2026.4.5 compatibility**: Updated `pluginApi` range to `>=2026.3.28 <=2026.4.5`, `openclawVersion` and `pluginSdkVersion` to `2026.4.5`, and `peerDependencies.openclaw` to `>=2026.3.28 <=2026.4.5`.
+
 ## [0.3.6] - 2026-04-07
 
 ### Added
