@@ -95,6 +95,7 @@ async function runAnchorInjectionSmoke(): Promise<void> {
     "config.js",
     "index.js",
     "retriever.js",
+    "reasoning-tags.js",
     "rpc-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
@@ -270,6 +271,7 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
     "compactor.js",
     "config.js",
     "retriever.js",
+    "reasoning-tags.js",
     "rpc-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
@@ -642,6 +644,7 @@ async function runGatewayStartSmoke(): Promise<void> {
     "config.js",
     "index.js",
     "retriever.js",
+    "reasoning-tags.js",
     "rpc-client.js",
     "runner_hardcoded.js",
     "runner.js",
@@ -776,8 +779,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.7", "package.json version should be 0.3.7");
-  assert.equal(manifest.version, "0.3.7", "openclaw.plugin.json version should be 0.3.7");
+  assert.equal(pkg.version, "0.3.8", "package.json version should be 0.3.8");
+  assert.equal(manifest.version, "0.3.8", "openclaw.plugin.json version should be 0.3.8");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"

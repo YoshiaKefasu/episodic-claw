@@ -10,7 +10,16 @@ import {
 } from "./types";
 import { Message, extractText, EXCLUDED_ROLES } from "./segmenter";
 import { estimateTokens } from "./utils";
+import { stripReasoningTagsFromText } from "./reasoning-tags";
 import * as stopwords from "stopwords-iso";
+
+// Recall-specific excluded roles: system prompts and LLM thinking blocks
+// must not leak into vector search queries (they pollute embedding intent).
+const RECALL_EXCLUDED_ROLES = new Set([
+  ...EXCLUDED_ROLES,
+  "system",
+  "thinking",
+]);
 
 // ─── Module-scope stopword cache (initialized once for performance) ──────────
 let STOPWORDS_CACHE: Set<string> | null = null;
@@ -43,9 +52,9 @@ function instantDeterministicRewrite(messages: Message[], config?: EpisodicPlugi
   // Phase 1: Aggressive Noise Removal
   const cleaned = messages
     .map(m => {
-      const text = extractText(m.content);
+      const rawText = extractText(m.content);
+      const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
       return text
-        .replace(/<final>[\s\S]*?<\/final>/g, "")
         .replace(/\[\[reply_to_current\]\]/g, "")
         .replace(/^System:\s*\[.*?\]\s*/gm, "")
         .replace(/<[^>]+>/g, "")
@@ -212,7 +221,7 @@ export class EpisodicRetriever {
     // Build the query from the recent N messages using deterministic polyglot rewriting
     const recentMessageCount = this.config?.recallQueryRecentMessageCount ?? 4;
     const recentMessages = currentMessages
-      .filter(m => !EXCLUDED_ROLES.has(m.role))
+      .filter(m => !RECALL_EXCLUDED_ROLES.has(m.role))
       .slice(-recentMessageCount);
     const query = instantDeterministicRewrite(recentMessages, this.config);
     if (!query) {

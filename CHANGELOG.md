@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.8] - 2026-04-09
+
+### Fixed
+- **Recall query pollution from system messages and LLM thinking blocks**: System prompts and internal reasoning text were leaking into recall search queries via three pathways: (1) `system`/`thinking` role messages passing through the recall filter, (2) `type: "thinking"`/`"reasoning"` content blocks being extracted as plain text, and (3) Gemini's embedded thinking tags (`&#94;>thought`, `<final>`) inside text blocks. Fixed with a three-layer defense: (1) `RECALL_EXCLUDED_ROLES` in `retriever.ts` excludes `system`/`thinking` roles; (2) `extractPlainText()` in `large-payload.ts` strips thinking/reasoning blocks; (3) `stripReasoningTagsFromText()` (adapted from OpenClaw core) removes Gemini/Claude/DeepSeek thinking tags and `<final>` tags from extracted text before query construction.
+
 ## [0.3.7.2] - 2026-04-08
 
 ### Changed

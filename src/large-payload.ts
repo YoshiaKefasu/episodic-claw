@@ -20,6 +20,7 @@ function extractPlainText(content: any): string {
     return content
       .map((block) => {
         if (typeof block === "string") return block;
+        if (block && typeof block === "object" && (block.type === "thinking" || block.type === "reasoning")) return "";
         if (block && typeof block === "object" && typeof block.text === "string") return block.text;
         if (block && typeof block === "object" && "content" in block) {
           return extractPlainText((block as { content?: unknown }).content);
