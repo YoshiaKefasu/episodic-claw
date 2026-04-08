@@ -362,6 +362,14 @@ const PluginConfigSchema = Type.Object(
       maximum: 30,
       description: "How often the HealingWorker checks for gaps in the Lexical index. Default: 7 days."
     })),
+    queryExcludedKeywords: Type.Optional(Type.Array(Type.String(), {
+      description: "Keywords to exclude from recall queries. Add words here to prevent them from being used in memory search."
+    })),
+    recallQueryRecentMessageCount: Type.Optional(Type.Integer({
+      minimum: 1,
+      maximum: 12,
+      description: "How many recent messages are used to build the deterministic recall query. Default: 4."
+    })),
   },
   { additionalProperties: false }
 );

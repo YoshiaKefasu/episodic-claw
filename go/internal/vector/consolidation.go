@@ -186,9 +186,9 @@ Return ONLY the title text, nothing else.
 	}
 
 	now := time.Now()
-	dirPath := filepath.Join(agentWs,
-		fmt.Sprintf("%04d", now.Year()),
-		fmt.Sprintf("%02d", now.Month()),
+	// D1 dream path: dream/YYYY-MM/DD/
+	dirPath := filepath.Join(agentWs, "dream",
+		fmt.Sprintf("%04d-%02d", now.Year(), now.Month()),
 		fmt.Sprintf("%02d", now.Day()))
 
 	os.MkdirAll(dirPath, 0755)

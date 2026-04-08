@@ -1183,12 +1183,26 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	slug := fmt.Sprintf("episode-%x", hash)
 	EmitLog("Quality Guard (Ingest): using MD5 safe-queue slug: %s", slug)
 
-	// Build the path YYYY/MM/DD
+	// Build the path: notes/YYYY-MM for manual ep-save, YYYY/MM/DD for auto segments
 	now := time.Now()
-	dirPath := filepath.Join(params.AgentWs,
-		fmt.Sprintf("%04d", now.Year()),
-		fmt.Sprintf("%02d", now.Month()),
-		fmt.Sprintf("%02d", now.Day()))
+	isManualSave := false
+	for _, t := range params.Tags {
+		if t == "manual-save" {
+			isManualSave = true
+			break
+		}
+	}
+
+	var dirPath string
+	if isManualSave {
+		dirPath = filepath.Join(params.AgentWs, "notes",
+			fmt.Sprintf("%04d-%02d", now.Year(), now.Month()))
+	} else {
+		dirPath = filepath.Join(params.AgentWs,
+			fmt.Sprintf("%04d", now.Year()),
+			fmt.Sprintf("%02d", now.Month()),
+			fmt.Sprintf("%02d", now.Day()))
+	}
 
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
 		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Mkdir failed: " + err.Error()}, ID: req.ID})
@@ -1416,6 +1430,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			cancel() // Release context immediately
 
 			now := time.Now()
+			// D0 auto-segment path: YYYY/MM/DD (unchanged)
 			dirPath := filepath.Join(params.AgentWs,
 				fmt.Sprintf("%04d", now.Year()),
 				fmt.Sprintf("%02d", now.Month()),
@@ -1482,6 +1497,11 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 		if err := vstore.BatchAdd(ctx, successRecords); err != nil {
 			EmitLog("BatchIngest: vstore.BatchAdd failed: %v", err)
 		}
+	}
+
+	// Ensure last_activity is updated for Sleep Timer consolidation
+	if vstore != nil {
+		_ = vstore.SetMeta("last_activity", []byte(fmt.Sprintf("%d", time.Now().Unix())))
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: slugs, ID: req.ID})
@@ -2222,10 +2242,16 @@ func checkReplayThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 
 func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	val, closer, err := vstore.GetRawMeta([]byte("meta:last_activity"))
-	if err != nil || len(val) == 0 {
-		if err == nil && closer != nil {
+	if err != nil {
+		if closer != nil {
 			closer.Close()
 		}
+		EmitLog("[SleepTimer] WARN: GetRawMeta failed for %s: %v", agentWs, err)
+		return
+	}
+	if len(val) == 0 {
+		closer.Close()
+		EmitLog("[SleepTimer] WARN: last_activity is empty for %s", agentWs)
 		return
 	}
 
@@ -2234,11 +2260,16 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	closer.Close()
 
 	if lastActivity == 0 {
+		EmitLog("[SleepTimer] WARN: last_activity is zero for %s", agentWs)
 		return
 	}
 
 	// 3 hours threshold
-	if time.Now().Unix()-lastActivity > 3*3600 {
+	idleSeconds := time.Now().Unix() - lastActivity
+	if idleSeconds > 3*3600 {
+		EmitLog("[SleepTimer] Idle %dh%02dm for %s, checking consolidation",
+			idleSeconds/3600, (idleSeconds%3600)/60, agentWs)
+
 		// Check if we already consolidated
 		val, closer, err = vstore.GetRawMeta([]byte("meta:last_consolidation"))
 		var lastConsolidation int64

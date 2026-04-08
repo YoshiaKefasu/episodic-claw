@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.3.6-2",
+  "version": "0.3.7",
   "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -140,6 +140,18 @@
         "maximum": 30,
         "default": 7,
         "description": "How often the HealingWorker checks for gaps in the Lexical (Bleve) index and auto-rebuilds if >10% of records are missing. Default: 7 days.\n⚠️ [Blast Radius] If too short: Unnecessary background CPU usage. If too long: Lexical search may be degraded for weeks after a migration or corruption."
+      },
+      "queryExcludedKeywords": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Keywords to exclude from recall queries. Add words here to prevent them from being used in memory search (e.g., common noise words or sensitive topics)."
+      },
+      "recallQueryRecentMessageCount": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 12,
+        "default": 4,
+        "description": "How many recent messages are used to build the deterministic recall query. Default: 4.\n⚠️ [Blast Radius] If too high: Query becomes noisy and dilutes semantic intent. If too low: Insufficient context for accurate memory retrieval."
       }
     }
   },

@@ -1,6 +1,6 @@
 {
   "name": "episodic-claw",
-  "version": "0.3.6-2",
+  "version": "0.3.7",
   "description": "Episodic Memory Engine for OpenClaw",
   "license": "MPL-2.0",
   "main": "./index.ts",
@@ -49,6 +49,7 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.48",
+    "stopwords-iso": "^1.1.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

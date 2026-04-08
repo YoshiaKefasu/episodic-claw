@@ -10,6 +10,76 @@ import {
 } from "./types";
 import { Message, extractText, EXCLUDED_ROLES } from "./segmenter";
 import { estimateTokens } from "./utils";
+import * as stopwords from "stopwords-iso";
+
+// ─── Module-scope stopword cache (initialized once for performance) ──────────
+let STOPWORDS_CACHE: Set<string> | null = null;
+
+type StopwordsDict = Record<string, string[] | undefined>;
+
+function getStopwords(config?: EpisodicPluginConfig): Set<string> {
+  if (STOPWORDS_CACHE) return STOPWORDS_CACHE;
+
+  const stopwordsSet = new Set<string>();
+  const dict = stopwords as unknown as StopwordsDict;
+
+  // 1. stopwords-iso: English, Japanese, Indonesian, Chinese, Korean
+  if (dict.en) dict.en.forEach((w: string) => stopwordsSet.add(w.toLowerCase()));
+  if (dict.ja) dict.ja.forEach((w: string) => stopwordsSet.add(w));
+  if (dict.id) dict.id.forEach((w: string) => stopwordsSet.add(w.toLowerCase()));
+  if (dict.zh) dict.zh.forEach((w: string) => stopwordsSet.add(w));
+  if (dict.ko) dict.ko.forEach((w: string) => stopwordsSet.add(w));
+
+  // 2. User-defined excluded keywords
+  if (config?.queryExcludedKeywords) {
+    config.queryExcludedKeywords.forEach(w => stopwordsSet.add(w));
+  }
+
+  STOPWORDS_CACHE = stopwordsSet;
+  return stopwordsSet;
+}
+
+function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): string {
+  // Phase 1: Aggressive Noise Removal
+  const cleaned = messages
+    .map(m => {
+      const text = extractText(m.content);
+      return text
+        .replace(/<final>[\s\S]*?<\/final>/g, "")
+        .replace(/\[\[reply_to_current\]\]/g, "")
+        .replace(/^System:\s*\[.*?\]\s*/gm, "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\p{Extended_Pictographic}/gu, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  // Phase 2+3: Polyglot keyword extraction + assembly
+  const keywords = extractPolyglotKeywords(cleaned, config);
+  return keywords.length > 0 ? keywords.join(" ") : cleaned;
+}
+
+function extractPolyglotKeywords(text: string, config?: EpisodicPluginConfig): string[] {
+  const stopwordsSet = getStopwords(config);
+  const keywords = new Set<string>();
+
+  // English / Latin script (3+ chars)
+  const enMatches = text.match(/\b[A-Za-z]{3,}\b/g) || [];
+  enMatches.forEach(w => {
+    if (!stopwordsSet.has(w.toLowerCase())) keywords.add(w);
+  });
+
+  // CJK: Han + Katakana + Hangul (2+ chars)
+  const cjkMatches = text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hangul}]{2,}/gu) || [];
+  cjkMatches.forEach(w => {
+    if (!stopwordsSet.has(w)) keywords.add(w);
+  });
+
+  // Top 12 limit to prevent semantic dilution
+  return Array.from(keywords).slice(0, 12);
+}
 
 export type RecallDiagnostics = {
   topMatchedBy: RecallMatchedBy | "";
@@ -139,17 +209,12 @@ export class EpisodicRetriever {
       return { text: "", episodeIds: [], reason: "max_tokens_zero", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
 
-    // Build the query from the recent N messages
+    // Build the query from the recent N messages using deterministic polyglot rewriting
+    const recentMessageCount = this.config?.recallQueryRecentMessageCount ?? 4;
     const recentMessages = currentMessages
       .filter(m => !EXCLUDED_ROLES.has(m.role))
-      .slice(-5);
-    const queryParts = recentMessages
-      .map(m => {
-        const content = extractText(m.content).trim();
-        return content ? `${m.role}: ${content}` : "";
-      })
-      .filter(part => part.length > 0);
-    const query = queryParts.join("\n").trim();
+      .slice(-recentMessageCount);
+    const query = instantDeterministicRewrite(recentMessages, this.config);
     if (!query) {
       return { text: "", episodeIds: [], reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }

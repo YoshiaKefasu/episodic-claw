@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.7.2] - 2026-04-08
+
+### Changed
+- **Episode directory separation**: Manual ep-save episodes now output to `episodes/notes/YYYY-MM/` instead of `episodes/YYYY/MM/DD/`. D1 consolidation outputs now go to `episodes/dream/YYYY-MM/DD/`. Auto-segmented D0 episodes remain in `episodes/YYYY/MM/DD/`. This eliminates the mixing of all episode types in a single directory.
+
+## [0.3.7.1] - 2026-04-08
+
+### Fixed
+- **D1 Consolidation never fires (Sleep Timer silent failure)**: `handleBatchIngest()` was not calling `SetMeta("last_activity", ...)`, causing `meta:last_activity` key to never be written to Pebble when only batchIngest is used. `checkSleepThreshold` then fails on `GetRawMeta` with `pebble.ErrNotFound` and silently returns, preventing consolidation forever. Fixed by adding `SetMeta` call after `wg.Wait()` in `handleBatchIngest`.
+- **Diagnostic logging for Sleep Timer**: Added `EmitLog` warnings to all 3 error exit paths in `checkSleepThreshold` (GetRawMeta failure, empty value, zero timestamp) plus an idle-time confirmation log when the 3-hour threshold is crossed. Eliminates the complete observability black hole.
+
+## [0.3.7] - 2026-04-08
+
+### Added
+- **Instant Deterministic Query Rewriting (Polyglot Heuristic)**: Replaced raw message concatenation in recall queries with a fast, rule-based query rewriting engine. Strips markup noise (`<final>`, `[[reply_to_current]]`, `System:` timestamps, emojis) and extracts meaningful keywords using multilingual heuristics (English 3+ chars, CJK 2+ chars) with stopword filtering via `stopwords-iso`. Zero API cost, sub-millisecond latency.
+- **`queryExcludedKeywords` config**: User-defined list of keywords to exclude from recall queries, preventing noise words or sensitive topics from polluting vector search.
+- **`recallQueryRecentMessageCount` config**: Adjustable number of recent messages used for query construction (default: 4, range: 1-12). Previously hardcoded to 5.
+
+### Fixed
+- **`recall_empty` reduction**: Clean query construction significantly improves semantic search accuracy by removing role prefixes and markup noise that previously diluted embedding vectors.
+- **Emoji filtering**: Uses `\p{Extended_Pictographic}` Unicode property escape for comprehensive emoji coverage (BMP, surrogate pairs, and ZWJ sequences).
+
 ## [0.3.6-2] - 2026-04-07
 
 ### Fixed

@@ -89,6 +89,10 @@ export interface EpisodicPluginConfig {
   /** How often the HealingWorker checks for gaps in the Lexical (Bleve) index and auto-rebuilds.
    *  Default: 7 days. Set to 1-30. */
   lexicalRebuildIntervalDays?: number;
+  /** Keywords to exclude from recall queries. Prevents noise words from polluting vector search. */
+  queryExcludedKeywords?: string[];
+  /** How many recent messages are used to build the deterministic recall query. Default: 4. */
+  recallQueryRecentMessageCount?: number;
 }
 
 export interface RecallCalibration {
