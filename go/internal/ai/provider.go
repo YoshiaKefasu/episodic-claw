@@ -119,6 +119,10 @@ func (r *RetryEmbedder) EmbedContent(ctx context.Context, text string) ([]float3
 		if ra := apiErr.RetryAfter(); ra > 0 {
 			wait = ra
 		}
+		// H-3 Phase 2: Cap Retry-After at 5 minutes to prevent indefinite waits
+		if wait > 300*time.Second {
+			wait = 300 * time.Second
+		}
 		logger.Warn(logger.CatAI, "[RetryEmbedder] HTTP %d (attempt %d/%d), retrying after %v",
 			apiErr.StatusCode, attempt+1, r.MaxRetries, wait)
 
@@ -164,6 +168,10 @@ func (r *RetryLLM) GenerateText(ctx context.Context, prompt string) (string, err
 		wait := backoff
 		if ra := apiErr.RetryAfter(); ra > 0 {
 			wait = ra
+		}
+		// Cap Retry-After at 5 minutes
+		if wait > 300*time.Second {
+			wait = 300 * time.Second
 		}
 		logger.Warn(logger.CatAI, "[RetryLLM] HTTP %d (attempt %d/%d), retrying after %v",
 			apiErr.StatusCode, attempt+1, r.MaxRetries, wait)
