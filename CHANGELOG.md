@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1] - 2026-04-09
+
+### Removed
+- **D1 consolidation pipeline**: Completely removed D1 consolidation from SleepTimer and made `ai.consolidate` RPC a no-op. Narrative mode replaces the D1 pipeline, eliminating double-summarization and slug-length file creation bugs (H-1, H-4).
+
+### Fixed
+- **SleepTimer log noise**: Suppressed `pebble: not found` warnings for workspaces that haven't had any sessions yet. Eliminates spam of harmless WARN logs every 2 minutes (H-2).
+- **Embedding 429 recovery**: Reduced heal_429 TTL from 2h to 30min and added probe-based recovery (try 5 files first before full recovery). Prevents prolonged embedding blackouts after quota exhaustion (H-3).
+
+### Changed
+- **`isConsolidating` atomic variable removed**: No longer needed since consolidation is disabled.
+
 ## [0.4.0] - 2026-04-09
 
 ### Added

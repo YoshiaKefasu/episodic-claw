@@ -36,7 +36,6 @@ var (
 	lexicalRebuildInterval *int
 
 	storeMutex      sync.Mutex
-	isConsolidating int32
 	isReplaying     int32
 	writeMu         sync.Mutex // Atomize writes to net.Conn
 	vectorStores    = make(map[string]*vector.Store)
@@ -1537,19 +1536,22 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 		Count int       `json:"count"`
 		Since time.Time `json:"since"`
 	}
+	// H-3: Reduced TTL (2h -> 30min) + probe-based recovery
 	const heal429Threshold = 3
-	const heal429TTL = 2 * time.Hour
+	const heal429TTL = 30 * time.Minute  // was 2h
+	const heal429ProbeCount = 5           // After TTL expiry, only try 5 files before full recovery
 
 	var h429 heal429State
 	if raw, closer, metaErr := vstore.GetRawMeta([]byte("meta:heal_429_state")); metaErr == nil {
 		json.Unmarshal(raw, &h429) //nolint:errcheck
 		closer.Close()             //nolint:errcheck
 	}
-	// Auto-reset if TTL has expired
+	// Auto-reset if TTL has expired — H-3: probe-based recovery
 	if h429.Count > 0 && time.Since(h429.Since) > heal429TTL {
-		EmitLog("HealingWorker: heal_429 TTL expired (%s elapsed). Resetting state and retrying.",
-			time.Since(h429.Since).Round(time.Minute))
-		h429 = heal429State{}
+		EmitLog("HealingWorker: heal_429 TTL expired (%s elapsed). Entering probe mode (%d files).",
+			time.Since(h429.Since).Round(time.Minute), heal429ProbeCount)
+		h429.Count = 0  // Reset counter, will re-accumulate during probe
+		h429.Since = time.Now()
 		if raw, _ := json.Marshal(h429); raw != nil {
 			vstore.SetMeta("heal_429_state", raw) //nolint:errcheck
 		}
@@ -2251,6 +2253,10 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 		if closer != nil {
 			closer.Close()
 		}
+		// H-2: pebble:not found is normal before first session. Suppress noise.
+		if strings.Contains(err.Error(), "not found") {
+			return
+		}
 		EmitLog("[SleepTimer] WARN: GetRawMeta failed for %s: %v", agentWs, err)
 		return
 	}
@@ -2272,87 +2278,20 @@ func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	// 3 hours threshold
 	idleSeconds := time.Now().Unix() - lastActivity
 	if idleSeconds > 3*3600 {
-		EmitLog("[SleepTimer] Idle %dh%02dm for %s, checking consolidation",
+		// v0.4.1+: D1 consolidation is disabled. Narrative mode replaces the D1 pipeline.
+		EmitLog("[SleepTimer] Idle %dh%02dm for %s (consolidation disabled in v0.4.1+)",
 			idleSeconds/3600, (idleSeconds%3600)/60, agentWs)
-
-		// Check if we already consolidated
-		val, closer, err = vstore.GetRawMeta([]byte("meta:last_consolidation"))
-		var lastConsolidation int64
-		if err == nil {
-			if len(val) > 0 {
-				fmt.Sscanf(string(val), "%d", &lastConsolidation)
-			}
-			if closer != nil {
-				closer.Close()
-			}
-		}
-
-		if lastConsolidation < lastActivity {
-			EmitLog("Sleep Timer triggered for %s (Idle for >3h)", agentWs)
-
-			// Fire consolidation job
-			if atomic.CompareAndSwapInt32(&isConsolidating, 0, 1) {
-				go func(ws string, vs *vector.Store) {
-					defer atomic.StoreInt32(&isConsolidating, 0)
-
-					consolidationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-					defer cancel()
-
-					err := vector.RunConsolidation(consolidationCtx, ws, apiKey, vs, gemmaLimiter, embedLimiter)
-					if err != nil {
-						EmitLog("Consolidation error for %s: %v", ws, err)
-					} else {
-						// Only set if success
-						vs.SetMeta("last_consolidation", []byte(fmt.Sprintf("%d", time.Now().Unix())))
-					}
-				}(agentWs, vstore)
-			} else {
-				EmitLog("Skipping Sleep Timer for %s, consolidation already in progress", agentWs)
-			}
-		}
 	}
 }
 
 func handleConsolidate(conn net.Conn, req RPCRequest) {
-	var params struct {
-		AgentWs string `json:"agentWs"`
-		APIKey  string `json:"apiKey"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
-		return
-	}
-
-	apiKey := params.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("GEMINI_API_KEY")
-	}
-
-	vstore, err := getStore(params.AgentWs)
-	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed"}, ID: req.ID})
-		return
-	}
-
-	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Consolidation Job Started", ID: req.ID})
-
-	go func() {
-		if atomic.CompareAndSwapInt32(&isConsolidating, 0, 1) {
-			defer atomic.StoreInt32(&isConsolidating, 0)
-
-			consolidationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-
-			err := vector.RunConsolidation(consolidationCtx, params.AgentWs, apiKey, vstore, gemmaLimiter, embedLimiter)
-			if err == nil {
-				vstore.SetMeta("last_consolidation", []byte(fmt.Sprintf("%d", time.Now().Unix())))
-			} else {
-				EmitLog("Consolidation error (manual): %v", err)
-			}
-		} else {
-			EmitLog("Consolidation skipped: already running")
-		}
-	}()
+	EmitLog("[Consolidation] D1 consolidation is disabled in v0.4.1+. " +
+		"Narrative mode replaces D1 pipeline. No action taken.")
+	sendResponse(conn, RPCResponse{
+		JSONRPC: "2.0",
+		Result:  "Consolidation disabled (v0.4.1+): narrative mode replaces D1 pipeline",
+		ID:      req.ID,
+	})
 }
 
 func handleReplay(conn net.Conn, req RPCRequest) {
