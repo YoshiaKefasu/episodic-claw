@@ -38,6 +38,8 @@ export interface FileEvent {
 
 export interface EpisodicPluginConfig {
   tombstoneRetentionDays?: number;
+  /** Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery).
+   *  Default: true. Does not affect narrative generation. D1 consolidation is no longer used. */
   enableBackgroundWorkers?: boolean;
   lexicalPreFilterLimit?: number;
   reserveTokens?: number;
@@ -50,13 +52,11 @@ export interface EpisodicPluginConfig {
    *  フォールバック回数が多い環境では大きくする（例: 10）。 */
   dedupWindow?: number;
   /** buffer サイズ上限 flush トリガー（文字数、デフォルト 7200）。
-   *  この値を超えると Surprise に関わらず強制 flush される。
-   *  maxCharsPerChunk より大きい値に設定すると chunking が発生する（1 flush = 複数エピソード）。
-   *  500 未満は非推奨。 */
+   *  Advanced: live flush guard for the segmenter. Forces flush regardless of surprise/time-gap.
+   *  この値を超えると Surprise に関わらず強制 flush される。500 未満は非推奨。 */
   maxBufferChars?: number;
-  /** batchIngest に送る 1 チャンクの最大文字数（デフォルト 9000）。
-   *  maxBufferChars より大きい値に設定すると chunking が発生しない（1 flush = 1 エピソード）。
-   *  500 未満は非推奨。 */
+  /** Deprecated (legacy-only): batchIngest に送る 1 チャンクの最大文字数（デフォルト 9000）。
+   *  v0.4.x の narrative cache path では使用されない。後方互換のために残存。500 未満は非推奨。 */
   maxCharsPerChunk?: number;
   /** 動的セグメンテーション: 閾値 = mean + lambda * std */
   segmentationLambda?: number;
@@ -100,19 +100,19 @@ export interface EpisodicPluginConfig {
   // Narrative architecture (v0.4.0)
   /** OpenRouter API key. Falls back to OPENROUTER_API_KEY env var. Empty = disabled. */
   openrouterApiKey?: string;
-  /** OpenRouter model ID for narrative generation. */
+  /** Deprecated: legacy alias for openrouterConfig.model. Use openrouterConfig.model instead. */
   openrouterModel?: string;
   /** Narrative system prompt (inline text). */
   narrativeSystemPrompt?: string;
   /** Narrative user prompt template (inline text). */
   narrativeUserPromptTemplate?: string;
-  /** Maximum characters to pool before forcing a flush. */
+  /** Advanced: maximum characters to pool before forcing a flush to the cache queue. Default: 15000. */
   maxPoolChars?: number;
   /** Pass the full previous episode to the LLM for context continuity. */
   narrativePreviousEpisodeRef?: boolean;
-  /** Max tokens for narrative summary (undefined = let OpenRouter decide). */
+  /** Deprecated: legacy alias for openrouterConfig.maxTokens. Use openrouterConfig.maxTokens instead. */
   narrativeMaxTokens?: number;
-  /** Temperature for narrative generation (0-1, default 0.4). */
+  /** Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead. */
   narrativeTemperature?: number;
   /** Nested OpenRouter config for narrative generation. */
   openrouterConfig?: {

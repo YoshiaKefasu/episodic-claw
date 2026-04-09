@@ -305,11 +305,11 @@ const PluginConfigSchema = Type.Object(
     })),
     maxBufferChars: Type.Optional(Type.Integer({
       minimum: 500,
-      description: "Character threshold that triggers a forced buffer flush regardless of surprise score (default 7200). Must be >= 500."
+      description: "Advanced: character threshold that forces the segmenter to flush regardless of surprise/time-gap boundaries. Default: 7200. Acts as a live flush guard to prevent unbounded buffer growth."
     })),
     maxCharsPerChunk: Type.Optional(Type.Integer({
       minimum: 500,
-      description: "Max characters per chunk sent to batchIngest (default 9000). Setting this below maxBufferChars splits one flush into multiple episodes. Must be >= 500."
+      description: "Deprecated (legacy-only): max characters per chunk for the old batchIngest path. No longer used in the v0.4.x narrative cache path. Retained for backward compatibility only. Default: 9000."
     })),
     sharedEpisodesDir: Type.Optional(Type.String({
       description: "Disabled and ignored. Shared episodes directories are no longer used at runtime."
@@ -382,7 +382,7 @@ const PluginConfigSchema = Type.Object(
       description: "OpenRouter API key for narrative generation. Falls back to OPENROUTER_API_KEY env var."
     })),
     openrouterModel: Type.Optional(Type.String({
-      description: "OpenRouter model ID for narrative generation. Default: openrouter/free"
+      description: "Deprecated: legacy alias for openrouterConfig.model. Use openrouterConfig.model instead."
     })),
     narrativeSystemPrompt: Type.Optional(Type.String({
       description: "Custom system prompt for narrative generation. Inline text."
@@ -392,7 +392,7 @@ const PluginConfigSchema = Type.Object(
     })),
     maxPoolChars: Type.Optional(Type.Integer({
       minimum: 1000,
-      description: "Maximum characters to pool before forcing a flush. Default: 15000."
+      description: "Advanced: maximum characters accumulated in the narrative pool before triggering a flush to the cache queue. Default: 15000. Acts as a pool flush guard to prevent context overflow."
     })),
     narrativePreviousEpisodeRef: Type.Optional(Type.Boolean({
       description: "Pass the full previous episode to the LLM for context continuity. Default: true."
@@ -400,18 +400,21 @@ const PluginConfigSchema = Type.Object(
     narrativeMaxTokens: Type.Optional(Type.Integer({
       minimum: 256,
       maximum: 32768,
-      description: "Optional. Max tokens cap for the narrative summary. Omit to let OpenRouter/model decide (recommended)."
+      description: "Deprecated: legacy alias for openrouterConfig.maxTokens. Use openrouterConfig.maxTokens instead."
     })),
     narrativeTemperature: Type.Optional(Type.Number({
       minimum: 0,
       maximum: 1,
-      description: "Sampling temperature for narrative generation. Default: 0.4 (factual, consistent)."
+      description: "Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead."
     })),
     openrouterConfig: Type.Optional(Type.Object({
       model: Type.Optional(Type.String()),
       maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768 })),
       temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
     }, { description: "Nested OpenRouter config. Takes precedence over flat fields." })),
+    enableBackgroundWorkers: Type.Optional(Type.Boolean({
+      description: "Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery). Default: true. Does not affect narrative generation."
+    })),
   },
   { additionalProperties: false }
 );
@@ -439,7 +442,7 @@ let _singleton: SingletonType | null = null;
 const episodicClawPlugin = {
   id: "episodic-claw",
   name: "Episodic Memory",
-  description: "D0/D1 hierarchical contextual memory and event stream for OpenClaw.",
+  description: "Sequential narrative memory with Cache-and-Drain architecture. Safely splits massive chat logs into 64K chunks, narrativizes them via OpenRouter, and provides semantic recall with per-agent continuity.",
   kind: "memory",
   configSchema: PluginConfigSchema,
   register(api: OpenClawPluginApi) {
@@ -674,6 +677,15 @@ const episodicClawPlugin = {
           debouncer.push(event);
         };
 
+        // ─── Narrative Worker Start (v0.4.2) ─────────────────────────────────────
+        // Initialize continuity state and start polling the cache queue.
+        if (_singleton!.narrativeWorker) {
+          const agents = [{ agentWs: resolution.agentWs, agentId: defaultAgentId }];
+          await _singleton!.narrativeWorker.initContinuity(agents);
+          _singleton!.narrativeWorker.start();
+          console.log("[Episodic Memory] Narrative worker started (cache queue polling).");
+        }
+
         // ─── Cold-Start Ingestion ────────────────────────────────────────────────
         // On first install, ingest existing .jsonl session into .md episodes.
         // Fire-and-forget to avoid blocking startup.
@@ -715,7 +727,7 @@ const episodicClawPlugin = {
             const hasApiKey = !!process.env.GEMINI_API_KEY;
             console.log(`[Episodic Memory] Cold-Start: found session file ${sessionFile} for ${agentId} (API key: ${hasApiKey ? "yes" : "no"})`);
             try {
-              const msgCount = await ingestColdStartSession(sessionFile, agentWs, rpcClient, hasApiKey);
+              const msgCount = await ingestColdStartSession(sessionFile, agentWs, agentId, rpcClient, hasApiKey);
               console.log(`[Episodic Memory] Cold-Start: ingested ${msgCount} messages from session for ${agentId}.`);
               ingestedSessions.add(sessionKey);
             } catch (err) {
@@ -728,14 +740,14 @@ const episodicClawPlugin = {
       api.on("gateway_stop", async (event?: any, _ctx?: any) => {
         console.log("[Episodic Memory] Stopping plugin...", event?.reason ? `(reason: ${event.reason})` : "");
 
-        // Narrative architecture (v0.4.0) — graceful drain of narrative worker
+        // Narrative architecture (v0.4.0) — graceful stop of narrative worker
         if (_singleton!.narrativeWorker) {
-          console.log("[Episodic Memory] Draining narrative worker...");
+          console.log("[Episodic Memory] Stopping narrative worker...");
           await Promise.race([
-            _singleton!.narrativeWorker.drain(),
+            _singleton!.narrativeWorker.stop(),
             new Promise(resolve => setTimeout(resolve, 15000)),
           ]);
-          console.log("[Episodic Memory] Narrative worker drained.");
+          console.log("[Episodic Memory] Narrative worker stopped.");
         }
 
         await rpcClient.stop();
@@ -1212,12 +1224,12 @@ const episodicClawPlugin = {
       }));
 
       const EpExpandSchema = Type.Object({
-        slug: Type.String({ description: "The ID/Slug of the D1 summary episode" })
+        slug: Type.String({ description: "The ID/Slug of the episode to expand" })
       });
 
       api.registerTool((ctx: any) => ({
         name: "ep-expand",
-        description: "Expand a D1 semantic summary node to read its underlying raw chronological episodes (D0). Use this when you need specific details that were abstracted away.",
+        description: "Expand a saved episode to read its full narrative text. Use this when you need to see the complete episode content that was stored under a specific slug.",
         parameters: EpExpandSchema,
         execute: async (_toolCallId: string, params: any) => {
           // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ

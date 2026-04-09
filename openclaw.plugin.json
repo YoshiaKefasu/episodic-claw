@@ -1,8 +1,8 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.1",
-  "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
+  "version": "0.4.2",
+  "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, exponential backoff, and crash-safe durability.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
   "author": {
@@ -48,12 +48,12 @@
       "maxBufferChars": {
         "type": "integer",
         "minimum": 500,
-        "description": "The character limit that forces the chat buffer to save (Flush) to disk. Default: 7200.\n⚠️ [Blast Radius] If too high: You risk losing a massive amount of unsaved memory if the app crashes. If too low (e.g. <500): The AI spams your disk with tiny, fragmented memory files and murders your PC's I/O performance."
+        "description": "Advanced: character threshold that forces the segmenter to flush regardless of surprise/time-gap boundaries. Default: 7200. Acts as a live flush guard to prevent unbounded buffer growth. ⚠️ Too high risks data loss on crash; too low causes I/O spam."
       },
       "maxCharsPerChunk": {
         "type": "integer",
         "minimum": 500,
-        "description": "The max size of a single memory chunk sent to the Batch Ingest DB. Default: 9000.\n⚠️ [Blast Radius] If too high: The database chokes on massive text blocks and times out. If too low: A single long conversation gets diced into chaotic pieces, ruining the context when you recall it later."
+        "description": "Deprecated (legacy-only): max characters per chunk for the old batchIngest path. No longer used in the v0.4.x narrative cache path. Default: 9000. Retained for backward compatibility only."
       },
       "segmentationLambda": {
         "type": "number",
@@ -122,7 +122,7 @@
       },
       "enableBackgroundWorkers": {
         "type": "boolean",
-        "description": "Enables background workers that summarize (D1) and self-heal your memory DB. Default: true.\n⚠️ [Blast Radius] If false: You save some LLM API money, but your database turns into an unorganized, uncompressed junkyard."
+        "description": "Enables background maintenance workers: HealingWorker (auto-rebuilds lexical/vector indexes, handles embedding 429 recovery) and replay scheduling. Default: true.\n⚠️ If false: Index auto-repair and embedding rate-limit recovery are disabled. Narrative generation continues normally."
       },
       "lexicalPreFilterLimit": {
         "type": "integer",
@@ -195,7 +195,7 @@
         "type": "integer",
         "minimum": 1000,
         "default": 15000,
-        "description": "Max characters to pool before flushing to narrative generation. Default: 15000.\n⚠️ [Blast Radius] If too high: Large context may exceed model limits. If too low: Episodes are fragmented and lack context."
+        "description": "Advanced: maximum characters accumulated in the narrative pool before triggering a flush to the cache queue. Default: 15000. Acts as a pool flush guard to prevent context overflow. ⚠️ Too high risks model input limits; too low causes episode fragmentation."
       },
       "narrativePreviousEpisodeRef": {
         "type": "boolean",

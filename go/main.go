@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 
 	"episodic-core/frontmatter"
 	"episodic-core/internal/ai"
+	"episodic-core/internal/cache"
 	"episodic-core/internal/logger"
 	"episodic-core/internal/vector"
 	"episodic-core/watcher"
@@ -27,6 +29,7 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/time/rate"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -39,6 +42,8 @@ var (
 	isReplaying     int32
 	writeMu         sync.Mutex // Atomize writes to net.Conn
 	vectorStores    = make(map[string]*vector.Store)
+	cacheQueues     = make(map[string]*cache.Queue) // agentWs -> cache queue
+	cacheQueuesMu   sync.Mutex
 
 	// Global rate limiters to respect Google AI Studio quotas across all handlers
 	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 5)   // 15 RPM
@@ -604,6 +609,319 @@ func handleRollbackLegacyNestedEpisodeTree(conn net.Conn, req RPCRequest) {
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"restoredRoot": restoredRoot, "status": "recovered"}, ID: req.ID})
+}
+
+// --- Cache Queue helpers ---
+
+func getOrCreateCacheQueue(agentWs string) (*cache.Queue, error) {
+	cacheQueuesMu.Lock()
+	defer cacheQueuesMu.Unlock()
+
+	if q, ok := cacheQueues[agentWs]; ok {
+		return q, nil
+	}
+
+	q, err := cache.New(agentWs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cache queue for %s: %w", agentWs, err)
+	}
+	cacheQueues[agentWs] = q
+	EmitLog("[CacheQueue] Initialized cache DB for %s", agentWs)
+	return q, nil
+}
+
+// --- Cache Queue RPC handlers ---
+
+func handleCacheEnqueueBatch(conn net.Conn, req RPCRequest) {
+	var params struct {
+		Items []cache.QueueItem `json:"items"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if len(params.Items) == 0 {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]int{"enqueued": 0}, ID: req.ID})
+		return
+	}
+
+	agentWs := params.Items[0].AgentWs
+	q, err := getOrCreateCacheQueue(agentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	if err := q.EnqueueBatch(params.Items); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	// Calculate token summary for logging
+	totalTokens := 0
+	for _, item := range params.Items {
+		totalTokens += item.EstimatedTokens
+	}
+	EmitLog("[Episodic Cache] Enqueued %d chunks for agentWs=%s. source=%s parent=%s (tokens: %d. queue_size=%d)",
+		len(params.Items), agentWs, params.Items[0].Source, params.Items[0].ParentIngestID, totalTokens, len(params.Items))
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]int{"enqueued": len(params.Items)}, ID: req.ID})
+}
+
+func handleCacheLeaseNext(conn net.Conn, req RPCRequest) {
+	var params struct {
+		WorkerID     string `json:"workerId"`
+		AgentID      string `json:"agentId"`
+		LeaseSeconds int    `json:"leaseSeconds"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.WorkerID == "" || params.AgentID == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing workerId or agentId"}, ID: req.ID})
+		return
+	}
+
+	// Find the cache queue for this agent — scan all workspaces
+	var foundItem *cache.QueueItem
+	for agentWs, q := range cacheQueues {
+		item, err := q.LeaseNext(params.AgentID, params.WorkerID, params.LeaseSeconds)
+		if err != nil {
+			continue
+		}
+		if item != nil {
+			foundItem = item
+			EmitLog("[NarrativeWorker] Leased chunk [%s] attempt=%d lease=%ds tokens=%d agentWs=%s",
+				item.ID, item.Attempts, params.LeaseSeconds, item.EstimatedTokens, agentWs)
+			break
+		}
+	}
+
+	if foundItem == nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: nil, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: foundItem, ID: req.ID})
+}
+
+func handleCacheAck(conn net.Conn, req RPCRequest) {
+	var params struct {
+		ID       string `json:"id"`
+		WorkerID string `json:"workerId"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	for agentWs, q := range cacheQueues {
+		if err := q.Ack(params.ID); err == nil {
+			EmitLog("[Episodic DB] Acked cache job [%s] from %s. Worker=%s", params.ID, agentWs, params.WorkerID)
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "acked", ID: req.ID})
+			return
+		}
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Item not found in any cache queue"}, ID: req.ID})
+}
+
+func handleCacheRetry(conn net.Conn, req RPCRequest) {
+	var params struct {
+		ID          string `json:"id"`
+		WorkerID    string `json:"workerId"`
+		Error       string `json:"error"`
+		BackoffSec  int    `json:"backoffSec"`
+		MaxAttempts int    `json:"maxAttempts"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.MaxAttempts <= 0 {
+		params.MaxAttempts = 20
+	}
+
+	for _, q := range cacheQueues {
+		if err := q.Retry(params.ID, params.Error, params.MaxAttempts, params.BackoffSec); err == nil {
+			EmitLog("[NarrativeWorker] Returned chunk [%s] to queue with backoff. attempts=%d error=%s", params.ID, params.MaxAttempts, params.Error)
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "retried", ID: req.ID})
+			return
+		}
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Item not found in any cache queue"}, ID: req.ID})
+}
+
+func handleGetLatestNarrative(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		AgentID string `json:"agentId"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.AgentWs == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]interface{}{
+			"episodeId": "", "body": "", "found": false,
+		}, ID: req.ID})
+		return
+	}
+
+	// First, try the cache queue for this workspace (if it exists)
+	cacheQueuesMu.Lock()
+	q, qExists := cacheQueues[params.AgentWs]
+	cacheQueuesMu.Unlock()
+
+	if qExists {
+		episodeID, body, found, err := q.GetLatestNarrative(params.AgentWs, params.AgentID)
+		if err != nil {
+			EmitLog("[CacheQueue] GetLatestNarrative error for %s: %v", params.AgentWs, err)
+		}
+		if found {
+			EmitLog("[CacheQueue] GetLatestNarrative found %s for agent %s (via cache queue)", episodeID, params.AgentID)
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]interface{}{
+				"episodeId": episodeID, "body": body, "found": true,
+			}, ID: req.ID})
+			return
+		}
+	}
+
+	// Fallback: scan the episodes directory directly (works even if no cache queue was created yet)
+	episodeID, body, found, err := scanLatestNarrativeEpisode(params.AgentWs, params.AgentID)
+	if err != nil {
+		EmitLog("[CacheQueue] scanLatestNarrativeEpisode error for %s: %v", params.AgentWs, err)
+	}
+	if found {
+		EmitLog("[CacheQueue] GetLatestNarrative found %s for agent %s (via directory scan)", episodeID, params.AgentID)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]interface{}{
+			"episodeId": episodeID, "body": body, "found": true,
+		}, ID: req.ID})
+		return
+	}
+
+	EmitLog("[CacheQueue] GetLatestNarrative not found for agent %s in %s", params.AgentID, params.AgentWs)
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]interface{}{
+		"episodeId": "", "body": "", "found": false,
+	}, ID: req.ID})
+}
+
+// scanLatestNarrativeEpisode scans the episodes directory for the latest narrative-tagged episode.
+// This is used as a fallback when the cache queue hasn't been initialized yet (e.g., at startup).
+func scanLatestNarrativeEpisode(agentWs, agentID string) (episodeID string, body string, found bool, err error) {
+	type epInfo struct {
+		id   string
+		time time.Time
+		path string
+	}
+
+	var episodes []epInfo
+	filepath.WalkDir(agentWs, func(fp string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(fp, ".md") || strings.HasSuffix(fp, ".raw.md") {
+			return nil
+		}
+		content, rErr := os.ReadFile(fp)
+		if rErr != nil {
+			return nil
+		}
+
+		// Try footer metadata first (v0.4.0+)
+		idx := bytes.LastIndex(content, []byte(cache.FooterMarker))
+		if idx >= 0 {
+			remaining := content[idx:]
+			endIdx := bytes.Index(remaining, []byte("-->"))
+			if endIdx < 0 {
+				return nil
+			}
+			jsonStr := strings.TrimSpace(string(remaining[len(cache.FooterMarker):endIdx]))
+			var fm cache.FooterMetadata
+			if jErr := json.Unmarshal([]byte(jsonStr), &fm); jErr != nil {
+				return nil
+			}
+			hasNarrative := false
+			for _, t := range fm.Tags {
+				if t == "narrative" {
+					hasNarrative = true
+					break
+				}
+			}
+			if !hasNarrative {
+				return nil
+			}
+			excluded := map[string]bool{"genesis-archive": true, "fallback": true, "gap-compacted": true}
+			for _, t := range fm.Tags {
+				if excluded[t] {
+					return nil
+				}
+			}
+			episodes = append(episodes, epInfo{id: fm.ID, time: fm.Created, path: fp})
+			return nil
+		}
+
+		// Fallback: try YAML frontmatter (v0.3.x)
+		parts := bytes.SplitN(content, []byte("---"), 3)
+		if len(parts) >= 3 && len(bytes.TrimSpace(parts[0])) == 0 {
+			var meta struct {
+				Tags []string `yaml:"tags"`
+			}
+			if yErr := yaml.Unmarshal(parts[1], &meta); yErr == nil {
+				hasNarrative := false
+				for _, t := range meta.Tags {
+					if t == "narrative" {
+						hasNarrative = true
+						break
+					}
+				}
+				if hasNarrative {
+					info, iErr := d.Info()
+					if iErr == nil {
+						episodes = append(episodes, epInfo{id: strings.TrimSuffix(d.Name(), ".md"), time: info.ModTime(), path: fp})
+					}
+				}
+			}
+		}
+		return nil
+	})
+
+	if len(episodes) == 0 {
+		return "", "", false, nil
+	}
+
+	sort.Slice(episodes, func(i, j int) bool {
+		return episodes[i].time.After(episodes[j].time)
+	})
+
+	latest := episodes[0]
+	bodyContent, rErr := os.ReadFile(latest.path)
+	if rErr != nil {
+		return "", "", false, rErr
+	}
+
+	// Strip footer metadata
+	idx := bytes.LastIndex(bodyContent, []byte(cache.FooterMarker))
+	if idx >= 0 {
+		bodyContent = bodyContent[:idx]
+	}
+
+	// Strip YAML frontmatter if present (for v0.3.x episodes)
+	if bytes.HasPrefix(bodyContent, []byte("---")) {
+		parts := bytes.SplitN(bodyContent, []byte("---"), 3)
+		if len(parts) >= 3 {
+			bodyContent = bytes.TrimLeft(parts[2], "\n\r")
+		}
+	}
+
+	bodyContent = bytes.TrimSpace(bodyContent)
+	return latest.id, string(bodyContent), true, nil
 }
 
 // RebuildResult is the structured result of a runAutoRebuild call.
@@ -2637,6 +2955,16 @@ func handleConnection(conn net.Conn) {
 			go handleDeleteEpisode(conn, req)
 		case "ai.batchDeleteEpisodes":
 			go handleBatchDeleteEpisodes(conn, req)
+		case "cache.enqueueBatch":
+			go handleCacheEnqueueBatch(conn, req)
+		case "cache.leaseNext":
+			go handleCacheLeaseNext(conn, req)
+		case "cache.ack":
+			go handleCacheAck(conn, req)
+		case "cache.retry":
+			go handleCacheRetry(conn, req)
+		case "cache.getLatestNarrative":
+			go handleGetLatestNarrative(conn, req)
 		case "ping":
 			go sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "pong", ID: req.ID})
 		default:

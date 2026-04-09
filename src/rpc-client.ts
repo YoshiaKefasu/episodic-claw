@@ -583,10 +583,12 @@ export class EpisodicCoreClient {
     return this.request<string[]>("ai.batchIngest", { items, agentWs, savedBy });
   }
 
+  /** Fallback/legacy path for non-narrative index rebuilds. Primary narrative path is cache DB. */
   async triggerBackgroundIndex(filePaths: string[], agentWs: string): Promise<string> {
     return this.request<string>("ai.triggerBackgroundIndex", { filePaths, agentWs });
   }
 
+  /** @deprecated No-op compatibility shim. D1 consolidation is no longer used in v0.4.x. */
   async consolidate(agentWs: string, apiKey: string): Promise<string> {
     return this.request<string>("ai.consolidate", { agentWs, apiKey });
   }
@@ -601,6 +603,28 @@ export class EpisodicCoreClient {
 
   async batchDeleteEpisodes(paths: string[], agentWs: string): Promise<string> {
     return this.request<string>("ai.batchDeleteEpisodes", { paths, agentWs });
+  }
+
+  // --- Cache Queue RPC methods (v0.4.2) ---
+
+  async cacheEnqueueBatch(items: any[]): Promise<{ enqueued: number }> {
+    return this.request<{ enqueued: number }>("cache.enqueueBatch", { items });
+  }
+
+  async cacheLeaseNext(workerId: string, agentId: string, leaseSeconds = 60): Promise<any | null> {
+    return this.request<any | null>("cache.leaseNext", { workerId, agentId, leaseSeconds });
+  }
+
+  async cacheAck(id: string, workerId: string): Promise<string> {
+    return this.request<string>("cache.ack", { id, workerId });
+  }
+
+  async cacheRetry(id: string, workerId: string, error: string, maxAttempts = 20, backoffSec = 0): Promise<string> {
+    return this.request<string>("cache.retry", { id, workerId, error, maxAttempts, backoffSec });
+  }
+
+  async cacheGetLatestNarrative(agentWs: string, agentId: string): Promise<{ episodeId: string; body: string; found: boolean }> {
+    return this.request("cache.getLatestNarrative", { agentWs, agentId });
   }
 }
 
@@ -774,40 +798,37 @@ export function parseJsonlToMessages(sessionFile: string): Array<{ role: string;
 }
 
 /**
- * ingestColdStartSession converts a .jsonl session into .md episodes via the existing pipeline.
- * If API key is available, it uses triggerBackgroundIndex (high quality).
- * If not, it falls back to direct .md file creation (text-only, zero API cost).
+ * ingestColdStartSession converts a .jsonl session into narrative cache queue items.
+ * v0.4.2+: All cold-start data flows through the cache DB for sequential narrativization.
+ * Zero-API fallback: creates .md files directly with genesis-archive tag.
  */
 export async function ingestColdStartSession(
   sessionFile: string,
   agentWs: string,
+  agentId: string,
   client: EpisodicCoreClient,
   hasApiKey: boolean
 ): Promise<number> {
   const messages = parseJsonlToMessages(sessionFile);
   if (messages.length === 0) return 0;
 
-  const chunkSize = 50;
-  const chunks: typeof messages[] = [];
-  for (let i = 0; i < messages.length; i += chunkSize) {
-    chunks.push(messages.slice(i, i + chunkSize));
-  }
+  // Combine all messages into a single raw text blob
+  const rawText = messages.map(m => `${m.role}: ${m.content}`).join("\n\n");
 
   if (hasApiKey) {
-    // High-quality path: use existing processBacklogFile pipeline
-    const tempDir = path.join(os.tmpdir(), `episodic-claw-coldstart-${Date.now()}`);
-    fs.mkdirSync(tempDir, { recursive: true });
-
-    for (let i = 0; i < chunks.length; i++) {
-      const tempFile = path.join(tempDir, `chunk-${i}.json`);
-      fs.writeFileSync(tempFile, JSON.stringify(chunks[i].map(m => ({ role: m.role, content: m.content }))));
-      await client.triggerBackgroundIndex([tempFile], agentWs);
+    // v0.4.2: Split into 64K chunks and enqueue to cache DB for narrativization
+    const { splitIntoChunks, enqueueNarrativeChunks } = require("./narrative-queue");
+    const chunks = splitIntoChunks(rawText, agentWs, agentId, "cold-start", "cold-start-import", 0);
+    try {
+      await enqueueNarrativeChunks(client, chunks);
+      console.log(`[ColdStart] Enqueued ${chunks.length} chunks for narrative generation from ${sessionFile}`);
+    } catch (err) {
+      console.error("[ColdStart] Cache enqueue failed, falling back to direct ingest:", err);
+      // Fallback to old path if cache enqueue fails
+      await ingestColdStartSessionFallback(messages, agentWs, client);
     }
-
-    // Cleanup temp files
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   } else {
-    // Zero-API fallback: create .md files directly
+    // Zero-API fallback: create .md files directly with genesis-archive tag
     const now = new Date();
     const dateDir = path.join(agentWs,
       String(now.getFullYear()),
@@ -815,15 +836,18 @@ export async function ingestColdStartSession(
       String(now.getDate()).padStart(2, "0"));
     fs.mkdirSync(dateDir, { recursive: true });
 
-    for (let i = 0; i < chunks.length; i++) {
-      const body = chunks[i].map(m => `${m.role}: ${m.content}`).join("\n\n");
-      const slug = `genesis-chunk-${String(i).padStart(4, "0")}`;
+    // Split into manageable chunks
+    const chunkSize = 50;
+    for (let i = 0; i < messages.length; i += chunkSize) {
+      const chunk = messages.slice(i, i + chunkSize);
+      const body = chunk.map(m => `${m.role}: ${m.content}`).join("\n\n");
+      const slug = `genesis-chunk-${String(Math.floor(i / chunkSize)).padStart(4, "0")}`;
       const mdPath = path.join(dateDir, `${slug}.md`);
 
       const fm = [
         "---",
         `id: ${slug}`,
-        `title: "Genesis Session Chunk ${i + 1}"`,
+        `title: "Genesis Session Chunk ${Math.floor(i / chunkSize) + 1}"`,
         `tags: [genesis-archive]`,
         `saved_by: auto`,
         "---",
@@ -836,6 +860,33 @@ export async function ingestColdStartSession(
   }
 
   return messages.length;
+}
+
+/**
+ * Fallback: use the old triggerBackgroundIndex path if cache enqueue fails.
+ */
+async function ingestColdStartSessionFallback(
+  messages: Array<{ role: string; content: string }>,
+  agentWs: string,
+  client: EpisodicCoreClient
+): Promise<void> {
+  const chunkSize = 50;
+  const chunks: typeof messages[] = [];
+  for (let i = 0; i < messages.length; i += chunkSize) {
+    chunks.push(messages.slice(i, i + chunkSize));
+  }
+
+  const tempDir = path.join(os.tmpdir(), `episodic-claw-coldstart-${Date.now()}`);
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  for (let i = 0; i < chunks.length; i++) {
+    const tempFile = path.join(tempDir, `chunk-${i}.json`);
+    fs.writeFileSync(tempFile, JSON.stringify(chunks[i].map(m => ({ role: m.role, content: m.content }))));
+    await client.triggerBackgroundIndex([tempFile], agentWs);
+  }
+
+  // Cleanup temp files
+  try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 }
 
 /**

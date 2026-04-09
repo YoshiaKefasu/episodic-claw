@@ -5,18 +5,19 @@
 
 **The "never-forget" long-term episodic memory for OpenClaw agents.**
 
-[![version](https://img.shields.io/badge/version-0.3.5--2-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
+[![version](https://img.shields.io/badge/version-0.4.2--2-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
 
 English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 </div>
 
 Conversations are saved locally. When you chat, it searches past history by "meaning" instead of just keyword matching, and slips the right memories into the AI's prompt before it even replies. This makes OpenClaw actually remember what you talked about last week without you having to re-explain it.
 
-With the `v0.3.5` era, the engine took a massive architectural leap. Instead of wrestling to compress memories ourselves, we now fully delegate the heavy-lifting of compaction back to OpenClaw's native LLM. But to ensure zero context loss, we use automatic "Lifecycle Hooks". Right before memory is wiped, the `before_compaction` hook saves everything. The AI can also proactively write an `ep-anchor` throughout the chat. Once compaction wipes the mental slate clean, we seamlessly inject that anchor right back into the active prompt via the `after_compaction` hook so the AI never misses a beat.
+With the `v0.4.2` era, we threw out the old playbook and rebuilt the core into what I call the **Sequential Narrative Architecture (Cache-and-Drain Model)**. 
+Ever tried dumping a 500,000-token chat log into an AI, only for it to panic and crash? Yeah, no more. Now, any massive pile of raw chat logs goes straight into a "Cache DB" waiting room. The plugin safely slices it up into 64K chunks, and a background worker quietly pulls them out one by one, turning them into beautiful, continuous TV-show-like "Episodes" over time. Even if you rip the power cord out of your PC mid-thought, the waiting room keeps its place in line.
 
-Plus, background memories now perfectly match your native language! If you chat in Japanese, the AI's internal long-term memories stay in Japanese. We also added a smart 24-turn cooldown guard so the AI doesn't spam itself with the exact same memory over and over.
+We kept all the absurd durability from before, too: native language-matching episode generation, our 24-turn cooldown guard, and `before_compaction` Ninja Hooks to safely bounce memories right before the host wipes the slate clean.
 
-> Check the `v0.3.x` roadmap and master plan [here](./docs/v0.3.0_master_plan.md).
+> Check the `v0.4.x` roadmap and master plan [here](./docs/plans/v0.4.0_narrative_architecture_roadmap.md).
 
 ---
 
@@ -60,31 +61,18 @@ sequenceDiagram
 
 ![Sequence diagram: episodic recall flow](docs/sequenceDiagram.png)
 
-And while you are chatting, new memories are being made in the background:
-- **Step A — Surprise Score watches for a topic change.** After each message, the system calculates a score: "Did the topic just completely change?" If yes, it clips the previous chat into a saved memory (Bayesian Segmentation).
-- **Step B — Bulletproof Saving.** To make sure nothing is lost if your PC crashes, the chat passes through a Write-Ahead-Log (WAL Queue) before the Go sidecar embeds it and saves it forever into Pebble DB. Large files or messy payloads (like huge JSONs) are automatically stripped to save space.
+And while you are chatting, new memories are being made in the background (this is the v0.4.2 magic):
+- **Step A — Off to the Cache DB Waiting Room.** Whenever conversation logs come in, even if it's a giant tsunami of text, the system slices it into safe 64K chunks and puts them in a temporary queue. No panic, no crashed APIs.
+- **Step B — Sequential Drain into Episodes.** A background worker pulls conversations from the waiting room one by one, hands them to the AI to convert into a narrative "Episode," and saves it to the Pebble DB. Because it remembers the context of the *previous* episode, your memories play out seamlessly like Episode 1, 2, and 3 of an anime.
 
 ---
 
-## <img src="./assets/icons/layers-3.svg" width="24" align="center" alt="" /> Memory Hierarchy (D0 / D1)
+## <img src="./assets/icons/layers-3.svg" width="24" align="center" alt="" /> Episodic Memory Structure
 
-> **TL;DR:** D0 is a raw, messy diary entry. D1 is the neat summary you wrote later so you wouldn't have to read the whole diary.
+Starting from v0.4.2, you no longer need to worry about complex internal structures like "memory tiers" or "summary algorithms". You just need to know this: **Every chat turns into a continuous, flowing Episode.**
 
-### <img src="./assets/icons/file-text.svg" width="24" align="center" alt="" /> D0 — Raw Episodes
-
-Whenever the chat topic changes, the buffer is saved as a D0 episode. These are verbatim logs: detailed, timestamped, and long.
-- Safely dumped into Pebble DB with a vector and word index.
-- Auto-tagged with hints like `auto-segmented`.
-- Instantly retrievable.
-
-### <img src="./assets/icons/moon.svg" width="24" align="center" alt="" /> D1 — Summarized Long-Term Memory (Sleep Consolidation)
-
-Over time, Background Workers group up multiple D0s and ask the LLM to compress them into a short D1 summary. This is basically human sleep consolidation: the clutter fades, the important lesson stays. 
-
-**Now natively language-aware!** If your raw chats were in Spanish, your D1 summary stays in Spanish.
-
-- Token cost drops massively while the meaning survives.
-- If the AI needs the gritty details, the `ep-expand` tool lets it drill from a D1 summary back to the raw D0 logs.
+- **Episode Generation:** The text chunks from the Cache DB wait in line and get sequentially formed into continuous story-like Episodes, safely dropped into Pebble DB.
+- **Natively language-aware!** If your raw chats were in Spanish, the background notes and concepts stay in Spanish.
 
 ### <img src="./assets/icons/zap.svg" width="24" align="center" alt="" /> What is Surprise Score?
 
@@ -94,20 +82,17 @@ Because of this, your memories don't mush into one giant, pointless blob.
 
 ---
 
-## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.3.5 so insane (Delegation & Refinement Era)
+## <img src="./assets/icons/rocket.svg" width="24" align="center" alt="" /> What makes v0.4.x so insane (The Indestructible Narrative Queue)
 
-We completely rethought the architecture here. Trying to do "everything" ourselves was dropping the big picture. Now, we delegate the heavy lifting to the Host, and focus purely on being a reliable memory bodyguard.
+We got tired of seeing API crash errors when feeding agents massive chat histories, or losing the context of a story just because we restarted our PC. So we completely re-engineered how memories are ingested.
 
-- **Delegated Compaction & Automatic Hooks**: `episodic-claw` no longer hogs the compaction cycle. OpenClaw handles the heavy LLM crunching natively. We use a `before_compaction` hook to intercept the process 1ms before it gets wiped, and safely freeze all unsaved chats into the DB.
-- **Proactive Anchors (`ep-anchor`)**: The Agent can now decide "Oh, this is important" and use the `ep-anchor` tool to write a dense session summary on its own terms, whenever it wants.
-- **Auto-Injection (`after_compaction`)**: Right after OpenClaw wipes the chat window, we restore context via the `after_compaction` hook, grab the Anchor the agent wrote, and inject it straight back into the active prompt. The AI literally doesn't even feel the memory wipe.
-- **Native Language Matching**: D1 summaries, titles, and generated topics now strictly respect the language of the source text. Your memories stay in the language you speak!
-- **Smart Recall Cooldown Guard**: To save your agent's context window from getting spammed, the same memory will wait 24 turns before it can be injected again. The AI won't act like a broken record.
-- **Inherited Bulletproof Defense**: All the insane durability from v0.3.0 (WAL queues, rate limit escalation strategies, auto-repair) is still intact. Your memories are safer than ever.
-- **Dropped the Clunky Stuff**: Since the Host now manages the memory limits, we deleted all our clunky "Context Pressure Monitor" logic. The plugin is leaner, meaner, and completely driven by automatic hooks (`before_prompt_build`).
+- **The Cache DB Buffer**: Dumping huge amounts of raw data (like Cold-start imports) all at once used to fry the system. Now, everything goes through a single bottleneck that chops it into safe, 64K-limit chunks. They wait patiently in the Cache DB.
+- **Per-Agent Continuity**: If your worker dies halfway through narrativizing an episode, chill. On the next startup, it fetches exactly where that specific agent left off and seamlessly writes the next episode. No continuity gaps.
+- **Exponential Backoff Overdrive**: if an API yells "Too Many Requests (429)," the plugin doesn't die. It just backs off for 5 seconds... then 10... then 20, casually retrying until it gets the job done.
+- **Delegated Compaction & Ninja Hooks**: `episodic-claw` no longer hogs the compaction cycle. OpenClaw handles the heavy LLM crunching natively. We simply use a `before_compaction` hook to intercept the process 1ms before it gets wiped, and safely freeze all unsaved chats into our waiting room. Literal zero percent data loss.
+- **Native Language Matching**: Generated topics, continuous episodes, and metadata strictly respect the language of the source text. Your memories stay in the language you actually speak!
 
-
-> (**Special Thanks: lossless-claw**) The insane paranoic resilience in v0.3.0—the auto-repairing transcripts and the never-surrender rate limit handling (Phase 7)—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.
+> (**Special Thanks: lossless-claw**) The insane paranoid resilience in this engine—the auto-repairing transcripts and the never-surrender rate limit handling—was directly ported from our sister project, `lossless-claw`. Without the brutal trial-by-fire and architectural breakthroughs made there, this level of stability in episodic-claw wouldn't be possible today.
 
 ---
 
@@ -126,7 +111,7 @@ AI agents can hallucinate or run destructive commmands if not guided properly. C
 ```
 **[SYSTEM INSTRUCTION: EPISODIC-CLAW INSTALLATION SEQUENCE]**
 
-You are to install the long-term memory extension plugin (episodic-claw v0.3.5) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
+You are to install the long-term memory extension plugin (episodic-claw v0.4.2) onto yourself. You MUST follow these exact steps in order. Do NOT execute alternative commands or modify user files independently.
 
 **[ Execution Steps ]**
 1. **Pre-check:** Run `openclaw --version` in the terminal to verify the CLI is available. (If this fails, STOP immediately and ask me for help).
@@ -135,12 +120,12 @@ You are to install the long-term memory extension plugin (episodic-claw v0.3.5) 
 4. **API Key Check:** The underlying backend requires a `GEMINI_API_KEY` in the environment. Verify if you have access to this environment variable. If missing or unsure, STOP and ask me to provide it. Do NOT hallucinate a key.
 5. **Tool Verification:** Check your available tools to confirm you now possess `ep-recall`, `ep-save`, `ep-expand`, and `ep-anchor`.
 6. **Configuration Auto-Tuning & Safety Lock:** Read the `openclaw.plugin.json` schema to understand all available properties (e.g., `reserveTokens`, `segmentationLambda` and their blast radius warnings). Based on our recent chat history and behavior, ponder the most optimal configuration for my needs. However, if you are unsure about ANY property, you MUST leave it at default/OFF and explicitly ask me: "How should I configure [Property]?" Do NOT guess.
-7. **Gateway Restart & Sleep Notice:** A restart of the OpenClaw Gateway or system is required to apply the plugin. Do NOT execute the restart command immediately. You MUST schedule a 6-minute sleep/wait before the command. Before going into sleep, inform me with a message like: *"A restart is required and will execute in 6 minutes. During the exact moment of restart, my consciousness will cut off before we can fully verify the installation. Please send me a message to wake me up when it's done so we can finish the test."*
+7. **Gateway Restart & Sleep Notice:** A restart of the OpenClaw Gateway or system is required to apply the plugin. Do NOT execute the restart command immediately. You MUST schedule a 6-minute sleep/wait before the command. Before going into sleep, inform me with a message like: *"A restart is required and will execute in 6 minutes. During the exact moment of restart, my consciousness will temporarily cut off. Please send me a message to wake me up when the restart is done."*
 
 **[ Final Test (After Restart & Wake-up) ]**
 (Execute this only after I wake you up post-restart)
 Once you are back online and all steps are cleared, test the system by using `ep-save` to permanently store this exact memory:
-* "Today, my memory system was upgraded to 64,000 tokens via episodic-claw."
+* "Today, I was upgraded with a rock-solid 64K-scale long-term memory architecture via episodic-claw."
 
 If you understand these constraints, begin sequentially from Step 1.
 ```
@@ -155,25 +140,27 @@ The AI can use these automatically, or you can explicitly tell it to use them.
 |---|---|---|
 | `ep-recall` | Manual memory search | Tell the AI "Hey, remember what we talked about yesterday regarding X?" and it deliberately digs up that memory. |
 | `ep-save` | Manual memory save | Tell the AI "Remember this strictly" and it forcefully saves it instantly. Perfect for rules, coding preferences, or hard facts you never want it to forget. |
-| `ep-expand` | Expand a summary back into detail | If the AI reads a D1 summary but says "I need the exact code snippet from that", it uses this tool to unfold the summary back into the massive D0 log. |
+| `ep-expand` | Lookup & expand details | If the AI reads a summarized episode but thinks "I need the exact details from that conversation", it uses this tool to unfold the archived logs. |
 | `ep-anchor` | Proactive session anchor | Before the context window gets bloated, the Agent can write down the key decisions, mindset, and current goals into a dense session anchor. When the memory inevitably gets compressed, this anchor flawlessly bridges the context gap. |
 
 ---
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
 
-The defaults are already heavily tuned, but here is what happens if you mess with them.
+The defaults are already heavily tuned. 
+*Note: Old limits like `maxBufferChars` or `maxPoolChars` still exist under the hood for runtime compatibility, but they have been downgraded to "Advanced/Legacy" knobs. You don't need to touch them anymore.*
 
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
 | `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |
-| `maxBufferChars` | `7200` | **Too high:** You risk losing a massive chunk of chat if the PC crashes. **Too low:** The AI murders your hard drive by saving tiny files every second. |
-| `maxCharsPerChunk` | `9000` | **Too high:** Heavy text blocks choke the database. **Too low:** Long chats get chopped into random pieces, ruining search context. |
+| `maxBufferChars` | `7200` | **[Advanced]** Serves as an upper limit in the live path to forcefully flush the buffer into the Cache DB before a natural topic shift occurs. |
+| `maxPoolChars` | `15000` | **[Advanced]** Serves as the threshold trigger for the narrative pool. Exceeding this forcefully executes the sequential episode generation. |
+| `maxCharsPerChunk` | `9000` | **[Legacy]** Compatibility parameter strictly for the legacy `chunkAndIngest` path. Purely irrelevant for modern narrative users. |
 | `segmentationLambda` | `2.0` | Topic sensitivity. **Too high:** It never cuts the memory, creating huge blobs. **Too low:** The AI snaps memories in half just because you used a new fancy word. |
 | `recallSemanticFloor` | `(unset)` | **Too high:** Perfectionist AI refuses to recall *anything*. **Too low:** It drags up totally unrelated garbage and starts lying (hallucination). |
 | `lexicalPreFilterLimit`| `1000` | **Too high:** CPU catches fire trying to do math on the whole DB. **Too low:** The text filter wrongly throws away brilliant memories. |
-| `enableBackgroundWorkers` | `true` | **false:** You save a few pennies on API calls, but your database turns into an uncompressed, messy junkyard. |
+| `enableBackgroundWorkers` | `true` | Background maintenance wrapper for ingestion and fallback compatibility. **false:** You save a few pennies on API calls, but older messy data piles up and you lose background optimizations. |
 | `recallReInjectionCooldownTurns` | `24` | **Too high:** The AI forgets a memory if you bring it up again much later in a long session. **Too low:** The AI gets spammed with the exact same memory in its system prompt every single turn, wasting tokens. |
 
 There are other micro-settings, but genuinely, unless you know what you are doing, stick to the defaults.
@@ -193,7 +180,7 @@ This project isn't pretending to be neuroscience, but it's not random architectu
     - **Bayesian Surprise Predicts Human Event Segmentation** ([PMC11654724](https://pmc.ncbi.nlm.nih.gov/articles/PMC11654724/))
     - **Robust Bayesian Online Changepoint Detection** ([arXiv:2302.04759](https://arxiv.org/abs/2302.04759))
 
-3. D1 consolidation, context, and human-like grouping
+3. Narrative Consolidation, context, and human-like grouping
     - **Neural Contiguity Effect** ([PMC5963851](https://pmc.ncbi.nlm.nih.gov/articles/PMC5963851/))
     - **Contextual prediction errors reorganize episodic memories** ([PMC8196002](https://pmc.ncbi.nlm.nih.gov/articles/PMC8196002/))
     - **Schemas provide a scaffold for neocortical integration** ([PMC9527246](https://pmc.ncbi.nlm.nih.gov/articles/PMC9527246/))

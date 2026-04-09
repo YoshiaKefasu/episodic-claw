@@ -3,6 +3,7 @@ import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
 import { NarrativePool } from "./narrative-pool";
 import { NarrativeWorker } from "./narrative-worker";
+import { splitIntoChunks, enqueueNarrativeChunks } from "./narrative-queue";
 import * as fs from "fs";
 import * as path from "path";
 import type { PoolFlushItem } from "./types";
@@ -314,8 +315,9 @@ export class EventSegmenter {
   }
 
   /**
-   * Pool mode: accumulate messages in NarrativePool, enqueue for narrativization.
-   * Fire-and-forget — saves raw log as fallback, then queues for narrative generation.
+   * Pool mode (v0.4.2): accumulate messages in NarrativePool, split into 64K chunks,
+   * and enqueue to the Go cache DB for sequential narrativization.
+   * Fire-and-forget — never awaited by processTurn.
    */
   private async poolAndQueue(agentWs: string, agentId: string, surprise: number, reason: string): Promise<void> {
     if (!this.pool || !this.narrativeWorker) return;
@@ -326,17 +328,14 @@ export class EventSegmenter {
     this.lastProcessedLength = 0;
 
     if (item) {
-      // Flush occurred: clear pool buffer and process the item.
+      // Flush occurred: clear pool buffer and process.
       this.pool.clear();
 
-      // Fire-and-forget: save raw log as fallback
-      this.saveRawLog(item, agentWs).catch(err =>
-        console.error("[Episodic Memory] Raw log save failed:", err)
-      );
-
-      // Enqueue for narrative generation
-      this.narrativeWorker.enqueue(item).catch(err =>
-        console.error("[Episodic Memory] Narrative enqueue failed:", err)
+      // Split into 64K chunks and enqueue to cache DB
+      const cacheReason = (reason === "surprise-boundary" ? "surprise-boundary" : "size-limit") as "surprise-boundary" | "size-limit";
+      const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise);
+      enqueueNarrativeChunks(this.rpc, chunks).catch(err =>
+        console.error("[Episodic Memory] Cache enqueue failed:", err)
       );
     }
     // If item is null, pool is still buffering; do not clear it.
@@ -354,7 +353,7 @@ export class EventSegmenter {
   }
 
   /**
-   * Forcibly flushes the current buffer to an episode regardless of surprise score.
+   * Forcibly flushes the current buffer to the cache queue regardless of surprise score.
    * Useful before compact() to ensure no context is lost.
    */
   async forceFlush(agentWs: string, agentId: string = ""): Promise<void> {
@@ -363,13 +362,13 @@ export class EventSegmenter {
       console.log(`[Episodic Memory] Force flushing segmenter buffer (${this.buffer.length} messages)...`);
 
       if (this.pool && this.narrativeWorker) {
-        // Pool mode: Add segmenter buffer to pool first, then force flush.
+        // Pool mode (v0.4.2): add to pool, split, and enqueue to cache DB
         this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
         const item = this.pool.forceFlush(agentWs, agentId);
         this.pool.clear();
         if (item) {
-          await this.saveRawLog(item, agentWs);
-          await this.narrativeWorker.enqueue(item);
+          const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0);
+          await enqueueNarrativeChunks(this.rpc, chunks);
         }
         this.buffer = [];
         this.lastProcessedLength = 0;

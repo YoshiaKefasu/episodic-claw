@@ -1,14 +1,13 @@
 /**
- * NarrativeWorker — Async narrative generation worker.
- * Queues conversation segments, sends them to OpenRouter for narrativization,
- * and falls back to raw log saving on failure.
- * KISS: Single concurrent request, FIFO queue, exponential backoff retry.
+ * NarrativeWorker — Async narrative generation worker (v0.4.2 pull-based).
+ * Pulls chunks from the Go cache DB via LeaseNext, narrativizes via OpenRouter,
+ * and Ack/Retries the cache job. Per-agent continuity state is maintained.
  */
 
 import { estimateTokens } from "./utils";
 import { OpenRouterClient } from "./openrouter-client";
 import { EpisodicCoreClient } from "./rpc-client";
-import { EpisodicPluginConfig, PoolFlushItem, NarrativeResult } from "./types";
+import { EpisodicPluginConfig, NarrativeResult } from "./types";
 import { buildFallbackSummary } from "./summary-escalation";
 import type { Message } from "./segmenter";
 
@@ -28,11 +27,28 @@ ${conversationText}`;
 
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 1000;
+const MAX_CACHE_ATTEMPTS = 20;
+const POLL_INTERVAL_MS = 1000;
+const LEASE_SECONDS = 120;
+
+interface CacheItem {
+  id: string;
+  agentWs: string;
+  agentId: string;
+  source: string;
+  rawText: string;
+  estimatedTokens: number;
+  attempts: number;
+}
 
 export class NarrativeWorker {
-  private queue: PoolFlushItem[] = [];
   private isProcessing = false;
-  private lastFullEpisode = ""; // Previous episode full text for context continuity
+  private shouldStop = false;
+  private pollTimer: NodeJS.Timeout | null = null;
+  // Per-agent continuity state
+  private lastNarrativeByAgent = new Map<string, { episodeId: string; body: string }>();
+  // Known agent IDs to poll (populated by initContinuity)
+  private knownAgentIds = new Set<string>();
 
   constructor(
     private client: OpenRouterClient,
@@ -41,54 +57,108 @@ export class NarrativeWorker {
   ) {}
 
   /**
-   * Enqueue a conversation segment for narrativization.
-   * Fire-and-forget: processing happens asynchronously.
+   * Start polling the cache queue for items to narrativize.
+   * Fire-and-forget: runs in the background until stop() is called.
    */
-  async enqueue(item: PoolFlushItem): Promise<void> {
-    this.queue.push(item);
-    if (!this.isProcessing) {
-      this.processNext().catch((err) => {
-        console.error("[NarrativeWorker] Unhandled error in processNext:", err);
-      });
+  start(): void {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+    this.shouldStop = false;
+    this.pollNext();
+  }
+
+  /**
+   * Stop polling and wait for current processing to finish.
+   */
+  async stop(): Promise<void> {
+    this.shouldStop = true;
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    // Wait for current narrativization to finish (up to 15s)
+    let waited = 0;
+    while (this.isProcessing && waited < 15000) {
+      await this.sleep(100);
+      waited += 100;
     }
   }
 
   /**
-   * Drain the queue — wait until all queued items are processed.
-   * Used for graceful shutdown (session_end / gateway_stop).
+   * Initialize continuity state by loading the latest narrative episode per agent.
+   * Also populates the knownAgentIds set for multi-agent polling.
    */
-  async drain(): Promise<void> {
-    while (this.queue.length > 0 || this.isProcessing) {
-      await this.sleep(100);
-    }
-  }
-
-  private async processNext(): Promise<void> {
-    if (this.isProcessing || this.queue.length === 0) return;
-    this.isProcessing = true;
-
-    while (this.queue.length > 0) {
-      const item = this.queue.shift()!;
+  async initContinuity(agents: Array<{ agentWs: string; agentId: string }>): Promise<void> {
+    for (const { agentWs, agentId } of agents) {
+      this.knownAgentIds.add(agentId);
       try {
-        const result = await this.narrativizeWithRetry(item);
-        if (result) {
-          await this.saveNarrative(result, item);
-          this.lastFullEpisode = result.text;
-        } else {
-          await this.saveRawFallback(item);
+        const result = await this.rpcClient.cacheGetLatestNarrative(agentWs, agentId);
+        if (result?.found && result.body) {
+          this.lastNarrativeByAgent.set(agentId, { episodeId: result.episodeId, body: result.body });
+          console.log(`[NarrativeWorker] Loaded continuity for agent ${agentId}: ${result.episodeId}`);
         }
       } catch (err) {
-        console.error("[NarrativeWorker] Failed to process item:", err);
-        await this.saveRawFallback(item);
+        // No continuity available yet — that's fine
       }
     }
-
-    this.isProcessing = false;
   }
 
-  private async narrativizeWithRetry(item: PoolFlushItem): Promise<NarrativeResult | null> {
+  private pollNext(): void {
+    if (this.shouldStop) {
+      this.isProcessing = false;
+      return;
+    }
+
+    this.processNextFromCache().finally(() => {
+      if (!this.shouldStop) {
+        this.pollTimer = setTimeout(() => this.pollNext(), POLL_INTERVAL_MS);
+      } else {
+        this.isProcessing = false;
+      }
+    });
+  }
+
+  private async processNextFromCache(): Promise<void> {
+    try {
+      // Poll each known agent ID (multi-agent support)
+      const agentIds = this.knownAgentIds.size > 0 ? Array.from(this.knownAgentIds) : ["main"];
+      for (const agentId of agentIds) {
+        const item = await this.rpcClient.cacheLeaseNext("narrative-worker", agentId, LEASE_SECONDS);
+        if (!item) continue; // No items for this agent, try next
+
+        console.log(
+          `[NarrativeWorker] Leased chunk [${item.id}] attempt=${item.attempts} lease=${LEASE_SECONDS}s tokens=${item.estimatedTokens} agent=${agentId}`
+        );
+
+        try {
+          const result = await this.narrativizeWithRetry(item);
+          if (result) {
+            await this.saveNarrative(result, item);
+            await this.rpcClient.cacheAck(item.id, "narrative-worker");
+            console.log(`[NarrativeWorker] Successfully narrativized chunk [${item.id}]. (Output: ${result.tokens} tokens)`);
+          } else {
+            await this.rpcClient.cacheRetry(item.id, "narrative-worker", "Narrativization returned empty", MAX_CACHE_ATTEMPTS);
+            console.log(`[NarrativeWorker] Returned chunk [${item.id}] to queue after empty result.`);
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await this.rpcClient.cacheRetry(item.id, "narrative-worker", errMsg, MAX_CACHE_ATTEMPTS);
+          console.log(`[NarrativeWorker] Returned chunk [${item.id}] to queue. attempts increased error=${errMsg}`);
+        }
+        // Process one item per poll cycle to avoid starvation
+        return;
+      }
+    } catch (err) {
+      // Polling error — just retry after interval
+      console.warn("[NarrativeWorker] Poll error:", err);
+    }
+  }
+
+  private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
     const systemPrompt = this.resolveSystemPrompt();
-    const userMessage = this.resolveUserPrompt(item);
+    const previous = this.lastNarrativeByAgent.get(item.agentId);
+    const conversationText = item.rawText;
+    const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
@@ -101,18 +171,18 @@ export class NarrativeWorker {
       } catch (err) {
         const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         console.warn(
-          `[NarrativeWorker] Narrativize attempt ${attempt + 1}/${MAX_RETRIES} failed: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
+          `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES} failed for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
         );
         await this.sleep(delayMs);
       }
     }
 
-    return null; // All retries exhausted
+    return null;
   }
 
-  private async saveNarrative(result: NarrativeResult, item: PoolFlushItem): Promise<void> {
+  private async saveNarrative(result: NarrativeResult, item: CacheItem): Promise<void> {
     try {
-      const tags = ["narrative", item.reason === "force-flush" ? "manual-save" : "auto-segmented"];
+      const tags = ["narrative", item.source === "live-turn" ? "auto-segmented" : "cold-start-import"];
       await this.rpcClient.batchIngest(
         [
           {
@@ -120,7 +190,7 @@ export class NarrativeWorker {
             tags,
             topics: [],
             edges: [],
-            surprise: item.surprise,
+            surprise: 0,
             depth: 0,
             tokens: result.tokens,
           },
@@ -128,39 +198,11 @@ export class NarrativeWorker {
         item.agentWs,
         item.agentId,
       );
-      console.log(
-        `[NarrativeWorker] Saved narrative episode for ${item.agentId} (${result.tokens} tokens, model: ${result.model})`
-      );
+      // Update continuity state
+      this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${Date.now()}`, body: result.text });
     } catch (err) {
       console.error("[NarrativeWorker] Failed to save narrative episode:", err);
-      await this.saveRawFallback(item);
-    }
-  }
-
-  private async saveRawFallback(item: PoolFlushItem): Promise<void> {
-    try {
-      const fallbackText = buildFallbackSummary(item.messages);
-      const tags = ["fallback", "auto-segmented"];
-      await this.rpcClient.batchIngest(
-        [
-          {
-            summary: fallbackText,
-            tags,
-            topics: [],
-            edges: [],
-            surprise: item.surprise,
-            depth: 0,
-            tokens: estimateTokens(fallbackText),
-          },
-        ],
-        item.agentWs,
-        item.agentId,
-      );
-      console.warn(
-        `[NarrativeWorker] Fallback: saved raw summary for ${item.agentId} (${item.reason})`
-      );
-    } catch (err) {
-      console.error("[NarrativeWorker] Fallback save also failed:", err);
+      throw err; // Let caller handle via cache retry
     }
   }
 
@@ -170,25 +212,13 @@ export class NarrativeWorker {
     return DEFAULT_SYSTEM_PROMPT;
   }
 
-  private resolveUserPrompt(item: PoolFlushItem): string {
+  private resolveUserPrompt(previousEpisode: string | undefined, conversationText: string): string {
     const custom = this.config.narrativeUserPromptTemplate;
-    const conversationText = item.messages
-      .map((m) => {
-        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        return `${m.role}: ${text}`;
-      })
-      .join("\n");
-
     if (custom && custom.trim().length > 0) {
-      const previousRef = this.config.narrativePreviousEpisodeRef ?? true;
-      const previousEpisode = previousRef && this.lastFullEpisode ? this.lastFullEpisode : "";
       return custom
-        .replace("{previousEpisode}", previousEpisode)
+        .replace("{previousEpisode}", previousEpisode || "")
         .replace("{conversationText}", conversationText);
     }
-
-    const previousRef = this.config.narrativePreviousEpisodeRef ?? true;
-    const previousEpisode = previousRef && this.lastFullEpisode ? this.lastFullEpisode : undefined;
     return DEFAULT_USER_PROMPT_TEMPLATE(previousEpisode, conversationText);
   }
 

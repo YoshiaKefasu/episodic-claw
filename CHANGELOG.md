@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.2] - 2026-04-10
+
+### Added
+- **Cold-Start Buffer Architecture (Cache DB)**: New Pebble-backed lease queue with 4 states (queued/leased/done/dead-letter) for durable, crash-safe narrative processing.
+- **64K Chunk Splitting**: Massive conversation logs (500k+ tokens) are safely split into 64K chunks before enqueueing, preventing API 400 errors from oversized payloads.
+- **Pull-based NarrativeWorker**: Worker now polls the cache DB instead of using an in-memory queue, with per-agent continuity via `lastNarrativeByAgent` Map.
+- **Continuity Restoration**: `GetLatestNarrative` scans episodes directory for latest narrative-tagged episode, with fallback to directory scan when cache queue isn't initialized yet. Supports both Invisible Footer (v0.4.0+) and YAML frontmatter (v0.3.x) formats.
+- **Exponential Backoff**: `backoffUntil` field added to queue items. Failed jobs are delayed-requeued with exponential backoff (2^attempt, max 300s cap), preventing hot retry loops.
+- **Multi-Agent Polling**: Worker polls each known agent ID in sequence instead of hardcoding `agentId="main"`.
+- **Crash Recovery**: Expired leases are automatically recovered on sidecar startup, resuming from where the worker left off.
+
+### Changed
+- **All 3 ingest paths unified**: Live ingest, cold-start import, and large gap archive (>50 msgs) now flow through the same `splitIntoChunks` + `enqueueNarrativeChunks` helper.
+- **Small gap exception**: Gaps ≤50 msgs continue to use `batchIngestWithEscalation` (intentional v0.4.2 scope exclusion, deferred to v0.4.3).
+- **Config descriptions updated**: `maxBufferChars` (advanced flush guard), `maxPoolChars` (advanced pool guard), `maxCharsPerChunk` (deprecated legacy-only), `enableBackgroundWorkers` (maintenance workers only).
+- **Flat narrative fields deprecated**: `openrouterModel`, `narrativeMaxTokens`, `narrativeTemperature` marked as legacy aliases for `openrouterConfig.*`.
+- **Compatibility keys disabled**: `sharedEpisodesDir` and `allowCrossAgentRecall` explicitly marked as disabled compatibility keys.
+- **`ai.consolidate` deprecated**: Marked as no-op compatibility shim. D1 consolidation is no longer used.
+- **Plugin description updated**: Changed from "D0/D1 hierarchical contextual memory" to "Sequential narrative memory with Cache-and-Drain architecture".
+- **`ep-expand` tool updated**: Description changed from D1/D0 expansion to episode lookup.
+
+### Fixed
+- **GetLatestNarrative AgentWs resolution**: Now resolves by `params.AgentWs` instead of scanning all queues. Falls back to direct directory scan when cache queue isn't initialized (e.g., at startup).
+- **YAML frontmatter stripping**: Both cache queue and directory scan paths now correctly strip YAML frontmatter when returning episode body.
+
 ## [0.4.1] - 2026-04-09
 
 ### Removed

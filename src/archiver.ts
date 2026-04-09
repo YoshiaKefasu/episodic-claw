@@ -3,6 +3,7 @@ import * as path from "path";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EventSegmenter, Message } from "./segmenter";
 import { BatchIngestItem } from "./types";
+import { splitIntoChunks, enqueueNarrativeChunks } from "./narrative-queue";
 import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel } from "./summary-escalation";
 
@@ -182,24 +183,25 @@ export class EpisodicArchiver {
     const slugs: string[] = [];
 
     if (unprocessed.length > 50) {
-      // Large gap: fire-and-forget background indexer
-      console.log(`[Episodic Memory] Massive gap detected (${unprocessed.length} msgs). Firing Background Indexer...`);
-      const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-      const dumpDir = path.join(params.agentWs, today.slice(0, 4), today.slice(4, 6), today.slice(6, 8));
-      await fsPromises.mkdir(dumpDir, { recursive: true });
-      const dumpFile = path.join(dumpDir, `legacy_backlog_${today}_${Date.now()}.json`);
-      await fsPromises.writeFile(dumpFile, JSON.stringify(unprocessed, null, 2), "utf-8");
-
-      const bgResult = await this.rpcClient.triggerBackgroundIndex([dumpFile], params.agentWs);
-      if (bgResult !== "ok") {
-        console.warn(
-          `[Episodic Memory] WARN: triggerBackgroundIndex returned unexpected response: "${bgResult}". ` +
-          `${unprocessed.length} messages may not be indexed.`
-        );
-      } else {
-        console.log(`[Episodic Memory] Background indexing accepted for ${unprocessed.length} messages.`);
+      // v0.4.2: Large gap → split into 64K chunks and enqueue to cache DB
+      console.log(`[Episodic Memory] Large gap detected (${unprocessed.length} msgs). Enqueuing to cache...`);
+      const rawText = unprocessed.map(m => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`).join("\n\n");
+      try {
+        const chunks = splitIntoChunks(rawText, params.agentWs, params.agentId, "gap-archive", "gap-archive", 0);
+        await enqueueNarrativeChunks(this.rpcClient, chunks);
+        console.log(`[Episodic Memory] Enqueued ${chunks.length} chunks for gap archive narrativization.`);
+        slugs.push(...chunks.map((c: any) => c.id));
+      } catch (err) {
+        console.error("[Episodic Memory] Gap archive cache enqueue failed, falling back to background indexer:", err);
+        // Fallback to old path
+        const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const dumpDir = path.join(params.agentWs, today.slice(0, 4), today.slice(4, 6), today.slice(6, 8));
+        await fsPromises.mkdir(dumpDir, { recursive: true });
+        const dumpFile = path.join(dumpDir, `legacy_backlog_${today}_${Date.now()}.json`);
+        await fsPromises.writeFile(dumpFile, JSON.stringify(unprocessed, null, 2), "utf-8");
+        await this.rpcClient.triggerBackgroundIndex([dumpFile], params.agentWs);
+        slugs.push(`Massive legacy context archived to background. Indexing ${unprocessed.length} messages.`);
       }
-      slugs.push(`Massive legacy context archived to background. Indexing ${unprocessed.length} messages.`);
     } else {
       // Normal gap: synchronous batchIngest in chunks
       console.log(`[Episodic Memory] Archiving ${unprocessed.length} unprocessed messages before compaction...`);
