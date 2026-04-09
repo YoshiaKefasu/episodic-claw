@@ -1,6 +1,11 @@
 import { EpisodicCoreClient } from "./rpc-client";
 import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
+import { NarrativePool } from "./narrative-pool";
+import { NarrativeWorker } from "./narrative-worker";
+import * as fs from "fs";
+import * as path from "path";
+import type { PoolFlushItem } from "./types";
 
 export const EXCLUDED_ROLES = new Set(["toolResult", "tool_result"]);
 
@@ -36,6 +41,11 @@ export class EventSegmenter {
   private segmentationCooldownTurns: number;
   private segmentationStdFloor: number;
   private segmentationFallbackThreshold: number;
+  // Surprise improvements (v0.4.0 Phase 3)
+  private segmentationTimeGapMinutes: number;
+  // Narrative architecture (v0.4.0)
+  private pool: NarrativePool | null;
+  private narrativeWorker: NarrativeWorker | null;
 
   constructor(
     rpc: EpisodicCoreClient,
@@ -49,18 +59,24 @@ export class EventSegmenter {
       cooldownTurns?: number;
       stdFloor?: number;
       fallbackThreshold?: number;
-    }
+      timeGapMinutes?: number;
+    },
+    pool?: NarrativePool | null,
+    narrativeWorker?: NarrativeWorker | null,
   ) {
     this.rpc = rpc;
     this.dedupWindow = dedupWindow;
     this.maxBufferChars = maxBufferChars;
     this.maxCharsPerChunk = maxCharsPerChunk;
     this.segmentationLambda = Math.max(0, tuning?.lambda ?? 2.0);
-    this.segmentationWarmupCount = Math.max(0, tuning?.warmupCount ?? 20);
+    this.segmentationWarmupCount = Math.max(0, tuning?.warmupCount ?? 10);  // Phase 3: was 20
     this.segmentationMinRawSurprise = Math.max(0, tuning?.minRawSurprise ?? 0.05);
     this.segmentationCooldownTurns = Math.max(0, tuning?.cooldownTurns ?? 2);
     this.segmentationStdFloor = Math.max(0.0001, tuning?.stdFloor ?? 0.01);
     this.segmentationFallbackThreshold = Math.max(0, tuning?.fallbackThreshold ?? 0.2);
+    this.segmentationTimeGapMinutes = tuning?.timeGapMinutes ?? 15;
+    this.pool = pool ?? null;
+    this.narrativeWorker = narrativeWorker ?? null;
   }
 
   private updateSegStats(value: number): void {
@@ -82,6 +98,37 @@ export class EventSegmenter {
     const shrink = 0.5;
     this.segCount = Math.max(1, Math.floor(this.segCount * shrink));
     this.segM2 *= shrink;
+  }
+
+  /**
+   * Phase 3: Detect time gap between user messages.
+   * Compares the last user message in the buffer with the first user message in the new batch.
+   * If the gap exceeds the configured threshold, force a segment boundary.
+   */
+  private isTimeGapBoundary(newMsgs: Message[]): boolean {
+    if (this.buffer.length === 0 || newMsgs.length === 0) return false;
+
+    // Find the last user message in the buffer
+    const lastBufferUser = [...this.buffer].reverse().find(m => m.role === "user" && m.timestamp);
+    // Find the first user message in the new messages
+    const firstNewUser = newMsgs.find(m => m.role === "user" && m.timestamp);
+
+    if (!lastBufferUser?.timestamp || !firstNewUser?.timestamp) return false;
+
+    const lastTs = new Date(lastBufferUser.timestamp).getTime();
+    const firstTs = new Date(firstNewUser.timestamp).getTime();
+    const gapMs = firstTs - lastTs;
+    const thresholdMs = this.segmentationTimeGapMinutes * 60 * 1000;
+    return gapMs > thresholdMs;
+  }
+
+  /**
+   * Phase 3: Simple adaptive lambda — 2-tier (KISS).
+   * Short sessions (<10 turns) use lower lambda for better sensitivity.
+   */
+  private getEffectiveLambda(): number {
+    if (this.segCount < 10) return Math.min(1.5, this.segmentationLambda);
+    return this.segmentationLambda;
   }
 
   /**
@@ -185,6 +232,15 @@ export class EventSegmenter {
     // 定期的なチャンク分割（Surprise判定を待たずにバッファが大きすぎる場合は強制分割）
     const estimatedChars = this.buffer.reduce((acc, m) => acc + extractText(m.content).length, 0);
 
+    // Phase 3: Time gap boundary check
+    if (this.isTimeGapBoundary(dedupedMessages)) {
+      console.log(`[Episodic Memory] Time gap boundary detected (${this.segmentationTimeGapMinutes}min threshold). Forcing segment...`);
+      await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap");
+      this.buffer = [...dedupedMessages];
+      this.lastProcessedLength = currentMessages.length;
+      return true;
+    }
+
     try {
       const sizeLimitExceeded = estimatedChars > this.maxBufferChars;
       this.turnSeq += 1;
@@ -195,7 +251,7 @@ export class EventSegmenter {
         turn: this.turnSeq,
         text1: oldSlice,
         text2: newSlice,
-        lambda: this.segmentationLambda,
+        lambda: this.getEffectiveLambda(),
         warmupCount: this.segmentationWarmupCount,
         minRawSurprise: this.segmentationMinRawSurprise,
         cooldownTurns: this.segmentationCooldownTurns,
@@ -222,14 +278,10 @@ export class EventSegmenter {
         // 2. Boundary crossed or Buffer too large! Trigger ingest for the OLD buffer
         const reason = sizeLimitExceeded ? "size-limit" : "surprise-boundary";
         console.log(`[Episodic Memory] ${reason} exceeded. Finalizing previous episode...`);
-        
-        // ==========================================
-        // 🔥 アーキテクチャ改修 (Audit対応) 🔥
-        // 直列awaitは絶対に行わず、Fire-and-Forgetとして非同期にバックグラウンドへ投げるだけにする。
-        // これによりNode.js (OpenClaw UI) が数分間ハングアップするのを完全に防ぐ。
-        // ==========================================
-        this.chunkAndIngest(this.buffer, agentWs, reason, agentId, surprise).catch(err => {
-          console.error("[Episodic Memory] Error in background chunkAndIngest:", err);
+
+        // Mode branching: pool+queue (v0.4.0) vs legacy chunkAndIngest (v0.3.x)
+        this.handleSegmentBoundary(agentWs, agentId, surprise, reason).catch(err => {
+          console.error("[Episodic Memory] Error in segment boundary handling:", err);
         });
         
         // Clear buffer and start fresh with the new context
@@ -250,6 +302,58 @@ export class EventSegmenter {
   }
 
   /**
+   * Mode branching: pool+queue (v0.4.0 narrative) vs legacy chunkAndIngest (v0.3.x).
+   * Fire-and-forget — never awaited by processTurn.
+   */
+  private async handleSegmentBoundary(agentWs: string, agentId: string, surprise: number, reason: string): Promise<void> {
+    if (this.pool && this.narrativeWorker) {
+      return this.poolAndQueue(agentWs, agentId, surprise, reason);
+    }
+    // Legacy path (v0.3.x) — no narrative architecture
+    return this.chunkAndIngest(this.buffer, agentWs, reason, agentId, surprise);
+  }
+
+  /**
+   * Pool mode: accumulate messages in NarrativePool, enqueue for narrativization.
+   * Fire-and-forget — saves raw log as fallback, then queues for narrative generation.
+   */
+  private async poolAndQueue(agentWs: string, agentId: string, surprise: number, reason: string): Promise<void> {
+    if (!this.pool || !this.narrativeWorker) return;
+
+    const item = this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
+    // Clear segmenter buffer immediately; messages are now in the pool.
+    this.buffer = [];
+    this.lastProcessedLength = 0;
+
+    if (item) {
+      // Flush occurred: clear pool buffer and process the item.
+      this.pool.clear();
+
+      // Fire-and-forget: save raw log as fallback
+      this.saveRawLog(item, agentWs).catch(err =>
+        console.error("[Episodic Memory] Raw log save failed:", err)
+      );
+
+      // Enqueue for narrative generation
+      this.narrativeWorker.enqueue(item).catch(err =>
+        console.error("[Episodic Memory] Narrative enqueue failed:", err)
+      );
+    }
+    // If item is null, pool is still buffering; do not clear it.
+  }
+
+  /**
+   * Save raw conversation log as .raw.md fallback file.
+   * Used when narrative generation fails or as backup data.
+   */
+  private async saveRawLog(item: PoolFlushItem, agentWs: string): Promise<void> {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const rawPath = path.join(agentWs, `${timestamp}.raw.md`);
+    await fs.promises.writeFile(rawPath, item.rawText, "utf8");
+    console.log(`[Episodic Memory] Raw log saved: ${rawPath}`);
+  }
+
+  /**
    * Forcibly flushes the current buffer to an episode regardless of surprise score.
    * Useful before compact() to ensure no context is lost.
    */
@@ -257,7 +361,22 @@ export class EventSegmenter {
     if (this.buffer.length === 0) return;
     try {
       console.log(`[Episodic Memory] Force flushing segmenter buffer (${this.buffer.length} messages)...`);
-      // forceFlushは同期完了を期待されるケースもあるためawaitする
+
+      if (this.pool && this.narrativeWorker) {
+        // Pool mode: Add segmenter buffer to pool first, then force flush.
+        this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
+        const item = this.pool.forceFlush(agentWs, agentId);
+        this.pool.clear();
+        if (item) {
+          await this.saveRawLog(item, agentWs);
+          await this.narrativeWorker.enqueue(item);
+        }
+        this.buffer = [];
+        this.lastProcessedLength = 0;
+        return;
+      }
+
+      // Legacy path (v0.3.x)
       await this.chunkAndIngest(this.buffer, agentWs, "force-flush", agentId);
       this.buffer = [];
     } catch (err) {

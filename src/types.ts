@@ -1,6 +1,8 @@
 /**
  * Edge defines a relationship pointer to another episode.
  */
+import type { Message } from "./segmenter";
+
 export interface Edge {
   id: string; // The target episode ID or local slug (e.g. 2026/03/14/abc)
   type: "temporal" | "semantic" | "causal";
@@ -68,6 +70,8 @@ export interface EpisodicPluginConfig {
   segmentationStdFloor?: number;
   /** 動的セグメンテーション: RPC 失敗時/ウォームアップ時の固定しきい値 */
   segmentationFallbackThreshold?: number;
+  /** Phase 3: ユーザーメッセージ間の時間ギャップがこれを超えると強制境界（分、デフォルト 15） */
+  segmentationTimeGapMinutes?: number;
   /** Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay. */
   recallSemanticFloor?: number;
   /** Recall calibration: cap usefulness posterior contribution so it stays a correction term. */
@@ -93,6 +97,29 @@ export interface EpisodicPluginConfig {
   queryExcludedKeywords?: string[];
   /** How many recent messages are used to build the deterministic recall query. Default: 4. */
   recallQueryRecentMessageCount?: number;
+  // Narrative architecture (v0.4.0)
+  /** OpenRouter API key. Falls back to OPENROUTER_API_KEY env var. Empty = disabled. */
+  openrouterApiKey?: string;
+  /** OpenRouter model ID for narrative generation. */
+  openrouterModel?: string;
+  /** Narrative system prompt (inline text). */
+  narrativeSystemPrompt?: string;
+  /** Narrative user prompt template (inline text). */
+  narrativeUserPromptTemplate?: string;
+  /** Maximum characters to pool before forcing a flush. */
+  maxPoolChars?: number;
+  /** Pass the full previous episode to the LLM for context continuity. */
+  narrativePreviousEpisodeRef?: boolean;
+  /** Max tokens for narrative summary (undefined = let OpenRouter decide). */
+  narrativeMaxTokens?: number;
+  /** Temperature for narrative generation (0-1, default 0.4). */
+  narrativeTemperature?: number;
+  /** Nested OpenRouter config for narrative generation. */
+  openrouterConfig?: {
+    model?: string;
+    maxTokens?: number;
+    temperature?: number;
+  };
 }
 
 export interface RecallCalibration {
@@ -163,4 +190,20 @@ export interface BatchIngestItem {
   depth?: number;
   tokens?: number;
   sources?: string[];
+}
+
+// Narrative architecture (v0.4.0) — moved from narrative-worker.ts (F2)
+export interface PoolFlushItem {
+  messages: Message[];
+  rawText: string;
+  surprise: number;
+  reason: "surprise-boundary" | "size-limit" | "force-flush";
+  agentWs: string;
+  agentId: string;
+}
+
+export interface NarrativeResult {
+  text: string;
+  tokens: number;
+  model: string;
 }

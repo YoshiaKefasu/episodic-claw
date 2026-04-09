@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.4.0] - 2026-04-09
+
+### Added
+- **Narrative Episode Architecture**: Conversation segments are now narrativized via OpenRouter (free models), producing readable, context-rich episode summaries instead of raw conversation logs.
+- **Invisible Footer Metadata**: Episode files now store metadata as an HTML comment at the end of the file. Opening an episode shows pure narrative text first — no YAML frontmatter.
+- **Time gap boundary detection**: Automatically segments when user message gap exceeds configurable threshold (default: 15 minutes).
+- **Adaptive Lambda (2-tier)**: Short sessions (<10 turns) use lower lambda (1.5) for better segmentation sensitivity.
+- **OpenRouter integration**: Configurable via `openrouterConfig` nested object or flat fields. Supports `model`, `maxTokens` (optional), and `temperature` settings.
+- **`.raw.md` fallback**: Raw conversation logs saved before narrativization for data safety.
+- **Graceful shutdown**: `gateway_stop` drains the narrative worker with 15-second timeout.
+- **User-only recall queries**: Recall now uses only user messages (whitelist), completely eliminating system prompt and thinking tag contamination.
+
+### Changed
+- **Default model**: Changed to `openrouter/free` (auto-routes to best available free model).
+- **Temperature lowered**: Default narrative temperature reduced from 0.7 to 0.4 (factual, consistent).
+- **maxTokens optional**: No longer sent by default — lets OpenRouter/model decide natural stopping point.
+- **Warmup count reduced**: `segmentationWarmupCount` default changed from 20 → 10.
+- **Episode file format**: New episodes use Invisible Footer format. Existing YAML frontmatter episodes remain fully readable (backwards compatible).
+
+### Fixed
+- **D1 consolidation sleep timer**: `handleBatchIngest()` now sets `meta:last_activity`, enabling automatic 3-hour idle consolidation.
+- **Pool data loss**: Fixed `pool.clear()` unconditional execution and `forceFlush` buffer transfer issues (P2-F1, P2-F2).
+- **Time gap config passthrough**: `segmentationTimeGapMinutes` now properly passed to segmenter (P3-F1).
+- **Time gap detection logic**: Now compares buffer's last user message vs new message's first user message (P3-F3).
+- **Recall query noise**: 3-layer defense (role whitelist + content block filter + reasoning tag stripper) eliminates all contamination.
+- **`.raw.md` watcher exclusion**: Go sidecar watcher ignores raw log files.
+
+## [0.4.0-beta] - 2026-04-09
+
+### Added
+- **Time gap boundary detection**: Automatically segments when user message gap exceeds configurable threshold (default: 15 minutes). New config: `segmentationTimeGapMinutes`.
+- **Adaptive Lambda (2-tier)**: Short sessions (<10 turns) use lower lambda (1.5) for better segmentation sensitivity. Long sessions use configured lambda.
+- **Invisible Footer metadata**: New episode files now store metadata as an HTML comment at the end of the file instead of YAML frontmatter. Episodes are now readable at first glance without YAML metadata at the top.
+- **`.raw.md` watcher exclusion**: Go sidecar watcher now ignores `.raw.md` files, preventing raw log backups from being indexed as episodes.
+
+### Changed
+- **Warmup count reduced**: `segmentationWarmupCount` default changed from 20 → 10 for faster adaptation in short conversations.
+- **Episode file format**: New episodes use Invisible Footer format. Existing YAML frontmatter episodes remain fully readable (backwards compatible).
+
+## [0.4.0-alpha.2] - 2026-04-09
+
+### Added
+- **Narrative architecture foundation**: `NarrativePool` buffers conversation messages and flushes when size limit is reached. `NarrativeWorker` asynchronously sends pooled segments to OpenRouter for narrativization with retry + fallback.
+- **Mode branching**: Segmenter now supports two modes — Pool+Queue (v0.4.0, when `openrouterApiKey` is set) and Legacy chunkAndIngest (v0.3.x, fallback when API key is not set).
+- **Raw log fallback**: `.raw.md` files are saved as fire-and-forget backups when pool mode is active.
+- **Graceful shutdown**: `gateway_stop` hook drains the narrative worker with a 15-second timeout.
+- **New files**: `src/narrative-pool.ts`, `src/narrative-worker.ts` (updated), `src/openrouter-client.ts` (updated)
+- **Type consolidation**: `PoolFlushItem` and `NarrativeResult` moved to `types.ts` (F2). `Message` type imported from `segmenter.ts` (F4).
+
+## [0.4.0-alpha.1] - 2026-04-09
+
+### Breaking Changes
+- **Recall query now uses user messages only (whitelist)**: Previous blacklist-based filtering (`RECALL_EXCLUDED_ROLES`) has been replaced with `.filter(m => m.role === "user")`. This completely eliminates contamination from system prompts and LLM thinking blocks, which the v0.3.8 3-layer filter could not fully prevent.
+
+### Added
+- **OpenRouter integration** (`src/openrouter-client.ts`): Chat Completion API client with 429 retry handling, AbortController timeout, and built-in `fetch()` (zero external dependencies).
+- **NarrativeWorker** (`src/narrative-worker.ts`): Async narrative generation worker with FIFO queue, exponential backoff retry (max 5 attempts), and raw summary fallback via `buildFallbackSummary`.
+- **New config fields**: `openrouterApiKey`, `openrouterModel`, `narrativeSystemPrompt`, `narrativeUserPromptTemplate`, `maxPoolChars`, `narrativePreviousEpisodeRef`
+- **New types**: `PoolFlushItem`, `NarrativeResult`
+
+### Changed
+- `src/retriever.ts`: Recall query filter switched from `!RECALL_EXCLUDED_ROLES.has(m.role)` to `m.role === "user"`. `RECALL_EXCLUDED_ROLES` constant removed.
+- `src/large-payload.ts`: `extractPlainText()` thinking/reasoning block exclusion retained as safety net for segmenter/summary.
+- `src/reasoning-tags.ts`: Retained as safety net for segmenter/summary (unused in recall pipeline).
+
 ## [0.3.8] - 2026-04-09
 
 ### Fixed

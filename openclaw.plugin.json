@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.3.8",
+  "version": "0.4.0",
   "description": "Long-term episodic memory for OpenClaw agents. Automatically saves conversation episodes, retrieves relevant past memories via semantic search, and injects them into every prompt — now with topics-aware recall, Bayesian rerank, and replay scheduling.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -152,6 +152,61 @@
         "maximum": 12,
         "default": 4,
         "description": "How many recent messages are used to build the deterministic recall query. Default: 4.\n⚠️ [Blast Radius] If too high: Query becomes noisy and dilutes semantic intent. If too low: Insufficient context for accurate memory retrieval."
+      },
+      "openrouterApiKey": {
+        "type": "string",
+        "description": "OpenRouter API key for narrative episode generation. Falls back to OPENROUTER_API_KEY env var. Leave empty to disable narrative mode.",
+        "secret": true
+      },
+      "openrouterConfig": {
+        "type": "object",
+        "description": "Configuration for the OpenRouter narrative generation model. Nested fields take precedence over flat equivalents.",
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "default": "openrouter/free",
+            "description": "OpenRouter model ID. Default: 'openrouter/free'. Example: 'qwen/qwen3-235b-a22b:free', 'deepseek/deepseek-chat-v3-0324:free'."
+          },
+          "maxTokens": {
+            "type": "integer",
+            "minimum": 256,
+            "maximum": 32768,
+            "description": "Optional. Max tokens cap for the narrative summary. Omit to let OpenRouter/model decide (recommended)."
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.4,
+            "description": "Sampling temperature for narrative generation. Default: 0.4 (factual, consistent)."
+          }
+        }
+      },
+      "narrativeSystemPrompt": {
+        "type": "string",
+        "description": "Custom system prompt for narrative generation. Inline text or path to .md/.txt file. Leave empty for default."
+      },
+      "narrativeUserPromptTemplate": {
+        "type": "string",
+        "description": "Custom user prompt template. Variables: {previousEpisode}, {conversationText}. Inline text or path to .md/.txt file."
+      },
+      "maxPoolChars": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 15000,
+        "description": "Max characters to pool before flushing to narrative generation. Default: 15000.\n⚠️ [Blast Radius] If too high: Large context may exceed model limits. If too low: Episodes are fragmented and lack context."
+      },
+      "narrativePreviousEpisodeRef": {
+        "type": "boolean",
+        "default": true,
+        "description": "Pass the full previous episode to the LLM for context continuity. Default: true."
+      },
+      "segmentationTimeGapMinutes": {
+        "type": "number",
+        "minimum": 1,
+        "default": 15,
+        "description": "Time gap threshold (minutes) between user messages that triggers an automatic segment boundary. Default: 15.\n⚠️ [Blast Radius] If too short: Excessive segmentation breaks conversation flow. If too long: Long pauses don't create natural episode boundaries."
       }
     }
   },

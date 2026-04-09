@@ -96,6 +96,9 @@ async function runAnchorInjectionSmoke(): Promise<void> {
     "index.js",
     "retriever.js",
     "reasoning-tags.js",
+    "openrouter-client.js",
+    "narrative-worker.js",
+    "narrative-pool.js",
     "rpc-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
@@ -272,6 +275,9 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
     "config.js",
     "retriever.js",
     "reasoning-tags.js",
+    "openrouter-client.js",
+    "narrative-worker.js",
+    "narrative-pool.js",
     "rpc-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
@@ -507,6 +513,10 @@ async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
     "large-payload.js",
     "rpc-client.js",
     "segmenter.js",
+    "reasoning-tags.js",
+    "openrouter-client.js",
+    "narrative-worker.js",
+    "narrative-pool.js",
     "summary-escalation.js",
     "transcript-repair.js",
     "types.js",
@@ -645,6 +655,9 @@ async function runGatewayStartSmoke(): Promise<void> {
     "index.js",
     "retriever.js",
     "reasoning-tags.js",
+    "openrouter-client.js",
+    "narrative-worker.js",
+    "narrative-pool.js",
     "rpc-client.js",
     "runner_hardcoded.js",
     "runner.js",
@@ -779,8 +792,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.3.8", "package.json version should be 0.3.8");
-  assert.equal(manifest.version, "0.3.8", "openclaw.plugin.json version should be 0.3.8");
+  assert.equal(pkg.version, "0.4.0", "package.json version should be 0.4.0");
+  assert.equal(manifest.version, "0.4.0", "openclaw.plugin.json version should be 0.4.0");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"

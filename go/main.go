@@ -512,6 +512,11 @@ func handleWatcherStart(conn net.Conn, req RPCRequest) {
 	}
 
 	w, err := watcher.New(1500, func(event watcher.FileEvent) {
+		// P2-F4 / Phase 3: Ignore .raw.md files — they are pre-narrative raw log backups,
+		// not actual episodes. Indexing them would pollute recall with raw conversation text.
+		if strings.HasSuffix(event.Path, ".raw.md") {
+			return
+		}
 		EmitLog("Watcher event: %s %s", event.Operation, event.Path)
 		sendEvent(conn, "watcher.onFileChange", event)
 	})

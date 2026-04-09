@@ -10,6 +10,9 @@ import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
 import { EpisodicArchiver } from "./archiver";
 import { AnchorStore } from "./anchor-store";
 import { estimateTokens } from "./utils";
+import { OpenRouterClient } from "./openrouter-client";
+import { NarrativeWorker } from "./narrative-worker";
+import { NarrativePool } from "./narrative-pool";
 import { RecallFallbackReason, RecallMatchedBy } from "./types";
 
 export interface OpenClawPluginApi {
@@ -332,6 +335,10 @@ const PluginConfigSchema = Type.Object(
     segmentationFallbackThreshold: Type.Optional(Type.Number({
       description: "Adaptive segmentation: fixed threshold used during fallback or warmup."
     })),
+    segmentationTimeGapMinutes: Type.Optional(Type.Number({
+      minimum: 1,
+      description: "Phase 3: Force segment boundary when user message gap exceeds this (minutes). Default: 15."
+    })),
     recallSemanticFloor: Type.Optional(Type.Number({
       description: "Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay."
     })),
@@ -370,6 +377,41 @@ const PluginConfigSchema = Type.Object(
       maximum: 12,
       description: "How many recent messages are used to build the deterministic recall query. Default: 4."
     })),
+    // Narrative architecture (v0.4.0)
+    openrouterApiKey: Type.Optional(Type.String({
+      description: "OpenRouter API key for narrative generation. Falls back to OPENROUTER_API_KEY env var."
+    })),
+    openrouterModel: Type.Optional(Type.String({
+      description: "OpenRouter model ID for narrative generation. Default: openrouter/free"
+    })),
+    narrativeSystemPrompt: Type.Optional(Type.String({
+      description: "Custom system prompt for narrative generation. Inline text."
+    })),
+    narrativeUserPromptTemplate: Type.Optional(Type.String({
+      description: "Custom user prompt template for narrative generation. Variables: {previousEpisode}, {conversationText}"
+    })),
+    maxPoolChars: Type.Optional(Type.Integer({
+      minimum: 1000,
+      description: "Maximum characters to pool before forcing a flush. Default: 15000."
+    })),
+    narrativePreviousEpisodeRef: Type.Optional(Type.Boolean({
+      description: "Pass the full previous episode to the LLM for context continuity. Default: true."
+    })),
+    narrativeMaxTokens: Type.Optional(Type.Integer({
+      minimum: 256,
+      maximum: 32768,
+      description: "Optional. Max tokens cap for the narrative summary. Omit to let OpenRouter/model decide (recommended)."
+    })),
+    narrativeTemperature: Type.Optional(Type.Number({
+      minimum: 0,
+      maximum: 1,
+      description: "Sampling temperature for narrative generation. Default: 0.4 (factual, consistent)."
+    })),
+    openrouterConfig: Type.Optional(Type.Object({
+      model: Type.Optional(Type.String()),
+      maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768 })),
+      temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+    }, { description: "Nested OpenRouter config. Takes precedence over flat fields." })),
   },
   { additionalProperties: false }
 );
@@ -388,6 +430,9 @@ type SingletonType = {
   debouncers: Map<string, FileEventDebouncer>;
   watcherWorkspaces: Set<string>;
   watcherDegradedWorkspaces: Set<string>;
+  // Narrative architecture (v0.4.0)
+  openRouterClient: OpenRouterClient | null;
+  narrativeWorker: NarrativeWorker | null;
 };
 let _singleton: SingletonType | null = null;
 
@@ -432,6 +477,20 @@ const episodicClawPlugin = {
         const cfg = loadConfig(openClawGlobalConfig);
         const rpcClient = new EpisodicCoreClient();
         const retriever = new EpisodicRetriever(rpcClient, cfg);
+
+        // Narrative architecture (v0.4.0)
+        const openRouterClient = cfg.openrouterApiKey
+          ? new OpenRouterClient({
+              apiKey: cfg.openrouterApiKey,
+              model: cfg.openrouterModel,
+              maxTokens: cfg.narrativeMaxTokens,
+              temperature: cfg.narrativeTemperature,
+            })
+          : null;
+        const narrativeWorker = openRouterClient
+          ? new NarrativeWorker(openRouterClient, rpcClient, cfg)
+          : null;
+
         _singleton = {
           rpcClient,
           retriever,
@@ -441,6 +500,8 @@ const episodicClawPlugin = {
           debouncers: new Map(),
           watcherWorkspaces: new Set(),
           watcherDegradedWorkspaces: new Set(),
+          openRouterClient,
+          narrativeWorker,
         };
         (global as any)[SINGLETON_KEY] = _singleton; // global に保存してプロセス全体で共有
         console.log("[Episodic Memory] Singleton created.");
@@ -448,7 +509,7 @@ const episodicClawPlugin = {
         console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
       }
 
-      const { rpcClient, retriever, cfg } = _singleton;
+      const { rpcClient, retriever, cfg, narrativeWorker } = _singleton;
       const recallCalibration = buildRecallCalibration(cfg);
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
@@ -466,6 +527,10 @@ const episodicClawPlugin = {
       const getAgentState = (agentId: string): AgentRuntimeState => {
         const existing = _singleton!.agentStates.get(agentId);
         if (existing) return existing;
+
+        // Narrative architecture (v0.4.0) — pool is per-agent, worker is shared
+        const pool = narrativeWorker ? new NarrativePool(cfg.maxPoolChars ?? 15000) : null;
+
         const segmenter = new EventSegmenter(
           rpcClient,
           cfg.dedupWindow,
@@ -478,7 +543,10 @@ const episodicClawPlugin = {
             cooldownTurns: cfg.segmentationCooldownTurns,
             stdFloor: cfg.segmentationStdFloor,
             fallbackThreshold: cfg.segmentationFallbackThreshold,
-          }
+            timeGapMinutes: cfg.segmentationTimeGapMinutes,
+          },
+          pool,
+          narrativeWorker,
         );
         const archiver = new EpisodicArchiver(rpcClient, segmenter);
         const anchorStore = new AnchorStore(rpcClient);
@@ -659,6 +727,17 @@ const episodicClawPlugin = {
 
       api.on("gateway_stop", async (event?: any, _ctx?: any) => {
         console.log("[Episodic Memory] Stopping plugin...", event?.reason ? `(reason: ${event.reason})` : "");
+
+        // Narrative architecture (v0.4.0) — graceful drain of narrative worker
+        if (_singleton!.narrativeWorker) {
+          console.log("[Episodic Memory] Draining narrative worker...");
+          await Promise.race([
+            _singleton!.narrativeWorker.drain(),
+            new Promise(resolve => setTimeout(resolve, 15000)),
+          ]);
+          console.log("[Episodic Memory] Narrative worker drained.");
+        }
+
         await rpcClient.stop();
         _singleton!.sidecarStarted = false;
       });

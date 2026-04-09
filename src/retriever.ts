@@ -8,18 +8,10 @@ import {
   RecallMatchedBy,
   RecallRpcEpisodeResult,
 } from "./types";
-import { Message, extractText, EXCLUDED_ROLES } from "./segmenter";
+import { Message, extractText } from "./segmenter";
 import { estimateTokens } from "./utils";
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import * as stopwords from "stopwords-iso";
-
-// Recall-specific excluded roles: system prompts and LLM thinking blocks
-// must not leak into vector search queries (they pollute embedding intent).
-const RECALL_EXCLUDED_ROLES = new Set([
-  ...EXCLUDED_ROLES,
-  "system",
-  "thinking",
-]);
 
 // ─── Module-scope stopword cache (initialized once for performance) ──────────
 let STOPWORDS_CACHE: Set<string> | null = null;
@@ -218,10 +210,10 @@ export class EpisodicRetriever {
       return { text: "", episodeIds: [], reason: "max_tokens_zero", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
     }
 
-    // Build the query from the recent N messages using deterministic polyglot rewriting
+    // Build the query from the recent N user messages (whitelist — only user intent matters for recall)
     const recentMessageCount = this.config?.recallQueryRecentMessageCount ?? 4;
     const recentMessages = currentMessages
-      .filter(m => !RECALL_EXCLUDED_ROLES.has(m.role))
+      .filter(m => m.role === "user")
       .slice(-recentMessageCount);
     const query = instantDeterministicRewrite(recentMessages, this.config);
     if (!query) {
