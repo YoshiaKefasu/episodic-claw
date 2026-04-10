@@ -18,7 +18,7 @@ export interface CacheQueueItem {
   parentIngestId: string;
   orderKey: string;
   surprise: number;
-  reason: "size-limit" | "surprise-boundary" | "cold-start-import" | "gap-archive" | "force-flush";
+  reason: "size-limit" | "surprise-boundary" | "cold-start-import" | "gap-archive" | "force-flush" | "idle-timeout";
   rawText: string;
   estimatedTokens: number;
   status: "queued" | "leased" | "dead-letter";
@@ -150,10 +150,12 @@ export function splitIntoChunks(
 /**
  * Enqueue narrative chunks to the Go cache DB.
  * Fire-and-forget: returns immediately after RPC call.
+ * If a wake callback is provided, it will be called after successful enqueue.
  */
 export async function enqueueNarrativeChunks(
   rpcClient: EpisodicCoreClient,
   chunks: CacheQueueItem[],
+  onWake?: () => void,
 ): Promise<void> {
   if (chunks.length === 0) return;
 
@@ -164,6 +166,8 @@ export async function enqueueNarrativeChunks(
     console.log(
       `[Episodic Cache] Enqueued ${count} chunks (${totalTokens} tokens) for agentId=${chunks[0].agentId} source=${chunks[0].source}`
     );
+    // Wake the worker from idle backoff if callback is provided
+    if (onWake) onWake();
   } catch (err) {
     console.error("[Episodic Cache] Failed to enqueue narrative chunks:", err);
     // Fallback: don't lose the data — the caller's buffer still holds it

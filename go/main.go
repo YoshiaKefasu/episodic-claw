@@ -2912,7 +2912,15 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		EmitLog("Method: %s", req.Method)
+		// Skip per-call logging for hot-path methods that are polled frequently.
+		// This reduces log noise without losing observability: state changes
+		// (enqueue, ack, retry) and errors are still logged individually.
+		skippedLogMethods := map[string]bool{
+			"cache.leaseNext": true,
+		}
+		if !skippedLogMethods[req.Method] {
+			EmitLog("Method: %s", req.Method)
+		}
 
 		switch req.Method {
 		case "watcher.start":

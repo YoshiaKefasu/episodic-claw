@@ -44,6 +44,9 @@ export class EventSegmenter {
   private segmentationFallbackThreshold: number;
   // Surprise improvements (v0.4.0 Phase 3)
   private segmentationTimeGapMinutes: number;
+  // Idle flush timer (v0.4.3): auto-flush buffer after silence
+  private idleFlushTimer: NodeJS.Timeout | null = null;
+  private lastBufferActivityAt = 0;
   // Narrative architecture (v0.4.0)
   private pool: NarrativePool | null;
   private narrativeWorker: NarrativeWorker | null;
@@ -78,6 +81,75 @@ export class EventSegmenter {
     this.segmentationTimeGapMinutes = tuning?.timeGapMinutes ?? 15;
     this.pool = pool ?? null;
     this.narrativeWorker = narrativeWorker ?? null;
+  }
+
+  /**
+   * Wake the narrative worker from idle backoff. Used by archiver and other callers
+   * that enqueue directly without going through poolAndQueue.
+   */
+  wakeNarrativeWorker(): void {
+    this.narrativeWorker?.wake();
+  }
+
+  // ─── Idle flush timer (v0.4.3) ──────────────────────────────────────────
+
+  /**
+   * Clear any pending idle flush timer.
+   * Called before scheduling a new timer or on forced flush/context reset.
+   */
+  private clearIdleFlushTimer(): void {
+    if (this.idleFlushTimer) {
+      clearTimeout(this.idleFlushTimer);
+      this.idleFlushTimer = null;
+    }
+  }
+
+  /**
+   * Schedule an idle flush timer if the buffer is non-empty.
+   * Fires after `segmentationTimeGapMinutes` of no new activity.
+   */
+  private scheduleIdleFlush(agentWs: string, agentId: string): void {
+    if (this.buffer.length === 0) return;
+
+    this.clearIdleFlushTimer();
+    this.lastBufferActivityAt = Date.now();
+    const delayMs = this.segmentationTimeGapMinutes * 60 * 1000;
+
+    this.idleFlushTimer = setTimeout(async () => {
+      this.idleFlushTimer = null;
+      await this.handleIdleFlush(agentWs, agentId);
+    }, delayMs).unref(); // unref() to not block process exit
+  }
+
+  /**
+   * Fired when the idle flush timer expires.
+   * Flushes the buffer if it has meaningful text content.
+   */
+  private async handleIdleFlush(agentWs: string, agentId: string): Promise<boolean> {
+    // Guard: don't flush if buffer was already cleared (race protection)
+    if (this.buffer.length === 0) return false;
+
+    // Check if buffer has meaningful text (not just images/tools)
+    const textContent = this.buffer
+      .filter(m => !EXCLUDED_ROLES.has(m.role) && m.role !== "tool_use")
+      .map(m => extractText(m.content).trim())
+      .filter(Boolean);
+
+    if (textContent.length === 0) {
+      console.log("[Episodic Memory] Idle flush skipped: buffer has no text content (image/tool-only).");
+      return false;
+    }
+
+    // Preserve cursor before flush — poolAndQueue resets it to 0
+    const savedLastProcessedLength = this.lastProcessedLength;
+
+    console.log(`[Episodic Memory] Idle timeout (${this.segmentationTimeGapMinutes}min). Auto-finalizing buffer (${textContent.length} text messages)...`);
+    await this.handleSegmentBoundary(agentWs, agentId, 0, "idle-timeout");
+
+    // Restore cursor — messages up to savedLastProcessedLength are already processed
+    this.lastProcessedLength = savedLastProcessedLength;
+    this.buffer = [];
+    return true;
   }
 
   private updateSegStats(value: number): void {
@@ -149,6 +221,7 @@ export class EventSegmenter {
         console.log(`[Episodic Memory] Context reset detected. Flushing ${this.buffer.length} buffered messages.`);
         await this.forceFlush(agentWs, agentId);
       }
+      this.clearIdleFlushTimer(); // Clear timer on context reset
       this.lastProcessedLength = 0;
       this.buffer = []; // forceFlush 失敗時も確実にクリア
     }
@@ -204,6 +277,8 @@ export class EventSegmenter {
       // First turn, just absorb
       this.buffer.push(...dedupedMessages);
       this.lastProcessedLength = currentMessages.length;
+      // Schedule idle flush for the new buffer
+      this.scheduleIdleFlush(agentWs, agentId);
       return false;
     }
 
@@ -239,6 +314,8 @@ export class EventSegmenter {
       await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap");
       this.buffer = [...dedupedMessages];
       this.lastProcessedLength = currentMessages.length;
+      // Reschedule idle flush for the new buffer after time-gap boundary
+      this.scheduleIdleFlush(agentWs, agentId);
       return true;
     }
 
@@ -284,12 +361,16 @@ export class EventSegmenter {
         this.handleSegmentBoundary(agentWs, agentId, surprise, reason).catch(err => {
           console.error("[Episodic Memory] Error in segment boundary handling:", err);
         });
-        
+
         // Clear buffer and start fresh with the new context
         this.buffer = [...dedupedMessages];
+        // Reschedule idle flush for the new buffer after boundary
+        this.scheduleIdleFlush(agentWs, agentId);
       } else {
         // Just append to buffer / update buffer
         this.buffer.push(...dedupedMessages);
+        // Reschedule idle flush for the updated buffer
+        this.scheduleIdleFlush(agentWs, agentId);
       }
       this.lastProcessedLength = currentMessages.length;
       return true;
@@ -298,6 +379,8 @@ export class EventSegmenter {
       // Fallback: absorb deduped messages only（Fix D-1 を catch でも維持）
       this.buffer.push(...dedupedMessages);
       this.lastProcessedLength = currentMessages.length;
+      // Reschedule idle flush on error recovery
+      this.scheduleIdleFlush(agentWs, agentId);
     }
     return false;
   }
@@ -323,18 +406,25 @@ export class EventSegmenter {
     if (!this.pool || !this.narrativeWorker) return;
 
     const item = this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
-    // Clear segmenter buffer immediately; messages are now in the pool.
+    // Clear segmenter buffer and idle flush timer; messages are now in the pool.
     this.buffer = [];
     this.lastProcessedLength = 0;
+    this.clearIdleFlushTimer();
 
     if (item) {
       // Flush occurred: clear pool buffer and process.
       this.pool.clear();
 
       // Split into 64K chunks and enqueue to cache DB
-      const cacheReason = (reason === "surprise-boundary" ? "surprise-boundary" : "size-limit") as "surprise-boundary" | "size-limit";
+      // Preserve idle-timeout reason for observability — don't collapse it into size-limit
+      const cacheReason = (
+        reason === "idle-timeout" ? "idle-timeout" :
+        reason === "surprise-boundary" ? "surprise-boundary" :
+        "size-limit"
+      ) as "idle-timeout" | "surprise-boundary" | "size-limit";
       const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise);
-      enqueueNarrativeChunks(this.rpc, chunks).catch(err =>
+      // Pass wake callback to wake the worker from idle backoff
+      enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake()).catch(err =>
         console.error("[Episodic Memory] Cache enqueue failed:", err)
       );
     }
@@ -360,6 +450,7 @@ export class EventSegmenter {
     if (this.buffer.length === 0) return;
     try {
       console.log(`[Episodic Memory] Force flushing segmenter buffer (${this.buffer.length} messages)...`);
+      this.clearIdleFlushTimer(); // Clear timer on force flush
 
       if (this.pool && this.narrativeWorker) {
         // Pool mode (v0.4.2): add to pool, split, and enqueue to cache DB
@@ -368,7 +459,8 @@ export class EventSegmenter {
         this.pool.clear();
         if (item) {
           const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0);
-          await enqueueNarrativeChunks(this.rpc, chunks);
+          // Pass wake callback to wake the worker from idle backoff
+          await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
         }
         this.buffer = [];
         this.lastProcessedLength = 0;

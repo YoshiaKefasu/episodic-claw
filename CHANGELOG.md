@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.3] - 2026-04-10
+
+### Fixed
+- **Adaptive Idle Backoff**: Cache worker idle backoff now uses exponential progression (1s → 2s → 4s → 8s → 15s cap) instead of linear, dramatically reducing log spam during idle periods.
+- **wake() Guarantee**: `wake()` now unconditionally clears the pending poll timer and resets backoff state, ensuring immediate poll resumption when new items are enqueued — even during 15s cap.
+- **All 4 Enqueue Paths Wired**: Live ingest, force flush, large gap archive, and cold-start all pass wake callback to the worker.
+- **Method Log Suppression**: `cache.leaseNext` added to Go sidecar's hot-path method skip list, preventing log storms during idle polling.
+- **Severity-Aware Stderr Bridge**: `[info]` logs from Go sidecar now route to `console.log`, `[warn]` to `console.warn`, and `[error]` to `console.error`, fixing host UI visibility.
+- **Surprise Metadata Preservation**: `CacheItem` now aliases `CacheQueueItem` with `surprise` field. `saveNarrative` passes `item.surprise ?? 0` instead of hardcoded 0, end-to-end to Go frontmatter.
+- **Recall Query CJK/Attachment Filter**: Channel-agnostic attachment noise sanitization (Telegram/LINE/Discord/gateway markers). Script-aware keyword extraction prioritizes CJK characters for better recall quality.
+- **Idle Flush Timer**: `EventSegmenter` now flushes non-empty text buffers after `segmentationTimeGapMinutes` of silence, with cursor preservation and `idle-timeout` reason propagation. Image-only and tool-only buffers are correctly excluded.
+
+### Verified
+- All release gates passed: Gate A (wake latency <10ms), Gate B (idle flush integration), Gate C (surprise footer persistence).
+- Strict proof with real compiled module instances for all 3 gates.
+
 ## [0.4.2] - 2026-04-10
 
 ### Added

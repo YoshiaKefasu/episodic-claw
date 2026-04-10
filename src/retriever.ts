@@ -13,6 +13,117 @@ import { estimateTokens } from "./utils";
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import * as stopwords from "stopwords-iso";
 
+// ─── Attachment noise patterns (channel-agnostic) ────────────────────────────
+// These patterns cover attachment markers used by OpenClaw across all channels:
+// Telegram: [media attached: /path/to/file ...]
+// Gateway:  [media attached: media://inbound/<id>]
+// LINE:     <media:image>, <media:document>
+// Discord:  <media:image> (N images), <media:document> (N files)
+// Auto-reply: To send an image back, prefer ... Keep caption in the text body.
+
+const ATTACHMENT_BOILERPLATE: RegExp[] = [
+  // [media attached: ...] or [media attached 1/2: ...] — indexed multi-attachment support
+  // Covers: [media attached: /path], [media attached 1/2: media://inbound/...], etc.
+  /\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi,
+  // <media:image>, <media:document>, <media:audio>, <media:video> with optional (N ...) suffix
+  /<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi,
+  // [User sent media without caption]
+  /\[User sent media without caption\]/gi,
+  // To send an image back, prefer ... (match up to period, preserve text after)
+  /To send an image back[^\n]*?(?:prefer|caption|Keep caption|URL)\.[ \t]*/gi,
+  // standalone "attached files" / "attachment" lines without meaningful text
+  /^\s*attached files\s*$/gi,
+  // media://inbound/<id> standalone
+  /media:\/\/inbound\/[^\s]+/gi,
+];
+
+// Patterns that indicate a message is attachment-dominant (no real user text)
+const ATTACHMENT_INDICATORS: RegExp[] = [
+  // File extensions appearing as standalone tokens (no CJK context around them)
+  /\b(jpg|jpeg|png|webp|gif|mp4|mp3|wav|pdf|txt|docx?|xlsx?)\b/gi,
+  // Absolute Windows paths
+  /[A-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*/gi,
+  // Unix absolute paths
+  /\/(?:usr|home|tmp|var|data|media|storage)(?:\/[^/\s]+)+/gi,
+];
+
+// Media-only sentinel: a message consisting almost entirely of attachment markers
+const MEDIA_ONLY_SENTINEL = /^\s*(?:\[media attached[^\]]*\]|<media:[^>]+>(?:\s*\([^)]*\))?|\[User sent media without caption\]|attached files|media:\/\/inbound\/[^\s]+|\s)*$/i;
+
+/**
+ * Check if a message is attachment-dominant (no meaningful user-authored text).
+ * Channel-agnostic: covers Telegram, LINE, Discord, and gateway auto-reply patterns.
+ */
+export function isAttachmentDominant(text: string): boolean {
+  // Check for media-only sentinel pattern
+  if (MEDIA_ONLY_SENTINEL.test(text.trim())) return true;
+
+  // Count attachment markers vs actual text
+  let markerCount = 0;
+  for (const pattern of ATTACHMENT_BOILERPLATE) {
+    const matches = text.match(pattern);
+    if (matches) markerCount += matches.length;
+  }
+
+  // If attachment markers dominate the text, it's attachment-dominant
+  const nonMarkerText = text.replace(/\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi, "")
+    .replace(/<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi, "")
+    .replace(/\[User sent media without caption\]/gi, "")
+    .replace(/To send an image back[^\n]*?(?:prefer|caption|Keep caption|URL)\.[ \t]*/gi, "")
+    .replace(/media:\/\/inbound\/[^\s]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // If after removing markers there's very little text left, it's attachment-dominant
+  // Use a more lenient threshold: 2 chars for CJK (which can be meaningful with just 2-3 chars)
+  const cjkChars = (nonMarkerText.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
+  if (nonMarkerText.length < 2) return true;
+  // For Latin-heavy text, require more content (to avoid false positives from short English words)
+  if (cjkChars === 0 && nonMarkerText.length < 5) return true;
+
+  // Count attachment indicator tokens
+  let indicatorCount = 0;
+  for (const pattern of ATTACHMENT_INDICATORS) {
+    const matches = text.match(pattern);
+    if (matches) indicatorCount += matches.length;
+  }
+
+  // If filename/path tokens outnumber meaningful text, skip
+  const wordCount = nonMarkerText.split(/\s+/).filter(Boolean).length;
+  if (indicatorCount > 0 && wordCount <= indicatorCount) return true;
+
+  return false;
+}
+
+/**
+ * Strip attachment noise from message text, preserving caption/user-authored text.
+ * Channel-agnostic: handles all OpenClaw attachment marker formats.
+ */
+export function stripAttachmentNoise(text: string): string {
+  let cleaned = text;
+  for (const pattern of ATTACHMENT_BOILERPLATE) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+  // Clean up leftover whitespace
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return cleaned;
+}
+
+/**
+ * Determine the dominant script of a text string.
+ * Returns 'cjk' if CJK characters are >= 30% of non-whitespace chars,
+ * otherwise returns 'latin'.
+ */
+export function detectDominantScript(text: string): "cjk" | "latin" {
+  const chars = text.replace(/\s/g, "");
+  if (chars.length === 0) return "latin";
+
+  const cjkChars = (text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
+  const cjkRatio = cjkChars / chars.length;
+
+  return cjkRatio >= 0.3 ? "cjk" : "latin";
+}
+
 // ─── Module-scope stopword cache (initialized once for performance) ──────────
 let STOPWORDS_CACHE: Set<string> | null = null;
 
@@ -40,20 +151,37 @@ function getStopwords(config?: EpisodicPluginConfig): Set<string> {
   return stopwordsSet;
 }
 
-function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): string {
-  // Phase 1: Aggressive Noise Removal
-  const cleaned = messages
-    .map(m => {
-      const rawText = extractText(m.content);
-      const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
-      return text
-        .replace(/\[\[reply_to_current\]\]/g, "")
-        .replace(/^System:\s*\[.*?\]\s*/gm, "")
-        .replace(/<[^>]+>/g, "")
-        .replace(/\p{Extended_Pictographic}/gu, "")
-        .replace(/\s+/g, " ")
-        .trim();
-    })
+export function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): string {
+  // Phase 0: Filter out attachment-dominant messages and strip attachment noise
+  const eligibleTexts: string[] = [];
+  let skippedCount = 0;
+
+  for (const m of messages) {
+    const rawText = extractText(m.content);
+    const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
+
+    if (isAttachmentDominant(text)) {
+      // Try to salvage caption text
+      const caption = stripAttachmentNoise(text);
+      if (caption.length >= 3) {
+        eligibleTexts.push(caption);
+      } else {
+        skippedCount += 1;
+      }
+    } else {
+      eligibleTexts.push(text);
+    }
+  }
+
+  // Phase 1: Aggressive Noise Removal (on eligible text only)
+  const cleaned = eligibleTexts
+    .map(text => text
+      .replace(/\[\[reply_to_current\]\]/g, "")
+      .replace(/^System:\s*\[.*?\]\s*/gm, "")
+      .replace(/<[^>]+>/g, "")
+      .replace(/\p{Extended_Pictographic}/gu, "")
+      .replace(/\s+/g, " ")
+      .trim())
     .filter(Boolean)
     .join("\n");
 
@@ -62,24 +190,45 @@ function instantDeterministicRewrite(messages: Message[], config?: EpisodicPlugi
   return keywords.length > 0 ? keywords.join(" ") : cleaned;
 }
 
-function extractPolyglotKeywords(text: string, config?: EpisodicPluginConfig): string[] {
+export function extractPolyglotKeywords(text: string, config?: EpisodicPluginConfig): string[] {
   const stopwordsSet = getStopwords(config);
-  const keywords = new Set<string>();
 
-  // English / Latin script (3+ chars)
+  // Detect dominant script to determine extraction priority
+  const dominantScript = detectDominantScript(text);
+
+  // Extract Latin keywords (3+ chars, non-stopwords)
+  const latinKeywords: string[] = [];
   const enMatches = text.match(/\b[A-Za-z]{3,}\b/g) || [];
   enMatches.forEach(w => {
-    if (!stopwordsSet.has(w.toLowerCase())) keywords.add(w);
+    if (!stopwordsSet.has(w.toLowerCase())) latinKeywords.push(w);
   });
 
-  // CJK: Han + Katakana + Hangul (2+ chars)
-  const cjkMatches = text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hangul}]{2,}/gu) || [];
+  // Extract CJK keywords (Han/Katakana/Hangul, 2+ chars, non-stopwords)
+  const cjkKeywords: string[] = [];
+  const cjkMatches = text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]{2,}/gu) || [];
   cjkMatches.forEach(w => {
-    if (!stopwordsSet.has(w)) keywords.add(w);
+    if (!stopwordsSet.has(w)) cjkKeywords.push(w);
   });
 
-  // Top 12 limit to prevent semantic dilution
-  return Array.from(keywords).slice(0, 12);
+  // Script-aware interleaving:
+  // - CJK-dominant text: prioritize CJK (8 CJK + 4 Latin)
+  // - Latin-dominant text: prioritize Latin (8 Latin + 4 CJK)
+  // This prevents one script from filling all 12 slots
+  const cjkFirst = dominantScript === "cjk";
+  const primaryPool = cjkFirst ? cjkKeywords : latinKeywords;
+  const secondaryPool = cjkFirst ? latinKeywords : cjkKeywords;
+  const primaryCount = 8;
+  const secondaryCount = 4;
+
+  const keywords: string[] = [];
+  for (let i = 0; i < primaryCount && i < primaryPool.length; i++) {
+    keywords.push(primaryPool[i]);
+  }
+  for (let i = 0; i < secondaryCount && i < secondaryPool.length; i++) {
+    keywords.push(secondaryPool[i]);
+  }
+
+  return keywords.slice(0, 12);
 }
 
 export type RecallDiagnostics = {
@@ -98,6 +247,14 @@ export type RecallInjectionOutcome = {
   truncatedEpisodeCount: number;
   firstEpisodeId: string;
   diagnostics: RecallDiagnostics;
+  // v0.4.3 observability: recall query construction details
+  recallQueryDebug?: {
+    recentMessageCount: number;
+    eligibleRecentMessages: number;
+    skippedImageLikeMessages: number;
+    dominantScript: string;
+    finalQuery: string;
+  };
 };
 
 // Final score is an approximately 0..1 confidence scale in the current recall reranker.
@@ -186,6 +343,17 @@ function shouldSkipDegradedFallbackInjection(result: RecallRpcEpisodeResult, min
   return scoreOf(result) < minScore;
 }
 
+// Helper to build recallQueryDebug for observability on all return paths
+function buildRecallQueryDebug(
+  recentMessageCount: number,
+  eligibleCount: number,
+  skippedCount: number,
+  dominantScript: string,
+  finalQuery: string
+): RecallInjectionOutcome["recallQueryDebug"] {
+  return { recentMessageCount, eligibleRecentMessages: eligibleCount, skippedImageLikeMessages: skippedCount, dominantScript, finalQuery };
+}
+
 export class EpisodicRetriever {
   constructor(
     private rpcClient: EpisodicCoreClient,
@@ -215,13 +383,38 @@ export class EpisodicRetriever {
     const recentMessages = currentMessages
       .filter(m => m.role === "user")
       .slice(-recentMessageCount);
+
+    // Count eligible vs skipped messages for observability
+    let eligibleCount = 0;
+    let skippedCount = 0;
+    for (const m of recentMessages) {
+      const rawText = extractText(m.content);
+      const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
+      if (isAttachmentDominant(text)) {
+        const caption = stripAttachmentNoise(text);
+        if (caption.length >= 3) {
+          eligibleCount += 1;
+        } else {
+          skippedCount += 1;
+        }
+      } else {
+        eligibleCount += 1;
+      }
+    }
+
     const query = instantDeterministicRewrite(recentMessages, this.config);
+    const dominantScript = query ? detectDominantScript(query) : "none";
+
     if (!query) {
-      return { text: "", episodeIds: [], reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics(),
+        recallQueryDebug: { recentMessageCount, eligibleRecentMessages: eligibleCount, skippedImageLikeMessages: skippedCount, dominantScript: "none", finalQuery: "" } };
     }
     const queryHash = createHash("sha1").update(query).digest("hex");
     const calibration = this.config ? buildRecallCalibration(this.config) : undefined;
     const minAutoInjectScore = autoInjectGuardMinScore(this.config);
+
+    // Log query construction for debugging
+    console.log(`[Episodic Recall] query="${query.substring(0, 120)}${query.length > 120 ? "..." : ""}" recentMsgs=${recentMessageCount} eligible=${eligibleCount} skipped=${skippedCount} script=${dominantScript} hash=${queryHash.substring(0, 8)}`);
 
     try {
       let sourcedResults: Array<{ ws: string; item: RecallRpcEpisodeResult }> = [];
@@ -234,7 +427,8 @@ export class EpisodicRetriever {
         console.warn("[Episodic Memory] Recall failed for primary workspace:", err);
       }
       if (sourcedResults.length === 0) {
-        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics(),
+          recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query) };
       }
 
       // System hint: placed at the top so the model sees it before any episode content.
@@ -318,9 +512,11 @@ export class EpisodicRetriever {
             truncatedEpisodeCount: 0,
             firstEpisodeId: "",
             diagnostics,
+            recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
           };
         }
-        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics };
+        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics,
+          recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query) };
       }
 
       assembled += "--- End of Memory ---\n";
@@ -351,11 +547,13 @@ export class EpisodicRetriever {
         truncatedEpisodeCount,
         firstEpisodeId,
         diagnostics,
+        recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
       };
 
     } catch (err) {
       console.error("[Episodic Memory] Retrieval failed:", err);
-      return { text: "", episodeIds: [], reason: "recall_failed", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
+      return { text: "", episodeIds: [], reason: "recall_failed", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics(),
+        recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query) };
     }
   }
 }

@@ -10,6 +10,7 @@ import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 import { buildFallbackSummary } from "./summary-escalation";
 import type { Message } from "./segmenter";
+import type { CacheQueueItem } from "./narrative-queue";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a conversation archivist. Read the following conversation log and write a short narrative summary of what was discussed, what was decided, and what was worked on.
 
@@ -31,15 +32,8 @@ const MAX_CACHE_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 1000;
 const LEASE_SECONDS = 120;
 
-interface CacheItem {
-  id: string;
-  agentWs: string;
-  agentId: string;
-  source: string;
-  rawText: string;
-  estimatedTokens: number;
-  attempts: number;
-}
+// Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
+type CacheItem = CacheQueueItem;
 
 export class NarrativeWorker {
   private isProcessing = false;
@@ -49,12 +43,32 @@ export class NarrativeWorker {
   private lastNarrativeByAgent = new Map<string, { episodeId: string; body: string }>();
   // Known agent IDs to poll (populated by initContinuity)
   private knownAgentIds = new Set<string>();
+  // Adaptive idle backoff (v0.4.3): reduce polling frequency when queue is empty
+  private consecutiveEmptyPolls = 0;
+  private nextPollDelayMs = POLL_INTERVAL_MS;
+  private readonly MAX_POLL_DELAY_MS = 15_000; // Cap at 15 seconds
 
   constructor(
     private client: OpenRouterClient,
     private rpcClient: EpisodicCoreClient,
     private config: EpisodicPluginConfig,
   ) {}
+
+  /**
+   * Wake the worker from idle backoff. Called when new items are enqueued.
+   * Idempotent: safe to call multiple times.
+   * Clears any pending poll timer and schedules an immediate poll.
+   */
+  wake(): void {
+    this.consecutiveEmptyPolls = 0;
+    this.nextPollDelayMs = POLL_INTERVAL_MS;
+    // Always clear the pending timer and poll immediately — don't wait for idle backoff
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+      this.pollNext();
+    }
+  }
 
   /**
    * Start polling the cache queue for items to narrativize.
@@ -111,7 +125,7 @@ export class NarrativeWorker {
 
     this.processNextFromCache().finally(() => {
       if (!this.shouldStop) {
-        this.pollTimer = setTimeout(() => this.pollNext(), POLL_INTERVAL_MS);
+        this.pollTimer = setTimeout(() => this.pollNext(), this.nextPollDelayMs);
       } else {
         this.isProcessing = false;
       }
@@ -125,6 +139,10 @@ export class NarrativeWorker {
       for (const agentId of agentIds) {
         const item = await this.rpcClient.cacheLeaseNext("narrative-worker", agentId, LEASE_SECONDS);
         if (!item) continue; // No items for this agent, try next
+
+        // Got an item — reset idle backoff
+        this.consecutiveEmptyPolls = 0;
+        this.nextPollDelayMs = POLL_INTERVAL_MS;
 
         console.log(
           `[NarrativeWorker] Leased chunk [${item.id}] attempt=${item.attempts} lease=${LEASE_SECONDS}s tokens=${item.estimatedTokens} agent=${agentId}`
@@ -147,6 +165,15 @@ export class NarrativeWorker {
         }
         // Process one item per poll cycle to avoid starvation
         return;
+      }
+
+      // All agents returned empty — increase backoff for next poll
+      this.consecutiveEmptyPolls++;
+      this.nextPollDelayMs = Math.min(this.MAX_POLL_DELAY_MS, this.nextPollDelayMs * 2);
+
+      // Log idle backoff state periodically (every ~5 minutes worth of polls at cap)
+      if (this.consecutiveEmptyPolls > 0 && this.consecutiveEmptyPolls % 20 === 0) {
+        console.log(`[NarrativeWorker] Idle backoff: ${this.consecutiveEmptyPolls} empty polls, next in ${this.nextPollDelayMs}ms`);
       }
     } catch (err) {
       // Polling error — just retry after interval
@@ -190,7 +217,7 @@ export class NarrativeWorker {
             tags,
             topics: [],
             edges: [],
-            surprise: 0,
+            surprise: item.surprise ?? 0,
             depth: 0,
             tokens: result.tokens,
           },

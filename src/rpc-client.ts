@@ -7,6 +7,7 @@ import * as net from "net";
 import * as os from "os";
 import * as fs from "fs";
 import * as https from "https";
+import type { CacheQueueItem } from "./narrative-queue";
 
 import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult } from "./types";
 
@@ -227,8 +228,31 @@ export class EpisodicCoreClient {
       throw new Error("Failed to capture child process stderr");
     }
 
+    // v0.4.3: Severity-aware stderr bridge
+    // Go logger outputs JSONL-style lines like: [core] [info] ..., [core] [warn] ..., [core] [error] ...
+    // Route each to the matching console method so host UI doesn't show info as warnings.
+    const levelPattern = /\[core\]\s*\[(info|warn|error)\]/i;
     this.child.stderr.on("data", (data: Buffer) => {
-      console.warn(data.toString().trimEnd());
+      const text = data.toString().trimEnd();
+      const match = text.match(levelPattern);
+      if (match) {
+        const level = match[1].toLowerCase();
+        switch (level) {
+          case "warn":
+            console.warn(text);
+            break;
+          case "error":
+            console.error(text);
+            break;
+          case "info":
+          default:
+            console.log(text);
+            break;
+        }
+      } else {
+        // Fallback: unknown format goes to warn (preserves existing behavior)
+        console.warn(text);
+      }
     });
 
     this.child.on("close", (code: number | null) => {
@@ -611,8 +635,8 @@ export class EpisodicCoreClient {
     return this.request<{ enqueued: number }>("cache.enqueueBatch", { items });
   }
 
-  async cacheLeaseNext(workerId: string, agentId: string, leaseSeconds = 60): Promise<any | null> {
-    return this.request<any | null>("cache.leaseNext", { workerId, agentId, leaseSeconds });
+  async cacheLeaseNext(workerId: string, agentId: string, leaseSeconds = 60): Promise<CacheQueueItem | null> {
+    return this.request<CacheQueueItem | null>("cache.leaseNext", { workerId, agentId, leaseSeconds });
   }
 
   async cacheAck(id: string, workerId: string): Promise<string> {
@@ -807,7 +831,8 @@ export async function ingestColdStartSession(
   agentWs: string,
   agentId: string,
   client: EpisodicCoreClient,
-  hasApiKey: boolean
+  hasApiKey: boolean,
+  onWake?: () => void,
 ): Promise<number> {
   const messages = parseJsonlToMessages(sessionFile);
   if (messages.length === 0) return 0;
@@ -820,7 +845,7 @@ export async function ingestColdStartSession(
     const { splitIntoChunks, enqueueNarrativeChunks } = require("./narrative-queue");
     const chunks = splitIntoChunks(rawText, agentWs, agentId, "cold-start", "cold-start-import", 0);
     try {
-      await enqueueNarrativeChunks(client, chunks);
+      await enqueueNarrativeChunks(client, chunks, onWake);
       console.log(`[ColdStart] Enqueued ${chunks.length} chunks for narrative generation from ${sessionFile}`);
     } catch (err) {
       console.error("[ColdStart] Cache enqueue failed, falling back to direct ingest:", err);

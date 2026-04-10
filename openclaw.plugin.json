@@ -1,8 +1,8 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.2",
-  "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, exponential backoff, and crash-safe durability.",
+  "version": "0.4.3",
+  "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, and crash-safe durability.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
   "author": {

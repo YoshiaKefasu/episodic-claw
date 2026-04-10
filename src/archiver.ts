@@ -188,7 +188,7 @@ export class EpisodicArchiver {
       const rawText = unprocessed.map(m => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`).join("\n\n");
       try {
         const chunks = splitIntoChunks(rawText, params.agentWs, params.agentId, "gap-archive", "gap-archive", 0);
-        await enqueueNarrativeChunks(this.rpcClient, chunks);
+        await enqueueNarrativeChunks(this.rpcClient, chunks, () => this.segmenter.wakeNarrativeWorker());
         console.log(`[Episodic Memory] Enqueued ${chunks.length} chunks for gap archive narrativization.`);
         slugs.push(...chunks.map((c: any) => c.id));
       } catch (err) {

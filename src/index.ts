@@ -128,6 +128,10 @@ function logPrependSystemContextOutcome(args: {
   matchedByCounts?: Record<RecallMatchedBy, number>;
   fallbackReasons?: RecallFallbackReason[];
   topicsFallbackCount?: number;
+  // v0.4.3 observability: recall query construction details
+  eligibleRecentMessages?: number;
+  skippedImageLikeMessages?: number;
+  dominantScript?: string;
 }): void {
   const parts = [
     `status=${args.status}`,
@@ -148,6 +152,10 @@ function logPrependSystemContextOutcome(args: {
   if (typeof args.topicsFallbackCount === "number" && args.topicsFallbackCount > 0) {
     parts.push(`topicsFallbackCount=${args.topicsFallbackCount}`);
   }
+  // v0.4.3 observability
+  if (typeof args.eligibleRecentMessages === "number") parts.push(`eligibleRecentMessages=${args.eligibleRecentMessages}`);
+  if (typeof args.skippedImageLikeMessages === "number") parts.push(`skippedImageLikeMessages=${args.skippedImageLikeMessages}`);
+  if (args.dominantScript) parts.push(`dominantScript=${args.dominantScript}`);
   if (args.fallbackReasons && args.fallbackReasons.length > 0) {
     parts.push(`fallbackReasons=${args.fallbackReasons.join("|")}`);
   }
@@ -727,7 +735,9 @@ const episodicClawPlugin = {
             const hasApiKey = !!process.env.GEMINI_API_KEY;
             console.log(`[Episodic Memory] Cold-Start: found session file ${sessionFile} for ${agentId} (API key: ${hasApiKey ? "yes" : "no"})`);
             try {
-              const msgCount = await ingestColdStartSession(sessionFile, agentWs, agentId, rpcClient, hasApiKey);
+              // Pass wake callback to resume worker from idle backoff after cold-start enqueue
+              const onWake = _singleton?.narrativeWorker?.wake.bind(_singleton.narrativeWorker);
+              const msgCount = await ingestColdStartSession(sessionFile, agentWs, agentId, rpcClient, hasApiKey, onWake);
               console.log(`[Episodic Memory] Cold-Start: ingested ${msgCount} messages from session for ${agentId}.`);
               ingestedSessions.add(sessionKey);
             } catch (err) {
@@ -961,6 +971,10 @@ const episodicClawPlugin = {
             matchedByCounts: recallOutcome.diagnostics.matchedByCounts,
             fallbackReasons: recallOutcome.diagnostics.fallbackReasons,
             topicsFallbackCount: recallOutcome.diagnostics.topicsFallbackCount,
+            // v0.4.3 observability
+            eligibleRecentMessages: recallOutcome.recallQueryDebug?.eligibleRecentMessages,
+            skippedImageLikeMessages: recallOutcome.recallQueryDebug?.skippedImageLikeMessages,
+            dominantScript: recallOutcome.recallQueryDebug?.dominantScript,
           });
 
           const prependSystemContext = [anchorPrependText, recallOutcome.text]
