@@ -5,7 +5,7 @@
 
 **The "never-forget" long-term episodic memory for OpenClaw agents.**
 
-[![version](https://img.shields.io/badge/version-0.4.2--2-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
+[![version](https://img.shields.io/badge/version-0.4.6-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
 
 English | [日本語](./README.ja.md) | [中文](./README.zh.md)
 </div>
@@ -60,6 +60,18 @@ sequenceDiagram
 ```
 
 ![Sequence diagram: episodic recall flow](docs/sequenceDiagram.png)
+
+### v0.4.6 — Tool-first Recall (Dual-path Architecture)
+
+Starting with v0.4.6, episodic-claw uses a **tool-first recall** architecture to ensure recall works consistently across both CLI and embedded (context engine) paths:
+
+- **Embedded path (context engine slot = "episodic-claw")**: `assemble()` and `before_prompt_build` skip `retrieveRelevantContext` by default, returning no-op to prevent duplicate injection. Recall is handled via the `ep-recall` tool on the same turn.
+- **CLI path**: The plugin registers memory prompt guidance that tells the model to conditionally call `ep-recall` — only when the user's message references past events, ongoing tasks, or comparisons. Simple acknowledgments (OK, thanks, etc.) are skipped automatically.
+- **Conditional gate pipeline**: A fast memory-only filter (novelty → intent → fingerprint → negative cache) runs before every `ep-recall` call. It prevents unnecessary tool calls on low-value turns. No-hit results trigger exponential backoff (3 → 6 → 12 turns).
+- **Query construction**: Recall queries are built from the existing Parse/Rewrite pipeline (using `recallQueryRecentMessageCount` as the user-message window size), NOT raw latest message text.
+- **Context-engine contract**: `assemble()` now returns `systemPromptAddition` (matching the OpenClaw context engine contract) instead of the plugin-local `prependSystemContext`.
+
+Configure via `toolFirstRecall.enabled` (default: `true`) and `toolFirstRecall.k` (default: `3`) in plugin config. Set `enabled: false` to revert to v0.4.5 behavior.
 
 And while you are chatting, new memories are being made in the background (this is the v0.4.2 magic):
 - **Step A — Off to the Cache DB Waiting Room.** Whenever conversation logs come in, even if it's a giant tsunami of text, the system slices it into safe 64K chunks and puts them in a temporary queue. No panic, no crashed APIs.

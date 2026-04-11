@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
+import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration, ToolFirstRecallConfig } from "./types";
 
 function clampUnitInterval(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -133,5 +133,20 @@ export function buildRecallCalibration(config: EpisodicPluginConfig): RecallCali
     topicsMatchBoost: config.recallTopicsMatchBoost,
     topicsMismatchPenalty: config.recallTopicsMismatchPenalty,
     topicsMissingPenalty: config.recallTopicsMissingPenalty,
+  };
+}
+
+/**
+ * Build Tool-first recall config from raw plugin config.
+ * Default: enabled=true, k=3.
+ */
+export function buildToolFirstRecallConfig(rawConfig: any): ToolFirstRecallConfig {
+  const tf = rawConfig?.toolFirstRecall ?? {};
+  return {
+    enabled: tf.enabled ?? true,
+    k: Math.max(1, Math.min(10, tf.k ?? 3)),
+    maxFingerprintChars: Math.max(32, Math.min(512, tf.maxFingerprintChars ?? 128)),
+    negativeCacheMaxSize: Math.max(10, Math.min(500, tf.negativeCacheMaxSize ?? 64)),
+    backoffTurns: tf.backoffTurns ?? [3, 6, 12],
   };
 }

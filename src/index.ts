@@ -4,7 +4,7 @@ import * as fs from "fs";
 import { createHash } from "crypto";
 import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer, resolveSessionFile, ingestColdStartSession, ingestedSessions } from "./rpc-client";
-import { buildRecallCalibration, loadConfig } from "./config";
+import { buildRecallCalibration, loadConfig, buildToolFirstRecallConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
 import { EpisodicArchiver } from "./archiver";
@@ -13,7 +13,10 @@ import { estimateTokens } from "./utils";
 import { OpenRouterClient } from "./openrouter-client";
 import { NarrativeWorker } from "./narrative-worker";
 import { NarrativePool } from "./narrative-pool";
-import { RecallFallbackReason, RecallMatchedBy } from "./types";
+import { RecallFallbackReason, RecallMatchedBy, ToolFirstRecallConfig, ToolFirstGateResult } from "./types";
+import { ToolFirstRecallGate } from "./tool-first-gate";
+import { instantDeterministicRewrite, isAttachmentDominant, stripAttachmentNoise } from "./retriever";
+import { stripReasoningTagsFromText } from "./reasoning-tags";
 
 export interface OpenClawPluginApi {
   // フック登録 — openclaw types.ts の PluginHookName に準拠
@@ -429,6 +432,11 @@ const PluginConfigSchema = Type.Object(
     enableBackgroundWorkers: Type.Optional(Type.Boolean({
       description: "Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery). Default: true. Does not affect narrative generation."
     })),
+    // Tool-first recall (v0.4.6)
+    toolFirstRecall: Type.Optional(Type.Object({
+      enabled: Type.Optional(Type.Boolean({ description: "Enable tool-first recall path. Default: true." })),
+      k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Default k for tool-first ep-recall calls. Default: 3." })),
+    }, { description: "Tool-first recall configuration (v0.4.6). Controls the conditional gate pipeline for ep-recall." })),
   },
   { additionalProperties: false }
 );
@@ -443,6 +451,8 @@ type SingletonType = {
   retriever: EpisodicRetriever;
   sidecarStarted: boolean;
   cfg: ReturnType<typeof loadConfig>;
+  tfConfig: ToolFirstRecallConfig;
+  tfGate: ToolFirstRecallGate;
   agentStates: Map<string, AgentRuntimeState>;
   debouncers: Map<string, FileEventDebouncer>;
   watcherWorkspaces: Set<string>;
@@ -492,6 +502,8 @@ const episodicClawPlugin = {
       if (!_singleton) {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
         const cfg = loadConfig(openClawGlobalConfig);
+        const tfConfig = buildToolFirstRecallConfig(openClawGlobalConfig);
+        const tfGate = new ToolFirstRecallGate(tfConfig);
         const rpcClient = new EpisodicCoreClient();
         const retriever = new EpisodicRetriever(rpcClient, cfg);
 
@@ -514,6 +526,8 @@ const episodicClawPlugin = {
           retriever,
           sidecarStarted: false,
           cfg,
+          tfConfig,
+          tfGate,
           agentStates: new Map(),
           debouncers: new Map(),
           watcherWorkspaces: new Set(),
@@ -527,7 +541,7 @@ const episodicClawPlugin = {
         console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
       }
 
-      const { rpcClient, retriever, cfg, narrativeWorker } = _singleton;
+      const { rpcClient, retriever, cfg, tfConfig, tfGate, narrativeWorker } = _singleton;
       const recallCalibration = buildRecallCalibration(cfg);
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
@@ -858,8 +872,15 @@ const episodicClawPlugin = {
           console.log("[Episodic Memory] Fallback segmenter error in before_prompt_build:", err);
         });
 
-        // ── メモリ注入（tokenBudget なし → 固定上限）──
-        // before_prompt_build は tokenBudget を受け取らないため、安全側の固定値を使う。
+        // ── Tool-first gate: if enabled, skip retrieveRelevantContext (A-1) ──
+        // Do NOT call tfGate.evaluate() here — it would mutate turn state and cause
+        // turn drift/noise. The ep-recall tool handles recall via the tool-first gate.
+        if (tfConfig.enabled) {
+          console.log(`[Episodic Memory] before_prompt_build source=tool_first skip_reason=no_op agentId=${agentId}`);
+          return {};
+        }
+
+        // ── Fallback path (tool-first disabled) — original behavior ──
         const ESTIMATED_MAX_EPISODIC_TOKENS = 1024;
         const k = 5;
 
@@ -1033,18 +1054,52 @@ const episodicClawPlugin = {
           const msgs = (ctx.messages || []) as Message[];
           console.log(`[Episodic Memory] assemble() called (${msgs.length} messages) — contextEngine slot IS set to "episodic-claw"`);
 
-          // before_prompt_build が既にセグメンテーション+メモリ注入を担当しているため、
-          // assemble() では最小限の処理のみ行う（二重注入防止）。
-          // 万一 before_prompt_build がブロックされた場合の保険として、
-          // 簡易的なメモリ注入のみ実行する（トークン予算は ctx.tokenBudget を使用）。
           const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
           const { agentId, agentWs } = resolution;
           if (!agentWs) {
-            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
+            return { messages: msgs, systemPromptAddition: "", estimatedTokens: 0 };
           }
           await prepareWorkspaces(resolution);
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
+
+          // ── Tool-first gate: if enabled, skip retrieveRelevantContext (A-1) ──
+          // Do NOT call tfGate.evaluate() here — it would mutate turn state and cause
+          // turn drift/noise. The ep-recall tool handles recall via the tool-first gate.
+          // Only allow anchor injection if available.
+          if (tfConfig.enabled) {
+            let anchorPrependText = "";
+            const anchorState = state.anchorInjection;
+            if (anchorState) {
+              const anchorPayload = buildAnchorInjectionPayload(anchorState);
+              if (anchorPayload) {
+                anchorPrependText = anchorPayload;
+              }
+              anchorState.remainingEligibleAssembles = Math.max(0, anchorState.remainingEligibleAssembles - 1);
+              if (anchorState.remainingEligibleAssembles <= 0) {
+                clearAnchorInjection(state);
+              }
+            }
+
+            // Fire-and-forget segmenter
+            state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
+              console.log("[Episodic Memory] Segmenter error in assemble (tool-first):", err);
+            });
+
+            // Return no-op for recall, only anchor text if any
+            const systemPromptAddition = anchorPrependText.trim();
+            return {
+              messages: msgs,
+              systemPromptAddition,
+              estimatedTokens: systemPromptAddition ? estimateTokens(systemPromptAddition) : 0,
+            };
+          }
+
+          // ── Fallback path (tool-first disabled) — original behavior ──
+          // before_prompt_build が既にセグメンテーション+メモリ注入を担当しているため、
+          // assemble() では最小限の処理のみ行う（二重注入防止）。
+          // 万一 before_prompt_build がブロックされた場合の保険として、
+          // 簡易的なメモリ注入のみ実行する（トークン予算は ctx.tokenBudget を使用）。
 
           // セグメンテーションは before_prompt_build で既に実行済みだが、
           // assemble() が呼ばれる = before_prompt_build がブロックされている可能性もあるため、
@@ -1061,7 +1116,7 @@ const episodicClawPlugin = {
           const k = 5;
 
           if (maxEpisodicTokens <= 0) {
-            return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };
+            return { messages: msgs, systemPromptAddition: "", estimatedTokens: 0 };
           }
 
           // アンカー注入
@@ -1085,29 +1140,52 @@ const episodicClawPlugin = {
 
           const maxRecallTokens = Math.max(0, maxEpisodicTokens - anchorTokens);
           if (maxRecallTokens <= 0) {
-            const prependSystemContext = anchorPrependText.trim();
-            return { messages: msgs, prependSystemContext, estimatedTokens: estimateTokens(prependSystemContext) };
+            const systemPromptAddition = anchorPrependText.trim();
+            return { messages: msgs, systemPromptAddition, estimatedTokens: estimateTokens(systemPromptAddition) };
           }
 
           try {
             const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
-            const prependSystemContext = [anchorPrependText, recallOutcome.text]
+            const systemPromptAddition = [anchorPrependText, recallOutcome.text]
               .map((part) => part.trim())
               .filter((part) => part.length > 0)
               .join("\n\n");
             return {
               messages: msgs,
-              prependSystemContext,
-              estimatedTokens: estimateTokens(prependSystemContext),
+              systemPromptAddition,
+              estimatedTokens: estimateTokens(systemPromptAddition),
             };
           } catch (err) {
             console.log("[Episodic Memory] assemble recall error:", err);
-            const prependSystemContext = anchorPrependText.trim();
-            return { messages: msgs, prependSystemContext, estimatedTokens: estimateTokens(prependSystemContext) };
+            const systemPromptAddition = anchorPrependText.trim();
+            return { messages: msgs, systemPromptAddition, estimatedTokens: estimateTokens(systemPromptAddition) };
           }
           },
         };
       });
+
+      // ─── CLI Memory Prompt Guidance (Tool-first Recall Contract) ─────────────
+      // For CLI path where before_prompt_build doesn't fire, we register a memory
+      // prompt section that guides the model to use ep-recall conditionally.
+      // This is the plugin-only bridge for CLI (A-2 in plan).
+      // Uses api.registerMemoryCapability if available, otherwise falls back to
+      // enhancing tool descriptions.
+      const TOOL_FIRST_MEMORY_GUIDANCE = `## Episodic Memory Usage (tool-first)
+- Before answering, check if the user's message references past conversations, ongoing tasks, or asks about something you discussed before.
+- If it does: call ep-recall with a focused query built from the key topics. Use k=${tfConfig.k}.
+- If ep-recall returns results: integrate them into your answer.
+- If ep-recall returns nothing: answer normally without fabricating memory content.
+- For simple acknowledgments (OK, thanks, etc.): skip ep-recall entirely.
+- Your memory tools are ep-recall (search), ep-save (save), ep-expand (read full), and ep-anchor (session continuity). Always use these before any other memory tool.`;
+
+      if (typeof (api as any).registerMemoryCapability === "function") {
+        (api as any).registerMemoryCapability({
+          promptBuilder: () => TOOL_FIRST_MEMORY_GUIDANCE,
+        });
+        console.log("[Episodic Memory] CLI memory prompt guidance registered via registerMemoryCapability.");
+      }
+      // If registerMemoryCapability is not available, the guidance is embedded in the
+      // ep-recall tool description below as a fallback.
 
       const EpRecallSchema = Type.Object({
         query: Type.String({ description: "Search explicitly within the agent's Episodic Memory for a given topic or keyword" }),
@@ -1122,7 +1200,7 @@ const episodicClawPlugin = {
 
       api.registerTool((ctx: any) => ({
         name: "ep-recall",
-        description: "Search explicitly within the agent's Episodic Memory for a given topic or keyword. Use this when the auto-retrieval isn't sufficient or you need specific historical facts.",
+        description: `Search explicitly within the agent's Episodic Memory for a given topic or keyword. Use this when the auto-retrieval isn't sufficient or you need specific historical facts. IMPORTANT: Call this conditionally — only when the user's message references past events, ongoing tasks, comparisons, or re-confirmation. Skip for simple acknowledgments (OK, thanks, etc.). If no results are returned, answer normally without fabricating memory content.`,
         parameters: EpRecallSchema,
         execute: async (_toolCallId: string, params: any) => {
           // [A-3] gateway_start 前に呼ばれた場合に空パスで RPC が発行されるのを防ぐ
@@ -1134,6 +1212,40 @@ const episodicClawPlugin = {
           await prepareWorkspaces(resolution);
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
+
+          // ── v0.4.6: Deterministic filter enforcement in execute path ──
+          // CLI path may not run before_prompt_build/assemble hooks, so we MUST
+          // run the gate here. Filter order: novelty -> intent -> fingerprint -> negative cache.
+          // If filter says skip, return short no-op and DO NOT call RPC recall.
+          if (tfConfig.enabled) {
+            // Build query using existing Parse/Rewrite logic (NOT raw user message).
+            // Use instantDeterministicRewrite with recent user messages when available.
+            const ctxMessages = (ctx?.messages || []) as Message[];
+            let query: string;
+            if (Array.isArray(ctxMessages) && ctxMessages.length > 0) {
+              const recentMsgs = ctxMessages
+                .filter((m: Message) => m.role === "user")
+                .slice(-(cfg.recallQueryRecentMessageCount ?? 4));
+              query = instantDeterministicRewrite(recentMsgs, cfg);
+            } else {
+              // Fallback to provided params.query if message context unavailable.
+              query = (params && typeof params.query === "string") ? params.query : "";
+            }
+
+            // Run the lightweight filter check (fingerprint + negative cache).
+            // Novelty/intent were already checked by the model's decision to call this tool,
+            // but we still enforce fingerprint dedup and negative cache backoff.
+            const gateResult = tfGate.evaluateForQuery(agentId, query);
+            if (!gateResult.pass) {
+              console.log(`[Episodic Memory] ep-recall source=tool_first_filter skip_reason=${gateResult.skipReason} agentId=${agentId}`);
+              return { content: [{ type: "text", text: "No new memory context to check — moving on with your question." }] };
+            }
+
+            // Use the gate's query (which is the rewritten query) for the RPC call.
+            // Override params.query with the gate's query for consistency.
+            params = { ...params, query: gateResult.query };
+          }
+
           const p = (params || {}) as Record<string, unknown>;
           const k = typeof p.k === "number" ? p.k : 3;
           const topics = Array.isArray(p.topics)
@@ -1152,7 +1264,18 @@ const episodicClawPlugin = {
             );
             const results = (primaryResults ?? []).slice(0, k);
             if (!results || results.length === 0) {
+              // Record no-hit for negative cache backoff
+              if (p.query && typeof p.query === "string") {
+                const queryFp = createHash("sha1").update((p.query as string).slice(0, tfConfig.maxFingerprintChars)).digest("hex");
+                tfGate.recordNoHit(agentId, queryFp);
+                console.log(`[Episodic Memory] ep-recall no-hit recorded fp=${queryFp.substring(0, 8)} agentId=${agentId}`);
+              }
               return { content: [{ type: "text", text: "Nothing came back. I don't have any memories matching that." }] };
+            }
+            // Record hit — clear negative cache entry
+            if (p.query && typeof p.query === "string") {
+              const queryFp = createHash("sha1").update((p.query as string).slice(0, tfConfig.maxFingerprintChars)).digest("hex");
+              tfGate.recordHit(agentId, queryFp);
             }
             const safeResults = results.map((res: any) => {
               const rawRecord = res?.Record ?? res?.record;

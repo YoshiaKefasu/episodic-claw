@@ -5,7 +5,7 @@
 
 **给 OpenClaw 智能体准备的“死都不忘”硬核长期情节记忆插件。**
 
-[![version](https://img.shields.io/badge/version-0.4.2--2-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
+[![version](https://img.shields.io/badge/version-0.4.6-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
 
 [English](./README.md) | [日本語](./README.ja.md) | 中文
 </div>

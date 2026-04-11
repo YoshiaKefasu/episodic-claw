@@ -5,7 +5,7 @@
 
 **OpenClawエージェントのための「ガチで忘れない」長期エピソード記憶プラグイン。**
 
-[![version](https://img.shields.io/badge/version-0.4.2--2-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
+[![version](https://img.shields.io/badge/version-0.4.6-blue?style=for-the-badge)](./CHANGELOG.md) [![license](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=for-the-badge)](./LICENSE) [![platform](https://img.shields.io/badge/platform-OpenClaw-orange?style=for-the-badge)](https://openclaw.ai)
 
 [English](./README.md) | 日本語 | [中文](./README.zh.md)
 </div>
@@ -60,6 +60,18 @@ sequenceDiagram
 ```
 
 ![シーケンス図：エピソード想起フロー](docs/sequenceDiagram.png)
+
+### v0.4.6 — ツールファースト想起（デュアルパスアーキテクチャ）
+
+v0.4.6以降、episodic-clawは**ツールファースト想起**アーキテクチャを採用し、CLI経路とエンベデッド経路（コンテキストエンジン）の両方で一貫した想起動作を保証します：
+
+- **エンベデッド経路（context engine slot = "episodic-claw"）**: `assemble()`と`before_prompt_build`はデフォルトで`retrieveRelevantContext`をスキップし、no-opを返して重複注入を防ぎます。想起は同一ターン内で`ep-recall`ツールを通じて行われます。
+- **CLI経路**: プラグインはメモリプロンプトガイダンスを登録し、モデルに対して条件付きで`ep-recall`を呼ぶよう指示します。ユーザーのメッセージが過去の出来事、進行中のタスク、比較を参照している場合のみ実行されます。単純な確認（OK、ありがとう等）は自動的にスキップされます。
+- **条件付きゲートパイプライン**: 各`ep-recall`呼び出しの前に、メモリ内の高速フィルター（novelty → intent → fingerprint → negative cache）が実行されます。no-hit結果は指数バックオフ（3 → 6 → 12ターン）をトリガーします。
+- **クエリ構築**: 想起クエリは既存のParse/Rewriteパイプラインから構築されます（`recallQueryRecentMessageCount`をユーザーメッセージ窓サイズとして使用）。最新の生メッセージをそのまま投げる方式は採用していません。
+- **コンテキストエンジン契約**: `assemble()`はOpenClawのコンテキストエンジン契約に合わせ`systemPromptAddition`を返すようになりました（従来の`prependSystemContext`ではありません）。
+
+プラグイン設定の`toolFirstRecall.enabled`（デフォルト: `true`）と`toolFirstRecall.k`（デフォルト: `3`）で設定可能です。`enabled: false`に設定するとv0.4.5の挙動に戻ります。
 
 そして裏では、新しい記憶もずっと作られ続けています（これがv0.4.2の醍醐味！）。
 - **Step A — 全部「待合室（Cache DB）」へ。** 会話履歴が一気に大量に流れて来ても、システムがパニックにならないよう「安全な64Kサイズ」に切り分けてから一時DBに並べます。

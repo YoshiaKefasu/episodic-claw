@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -151,7 +151,26 @@
         "minimum": 1,
         "maximum": 12,
         "default": 4,
-        "description": "How many recent messages are used to build the deterministic recall query. Default: 4.\n⚠️ [Blast Radius] If too high: Query becomes noisy and dilutes semantic intent. If too low: Insufficient context for accurate memory retrieval."
+        "description": "How many recent user messages are used to build the deterministic recall query (Parse/Rewrite window size, NOT raw latest message). Default: 4.\n⚠️ [Blast Radius] If too high: Query becomes noisy and dilutes semantic intent. If too low: Insufficient context for accurate memory retrieval."
+      },
+      "toolFirstRecall": {
+        "type": "object",
+        "description": "Tool-first recall configuration (v0.4.6). Controls the conditional gate pipeline for ep-recall. When enabled (default), assemble() and before_prompt_build skip retrieveRelevantContext to prevent duplicate injection, and ep-recall is used as the primary recall path.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable tool-first recall path. When true, embedded path (assemble/before_prompt_build) returns no-op for retrieveRelevantContext, and CLI path uses conditional ep-recall guidance. Default: true.\n⚠️ [Blast Radius] If false: Falls back to v0.4.5 behavior with retrieveRelevantContext on every turn in both paths."
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 3,
+            "description": "Default k (number of episodes) for tool-first ep-recall calls. Default: 3.\n⚠️ [Blast Radius] If too high: Too many episodes returned per call, increasing token cost. If too low: May miss relevant memories."
+          }
+        }
       },
       "openrouterApiKey": {
         "type": "string",

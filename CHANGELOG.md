@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.6] - 2026-04-12
+
+### Added
+- **CLI Filter Enforcement in `ep-recall` Execute Path**: The `ep-recall` tool execute path now runs `tfGate.evaluateForQuery()` before making any RPC call. Full 4-stage filter order: novelty -> intent -> fingerprint dedup -> negative cache backoff.
+- **Per-Agent Gate State Isolation**: Gate state is now scoped by `agentId`. Each agent has its own fingerprint window, negative cache, and turn counter.
+- **New `evaluateForQuery()` Method**: Lightweight filter check that accepts a pre-built query string, running the full 4-stage pipeline.
+
+### Changed
+- **Hook No-Op Without State Mutation**: `before_prompt_build` and `assemble` now return no-op immediately when `toolFirstRecall.enabled=true` without calling `tfGate.evaluate()`, preventing turn drift and noise.
+- **Tool-first gate**: `src/tool-first-gate.ts` added with per-agent state management and `evaluateForQuery()` method.
+
+### Fixed
+- Gate state no longer leaks across agents/sessions.
+- `before_prompt_build` and `assemble` no longer cause turn drift when tool-first is enabled.
+- CLI path now has deterministic filter enforcement — no more unconditional `ep-recall` RPC calls.
+
 ## [0.4.5] - 2026-04-11
 
 ### Changed
