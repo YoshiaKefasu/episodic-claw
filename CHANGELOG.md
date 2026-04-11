@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.8] - 2026-04-12
+
+### Fixed
+- **OpenClaw Build Metadata**: Corrected `openclaw.compat.pluginApi`, `openclaw.build.openclawVersion`, and `openclaw.build.pluginSdkVersion` from `2026.4.11` back to `2026.4.10`. The previous release accidentally referenced a non-existent OpenClaw version.
+
 ## [0.4.6] - 2026-04-12
 
 ### Added
