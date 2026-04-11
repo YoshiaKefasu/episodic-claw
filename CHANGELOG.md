@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5] - 2026-04-11
+
+### Changed
+- **Compat Plugin API Range**: Updated to `>=2026.3.28 <=2026.4.10` to align with OpenClaw `2026.4.10`.
+- **Build Versions**: `openclawVersion` and `pluginSdkVersion` aligned to `2026.4.10`.
+- **Install Guidance**: Added explicit docs for OpenClaw `2026.4.8` `memory-lancedb` validation failure and upgrade guidance to `2026.4.10+`.
+
 ## [0.4.4] - 2026-04-11
 
 ### Added

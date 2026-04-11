@@ -47,12 +47,15 @@ ClawHub のプラグイン編集画面（https://clawhub.ai/plugins/episodic-cla
 ## 3. 公開手順（次回リリース時）
 
 1. **上記 1.1〜1.3 を ClawHub Web UI で更新**
-2. **新しいバージョンを GitHub Release として公開**
-3. **ClawHub でパッケージを再公開（re-publish）**
-4. **スキャン結果を確認**
+2. **OpenClaw 設定互換チェックを先に実行**
+   - `openclaw doctor --fix --non-interactive --yes`
+   - `plugins.entries.memory-lancedb.config.embedding` エラーが出る環境では、`~/.openclaw/openclaw.json` から `plugins.entries.memory-lancedb` を削除して再実行（episodic-claw は LanceDB 非依存）
+3. **新しいバージョンを GitHub Release として公開**
+4. **ClawHub でパッケージを再公開（re-publish）**
+5. **スキャン結果を確認**
    - VirusTotal: 通常数分で完了
    - OpenClaw Scanner: 数分〜数時間
-5. **結果が "Benign (High Confidence)" であることを確認**
+6. **結果が "Benign (High Confidence)" であることを確認**
 
 ---
 

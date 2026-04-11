@@ -103,6 +103,40 @@ openclaw plugins install clawhub:episodic-claw
 
 入り口はこれだけです。Go サイドカーは OpenClaw 環境に設定済みの `GEMINI_API_KEY` をそのまま自動で使います。
 
+### OpenClaw 2026.4.8 の既知インストール失敗（`memory-lancedb`）
+
+次のエラーで失敗する場合:
+
+`plugins.entries.memory-lancedb.config.embedding: must have required property 'embedding'`
+
+これは `episodic-claw` 側ではなく、OpenClaw 側の既存設定移行に起因するバリデーションエラーです。  
+`episodic-claw` は LanceDB を使わないので、`memory-lancedb` の古い設定を消して問題ありません。OpenAI API キーも不要です。
+この挙動は OpenClaw `2026.4.10` の `Config/plugins` 修正で解消済みなので、長期的には OpenClaw を `2026.4.10` 以上へ更新するのが最善です。
+
+Linux/macOS:
+
+```bash
+cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.$(date +%Y%m%d-%H%M%S)
+tmp="$(mktemp)"
+jq 'del(.plugins.entries["memory-lancedb"])' ~/.openclaw/openclaw.json > "$tmp" && mv "$tmp" ~/.openclaw/openclaw.json
+openclaw doctor --fix --non-interactive --yes
+openclaw plugins install clawhub:episodic-claw
+```
+
+Windows PowerShell:
+
+```powershell
+$cfg = Join-Path $HOME ".openclaw\openclaw.json"
+Copy-Item $cfg "$cfg.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+$json = Get-Content $cfg -Raw | ConvertFrom-Json -Depth 100
+if ($json.plugins.entries.PSObject.Properties.Name -contains "memory-lancedb") {
+  $json.plugins.entries.PSObject.Properties.Remove("memory-lancedb")
+}
+$json | ConvertTo-Json -Depth 100 | Set-Content $cfg -Encoding UTF8
+openclaw doctor --fix --non-interactive --yes
+openclaw plugins install clawhub:episodic-claw
+```
+
 ---
 
 ## <img src="./assets/icons/cpu.svg" width="24" align="center" alt="" /> Agent Install Prompt (エージェント用・詳細版)

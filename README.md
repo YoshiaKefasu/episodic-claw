@@ -104,6 +104,40 @@ openclaw plugins install clawhub:episodic-claw
 
 That's it. The Go sidecar automatically grabs the `GEMINI_API_KEY` you already have set up in your OpenClaw environment.
 
+### Known OpenClaw 2026.4.8 install failure (`memory-lancedb`)
+
+If install fails with:
+
+`plugins.entries.memory-lancedb.config.embedding: must have required property 'embedding'`
+
+this is an OpenClaw config migration issue, not an episodic-claw issue.  
+`episodic-claw` does not use LanceDB, so you can safely remove the stale `memory-lancedb` config entry. No OpenAI API key is required.
+This behavior is fixed in OpenClaw `2026.4.10` (`Config/plugins` validation fix), so upgrading OpenClaw is the preferred long-term solution.
+
+Linux/macOS:
+
+```bash
+cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.$(date +%Y%m%d-%H%M%S)
+tmp="$(mktemp)"
+jq 'del(.plugins.entries["memory-lancedb"])' ~/.openclaw/openclaw.json > "$tmp" && mv "$tmp" ~/.openclaw/openclaw.json
+openclaw doctor --fix --non-interactive --yes
+openclaw plugins install clawhub:episodic-claw
+```
+
+Windows PowerShell:
+
+```powershell
+$cfg = Join-Path $HOME ".openclaw\openclaw.json"
+Copy-Item $cfg "$cfg.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+$json = Get-Content $cfg -Raw | ConvertFrom-Json -Depth 100
+if ($json.plugins.entries.PSObject.Properties.Name -contains "memory-lancedb") {
+  $json.plugins.entries.PSObject.Properties.Remove("memory-lancedb")
+}
+$json | ConvertTo-Json -Depth 100 | Set-Content $cfg -Encoding UTF8
+openclaw doctor --fix --non-interactive --yes
+openclaw plugins install clawhub:episodic-claw
+```
+
 ## <img src="./assets/icons/cpu.svg" width="24" align="center" alt="" /> Agent Install Prompt
 
 AI agents can hallucinate or run destructive commmands if not guided properly. Copy and paste this **strict, step-by-step instruction** directly to your agent so it can safely install this memory engine for itself.
