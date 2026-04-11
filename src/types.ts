@@ -137,6 +137,8 @@ export interface EpisodicPluginConfig {
     maxTokens?: number;
     exclude?: boolean;
   };
+  /** Runtime Bridge Mode master switch (v0.4.7). Controls whether the plugin uses the universal bridge (before_dispatch/message_sent) or legacy embedded path. Default: "auto". */
+  runtimeBridgeMode?: RuntimeBridgeMode;
 }
 
 export interface RecallCalibration {
@@ -256,3 +258,7 @@ export interface NegativeCacheEntry {
   backoffUntilTurn: number;
   lastSeenTurn: number;
 }
+
+// ─── Runtime Bridge Mode master switch (v0.4.7) ───────────────────────────────
+
+export type RuntimeBridgeMode = "auto" | "legacy_embedded" | "cli_universal";

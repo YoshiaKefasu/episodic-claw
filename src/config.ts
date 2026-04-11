@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration, ToolFirstRecallConfig } from "./types";
+import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration, RuntimeBridgeMode, ToolFirstRecallConfig } from "./types";
 
 function clampUnitInterval(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -149,4 +149,17 @@ export function buildToolFirstRecallConfig(rawConfig: any): ToolFirstRecallConfi
     negativeCacheMaxSize: Math.max(10, Math.min(500, tf.negativeCacheMaxSize ?? 64)),
     backoffTurns: tf.backoffTurns ?? [3, 6, 12],
   };
+}
+
+/**
+ * Resolve Runtime Bridge Mode from raw plugin config.
+ * Default: "auto" (provider-aware routing).
+ */
+export function resolveRuntimeBridgeMode(rawConfig: any): RuntimeBridgeMode {
+  const raw = rawConfig?.runtimeBridgeMode;
+  const validModes: RuntimeBridgeMode[] = ["auto", "legacy_embedded", "cli_universal"];
+  if (typeof raw === "string" && validModes.includes(raw as RuntimeBridgeMode)) {
+    return raw as RuntimeBridgeMode;
+  }
+  return "auto";
 }

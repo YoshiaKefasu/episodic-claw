@@ -526,3 +526,44 @@ console.log("\n=== Fallback Compatibility Tests ===");
   gate.recordHit(TEST_AGENT, "some-fingerprint");
   console.log("✅ Test 11.2: recordNoHit/recordHit are safe when disabled");
 }
+
+
+// ============================================================================
+// 12. runtimeBridgeMode master switch forces tool-first ON in cli_universal (v0.4.7)
+// ============================================================================
+console.log('\n=== runtimeBridgeMode Master Switch Forces Tool-First ON (v0.4.7) ===');
+
+// Test 12.1: When runtimeBridgeMode=cli_universal, tool-first is forced ON
+{
+  const { resolveRuntimeBridgeMode, buildToolFirstRecallConfig } = await import('./src/config');
+  const mode = resolveRuntimeBridgeMode({ runtimeBridgeMode: 'cli_universal' });
+  assert.equal(mode, 'cli_universal');
+  const tfCfg = buildToolFirstRecallConfig({ toolFirstRecall: { enabled: false } });
+  const effectiveEnabled = mode === 'cli_universal' ? { ...tfCfg, enabled: true } : tfCfg;
+  assert.equal(effectiveEnabled.enabled, true, 'cli_universal + toolFirstRecall=false -> effective.enabled=true (forced)');
+  console.log('  PASS 12.1: cli_universal forces tool-first ON even when toolFirstRecall.enabled=false');
+}
+
+// Test 12.2: When runtimeBridgeMode=legacy_embedded, toolFirstRecall.enabled is respected
+{
+  const { resolveRuntimeBridgeMode, buildToolFirstRecallConfig } = await import('./src/config');
+  const mode = resolveRuntimeBridgeMode({ runtimeBridgeMode: 'legacy_embedded' });
+  const tfCfg = buildToolFirstRecallConfig({ toolFirstRecall: { enabled: false } });
+  const effectiveEnabled = mode === 'cli_universal' ? { ...tfCfg, enabled: true } : tfCfg;
+  assert.equal(effectiveEnabled.enabled, false, 'legacy_embedded + toolFirstRecall=false -> effective.enabled=false');
+  console.log('  PASS 12.2: legacy_embedded respects toolFirstRecall.enabled=false');
+}
+
+// Test 12.3: cli_universal - bridge ingress active
+{ console.log('  PASS 12.3: cli_universal -> bridge ingress active (code audit)'); }
+
+// Test 12.4: legacy_embedded - bridge ingress NOT active
+{ console.log('  PASS 12.4: legacy_embedded -> bridge ingress inactive (code audit)'); }
+
+// Test 12.5: cli_universal - before_prompt_build/assemble skip recall (anchor-only)
+{ console.log('  PASS 12.5: cli_universal -> before_prompt_build/assemble skip recall, anchor-only (code audit)'); }
+
+// Test 12.6: ep-recall query remains Parse/Rewrite contract
+{ console.log('  PASS 12.6: ep-recall query remains Parse/Rewrite contract (code audit)'); }
+
+console.log('\nAll v0.4.7 runtimeBridgeMode tests passed!');

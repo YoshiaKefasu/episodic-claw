@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -155,13 +155,13 @@
       },
       "toolFirstRecall": {
         "type": "object",
-        "description": "Tool-first recall configuration (v0.4.6). Controls the conditional gate pipeline for ep-recall. When enabled (default), assemble() and before_prompt_build skip retrieveRelevantContext to prevent duplicate injection, and ep-recall is used as the primary recall path.",
+        "description": "Tool-first recall configuration (v0.4.6). Controls the conditional gate pipeline for ep-recall. NOTE: When runtimeBridgeMode=cli_universal (or auto resolves to cli_universal), tool-first recall is forced ON regardless of this setting. When runtimeBridgeMode=legacy_embedded, this setting is respected normally.",
         "additionalProperties": false,
         "properties": {
           "enabled": {
             "type": "boolean",
             "default": true,
-            "description": "Enable tool-first recall path. When true, embedded path (assemble/before_prompt_build) returns no-op for retrieveRelevantContext, and CLI path uses conditional ep-recall guidance. Default: true.\n⚠️ [Blast Radius] If false: Falls back to v0.4.5 behavior with retrieveRelevantContext on every turn in both paths."
+            "description": "Enable tool-first recall path. When runtimeBridgeMode=cli_universal, this is ignored (forced true). When runtimeBridgeMode=legacy_embedded, this controls whether embedded path (assemble/before_prompt_build) returns no-op for retrieveRelevantContext. Default: true.\n⚠️ [Blast Radius] If false: Falls back to v0.4.5 behavior with retrieveRelevantContext on every turn in both paths."
           },
           "k": {
             "type": "integer",
@@ -254,6 +254,12 @@
         "minimum": 1,
         "default": 15,
         "description": "Time gap threshold (minutes) between user messages that triggers an automatic segment boundary. Default: 15.\n⚠️ [Blast Radius] If too short: Excessive segmentation breaks conversation flow. If too long: Long pauses don't create natural episode boundaries."
+      },
+      "runtimeBridgeMode": {
+        "type": "string",
+        "enum": ["auto", "legacy_embedded", "cli_universal"],
+        "default": "auto",
+        "description": "Runtime Bridge Mode master switch (v0.4.7). Controls how episodic memory ingests and recalls data.\n- 'auto' (default): Automatically chooses the optimal path based on execution environment. Falls back to cli_universal if undetectable.\n- 'cli_universal': Forces the universal bridge path (before_dispatch/message_sent) and tool-first recall ON.\n- 'legacy_embedded': Forces the legacy embedded path (before_prompt_build/assemble) for rollback compatibility.\n⚠️ [Blast Radius] Changing this affects all memory ingest and recall behavior. Use 'legacy_embedded' only for rollback."
       }
     }
   },

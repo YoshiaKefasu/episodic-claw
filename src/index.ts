@@ -4,8 +4,8 @@ import * as fs from "fs";
 import { createHash } from "crypto";
 import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer, resolveSessionFile, ingestColdStartSession, ingestedSessions } from "./rpc-client";
-import { buildRecallCalibration, loadConfig, buildToolFirstRecallConfig } from "./config";
-import { EventSegmenter, Message, extractText } from "./segmenter";
+import { buildRecallCalibration, loadConfig, buildToolFirstRecallConfig, resolveRuntimeBridgeMode } from "./config";
+import { EventSegmenter, Message, extractText, SessionMappingCache, SessionMappingEntry, buildBeforeDispatchDelta, buildMessageSentDelta, normalizeConversationKey, getAllConversationKeys } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome } from "./retriever";
 import { EpisodicArchiver } from "./archiver";
 import { AnchorStore } from "./anchor-store";
@@ -13,7 +13,7 @@ import { estimateTokens } from "./utils";
 import { OpenRouterClient } from "./openrouter-client";
 import { NarrativeWorker } from "./narrative-worker";
 import { NarrativePool } from "./narrative-pool";
-import { RecallFallbackReason, RecallMatchedBy, ToolFirstRecallConfig, ToolFirstGateResult } from "./types";
+import { RecallFallbackReason, RecallMatchedBy, RuntimeBridgeMode, ToolFirstRecallConfig, ToolFirstGateResult } from "./types";
 import { ToolFirstRecallGate } from "./tool-first-gate";
 import { instantDeterministicRewrite, isAttachmentDominant, stripAttachmentNoise } from "./retriever";
 import { stripReasoningTagsFromText } from "./reasoning-tags";
@@ -437,6 +437,11 @@ const PluginConfigSchema = Type.Object(
       enabled: Type.Optional(Type.Boolean({ description: "Enable tool-first recall path. Default: true." })),
       k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Default k for tool-first ep-recall calls. Default: 3." })),
     }, { description: "Tool-first recall configuration (v0.4.6). Controls the conditional gate pipeline for ep-recall." })),
+    // Runtime Bridge Mode (v0.4.7)
+    runtimeBridgeMode: Type.Optional(Type.String({
+      enum: ["auto", "legacy_embedded", "cli_universal"],
+      description: "Runtime bridge mode master switch (v0.4.7). Controls whether the plugin uses the universal bridge (before_dispatch/message_sent) or legacy embedded path. Default: \"auto\"."
+    })),
   },
   { additionalProperties: false }
 );
@@ -452,6 +457,7 @@ type SingletonType = {
   sidecarStarted: boolean;
   cfg: ReturnType<typeof loadConfig>;
   tfConfig: ToolFirstRecallConfig;
+  effectiveTfConfig: ToolFirstRecallConfig;
   tfGate: ToolFirstRecallGate;
   agentStates: Map<string, AgentRuntimeState>;
   debouncers: Map<string, FileEventDebouncer>;
@@ -460,6 +466,13 @@ type SingletonType = {
   // Narrative architecture (v0.4.0)
   openRouterClient: OpenRouterClient | null;
   narrativeWorker: NarrativeWorker | null;
+  // v0.4.7: Session mapping for message_sent resolution (TTL/LRU)
+  sessionMapping: SessionMappingCache;
+  // v0.4.7: Idempotency markers for hook-driven ingest
+  ingestIdempotency: Map<string, number>; // key -> lastSeenMinuteBucket
+  // v0.4.7: CLI Mode master switch
+  runtimeBridgeMode: RuntimeBridgeMode;
+  effectiveBridgeMode: "cli_universal" | "legacy_embedded";
 };
 let _singleton: SingletonType | null = null;
 
@@ -503,11 +516,33 @@ const episodicClawPlugin = {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
         const cfg = loadConfig(openClawGlobalConfig);
         const tfConfig = buildToolFirstRecallConfig(openClawGlobalConfig);
-        const tfGate = new ToolFirstRecallGate(tfConfig);
+        const rbMode = resolveRuntimeBridgeMode(openClawGlobalConfig);
+
+        // Resolve effective bridge mode
+        let effMode: "cli_universal" | "legacy_embedded";
+        if (rbMode === "cli_universal") {
+          effMode = "cli_universal";
+        } else if (rbMode === "legacy_embedded") {
+          effMode = "legacy_embedded";
+        } else {
+          const isCliPath = process.env.OPENCLAW_CLI === "1" || process.argv.some(a => a.includes("openclaw"));
+          if (isCliPath) {
+            effMode = "cli_universal";
+          } else {
+            console.warn("[Episodic Memory] runtimeBridgeMode=auto: execution path undecidable, defaulting to cli_universal (safe side).");
+            effMode = "cli_universal";
+          }
+        }
+
+        // Force tool-first ON when effective mode is cli_universal
+        const effectiveTfConfig = effMode === "cli_universal"
+          ? { ...tfConfig, enabled: true }
+          : tfConfig;
+
+        const tfGate = new ToolFirstRecallGate(effectiveTfConfig);
         const rpcClient = new EpisodicCoreClient();
         const retriever = new EpisodicRetriever(rpcClient, cfg);
 
-        // Narrative architecture (v0.4.0)
         const openRouterClient = cfg.openrouterApiKey
           ? new OpenRouterClient({
               apiKey: cfg.openrouterApiKey,
@@ -527,6 +562,7 @@ const episodicClawPlugin = {
           sidecarStarted: false,
           cfg,
           tfConfig,
+          effectiveTfConfig,
           tfGate,
           agentStates: new Map(),
           debouncers: new Map(),
@@ -534,17 +570,26 @@ const episodicClawPlugin = {
           watcherDegradedWorkspaces: new Set(),
           openRouterClient,
           narrativeWorker,
+          sessionMapping: new SessionMappingCache(),
+          ingestIdempotency: new Map(),
+          runtimeBridgeMode: rbMode,
+          effectiveBridgeMode: effMode,
         };
-        (global as any)[SINGLETON_KEY] = _singleton; // global に保存してプロセス全体で共有
-        console.log("[Episodic Memory] Singleton created.");
+        (global as any)[SINGLETON_KEY] = _singleton;
+        console.log(`[Episodic Memory] Singleton created. runtimeBridgeMode=${rbMode} effective=${effMode}`);
       } else {
         console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
       }
 
-      const { rpcClient, retriever, cfg, tfConfig, tfGate, narrativeWorker } = _singleton;
+      // _singleton is guaranteed non-null here (created above if missing)
+      const s = _singleton!;
+      const { rpcClient, retriever, cfg, tfConfig, effectiveTfConfig, tfGate, narrativeWorker, runtimeBridgeMode, effectiveBridgeMode } = s;
       const recallCalibration = buildRecallCalibration(cfg);
       // openClawGlobalConfig は gateway_start ハンドラ内の workspace 解決で使用
       const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
+
+      // CLI mode + tool-first: either one enabled is enough for tool-first path
+      const effectiveToolFirstEnabled = effectiveBridgeMode === "cli_universal" || effectiveTfConfig.enabled;
 
       // 同一メモリ結果の再注入を防止するためのクールダウンターン数
       // 12往復の会話（ユーザー12 + アシスタント12）。1Mコンテキスト窓では十分な間隔。
@@ -800,6 +845,164 @@ const episodicClawPlugin = {
         }
       });
 
+      // ─── v0.4.7: Bridge ingress hooks (provider-agnostic ingest) ─────────────
+      // Only active when effectiveBridgeMode === "cli_universal". When false,
+      // legacy embedded path (before_prompt_build/assemble) handles all ingest.
+      //
+      // Primary: before_dispatch fires before CLI/Embedded split, guaranteeing
+      // ingest runs for both paths. Uses processIncrementalTurn (not processTurn)
+      // because the payload is a single-turn delta, not cumulative history.
+      //
+      // Secondary: message_sent captures assistant-side text for complete
+      // episodic capture (prevents "user-only" degraded state).
+
+      // Idempotency key: sessionKey + role + normalizedTextHash + minuteBucket
+      function buildIdempotencyKey(sessionKey: string, role: string, text: string): string {
+        const minuteBucket = Math.floor(Date.now() / 60000);
+        const textHash = createHash("sha256").update(text).digest("hex").slice(0, 16);
+        return `${sessionKey}:${role}:${textHash}:${minuteBucket}`;
+      }
+
+      function checkAndMarkIdempotency(key: string): boolean {
+        const existing = _singleton!.ingestIdempotency.get(key);
+        if (existing !== undefined) return false; // duplicate
+        _singleton!.ingestIdempotency.set(key, Date.now());
+        // Prune old entries (> 5 minutes ago)
+        const cutoff = Date.now() - 5 * 60 * 1000;
+        for (const [k, v] of _singleton!.ingestIdempotency) {
+          if (v < cutoff) _singleton!.ingestIdempotency.delete(k);
+        }
+        return true;
+      }
+
+      // ── Bridge ingress: only when effectiveBridgeMode === "cli_universal" ──
+      if (effectiveBridgeMode === "cli_universal") {
+        api.on("before_dispatch", async (event: any, ctx: any) => {
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
+            console.log("[Episodic Memory] before_dispatch: no workspace resolved, skipping.");
+            return;
+          }
+
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
+
+          // Build session mapping for message_sent resolution
+          // Register under ALL available keys from ctx to prevent key mismatch
+          const allKeys = getAllConversationKeys(ctx);
+          if (allKeys.length > 0) {
+            const sessionKey = ctx?.sessionKey || `agent:${agentId}`;
+            const entry: SessionMappingEntry = {
+              sessionKey,
+              agentId,
+              agentWs,
+              expiresAt: 0, // set by SessionMappingCache
+            };
+            for (const key of allKeys) {
+              _singleton!.sessionMapping.set(key, entry);
+            }
+          }
+
+          // Build delta Message[] from real before_dispatch event shape
+          // (event.content / event.body — NOT event.messages)
+          const messages = buildBeforeDispatchDelta(event);
+          if (messages.length === 0) {
+            console.log("[Episodic Memory] before_dispatch: no content/body in payload, skipping.");
+            return;
+          }
+
+          // Idempotency guard
+          const primaryMsg = messages[messages.length - 1];
+          const primaryText = extractText(primaryMsg.content).trim();
+          if (primaryText) {
+            const sessionKey = ctx?.sessionKey || `agent:${agentId}`;
+            const idemKey = buildIdempotencyKey(sessionKey, primaryMsg.role || "user", primaryText);
+            if (!checkAndMarkIdempotency(idemKey)) {
+              console.log(`[Episodic Memory] before_dispatch: duplicate detected (idemKey=${idemKey.slice(0, 40)}...), skipping.`);
+              return;
+            }
+          }
+
+          console.log(`[Episodic Memory] before_dispatch: source=bridge_ingress sessionKey=${ctx?.sessionKey || "n/a"} agentId=${agentId} agentWs=${agentWs} messages=${messages.length}`);
+
+          // Use incremental ingest (NOT processTurn) — payload is single-turn delta
+          state.segmenter.processIncrementalTurn(messages, agentWs, agentId, "before_dispatch").catch(err => {
+            console.error("[Episodic Memory] before_dispatch: incremental ingest error:", err);
+          });
+
+          // [Fix D-3] setMeta rate-limit
+          const nowMeta = Date.now();
+          if (nowMeta - state.lastSetMetaTime >= SET_META_INTERVAL_MS) {
+            await rpcClient.setMeta("last_activity", nowMeta.toString(), agentWs);
+            state.lastSetMetaTime = nowMeta;
+          }
+        });
+
+        // Secondary: message_sent — captures assistant-side text
+        api.on("message_sent", async (event: any, ctx: any) => {
+          // Resolve session from conversation/channel via short-lived mapping
+          // Try ALL available keys from ctx in priority order, use first hit
+          const allKeys = getAllConversationKeys(ctx);
+          if (allKeys.length === 0) {
+            console.log("[Episodic Memory] message_sent: no conversation/session key in ctx, no-op.");
+            return;
+          }
+
+          let mapping: SessionMappingEntry | null = null;
+          let resolvedKey: string | null = null;
+          for (const key of allKeys) {
+            const entry = _singleton!.sessionMapping.get(key);
+            if (entry) {
+              mapping = entry;
+              resolvedKey = key;
+              break;
+            }
+          }
+
+          if (!mapping) {
+            console.log(`[Episodic Memory] message_sent: session mapping unresolved for keys=[${allKeys.join(", ")}], no-op (safe guard).`);
+            return;
+          }
+
+          const { agentId, agentWs } = mapping;
+          const state = getAgentState(agentId);
+
+          // Build delta from real message_sent event shape
+          // (event.content + event.success — NOT event.messages)
+          // buildMessageSentDelta already checks success === true internally
+          const messages = buildMessageSentDelta(event);
+          if (messages.length === 0) {
+            // Distinguish: success=false vs no content
+            const evtSuccess = event?.success;
+            if (evtSuccess !== true) {
+              console.log(`[Episodic Memory] message_sent: success=${evtSuccess}, no-op.`);
+            } else {
+              console.log("[Episodic Memory] message_sent: no content in payload, skipping.");
+            }
+            return;
+          }
+
+          // Idempotency guard
+          const primaryMsg = messages[messages.length - 1];
+          const primaryText = extractText(primaryMsg.content).trim();
+          if (primaryText) {
+            const idemKey = buildIdempotencyKey(mapping.sessionKey, primaryMsg.role || "assistant", primaryText);
+            if (!checkAndMarkIdempotency(idemKey)) {
+              console.log(`[Episodic Memory] message_sent: duplicate detected (idemKey=${idemKey.slice(0, 40)}...), skipping.`);
+              return;
+            }
+          }
+
+          console.log(`[Episodic Memory] message_sent: source=bridge_ingress sessionKey=${mapping.sessionKey} agentId=${agentId} messages=${messages.length}`);
+
+          state.segmenter.processIncrementalTurn(messages, agentWs, agentId, "message_sent").catch(err => {
+            console.error("[Episodic Memory] message_sent: incremental ingest error:", err);
+          });
+        });
+      }
+
 
       // ─── before_compaction hook ────────────────────────────────────────────────
       // Fires immediately before OpenClaw's LLM compaction runs.
@@ -867,20 +1070,22 @@ const episodicClawPlugin = {
         const state = getAgentState(agentId);
         state.lastAgentWs = agentWs;
 
-        // ── セグメンテーション（fire-and-forget）──
-        state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
-          console.log("[Episodic Memory] Fallback segmenter error in before_prompt_build:", err);
-        });
-
-        // ── Tool-first gate: if enabled, skip retrieveRelevantContext (A-1) ──
-        // Do NOT call tfGate.evaluate() here — it would mutate turn state and cause
-        // turn drift/noise. The ep-recall tool handles recall via the tool-first gate.
-        if (tfConfig.enabled) {
+        // ── Tool-first gate: if enabled, strict no-op — bridge ingress handles ingest ──
+        // When effectiveToolFirstEnabled=true (runtimeBridgeMode=cli_universal forces ON),
+        // before_dispatch/message_sent are the primary ingest path via processIncrementalTurn.
+        // Calling processTurn here would cause duplicate ingest of the same messages.
+        // Do NOT call tfGate.evaluate() — ep-recall tool handles recall gating.
+        if (effectiveToolFirstEnabled) {
           console.log(`[Episodic Memory] before_prompt_build source=tool_first skip_reason=no_op agentId=${agentId}`);
           return {};
         }
 
         // ── Fallback path (tool-first disabled) — original behavior ──
+        // ── セグメンテーション（fire-and-forget）──
+        state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
+          console.log("[Episodic Memory] Fallback segmenter error in before_prompt_build:", err);
+        });
+
         const ESTIMATED_MAX_EPISODIC_TOKENS = 1024;
         const k = 5;
 
@@ -1063,11 +1268,12 @@ const episodicClawPlugin = {
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
 
-          // ── Tool-first gate: if enabled, skip retrieveRelevantContext (A-1) ──
-          // Do NOT call tfGate.evaluate() here — it would mutate turn state and cause
-          // turn drift/noise. The ep-recall tool handles recall via the tool-first gate.
+          // ── Tool-first gate: if enabled, strict no-op — bridge ingress handles ingest ──
+          // When effectiveToolFirstEnabled=true (runtimeBridgeMode=cli_universal forces ON),
+          // before_dispatch/message_sent are the primary ingest path via processIncrementalTurn.
+          // Calling processTurn here would cause duplicate ingest of the same messages.
           // Only allow anchor injection if available.
-          if (tfConfig.enabled) {
+          if (effectiveToolFirstEnabled) {
             let anchorPrependText = "";
             const anchorState = state.anchorInjection;
             if (anchorState) {
@@ -1081,11 +1287,6 @@ const episodicClawPlugin = {
               }
             }
 
-            // Fire-and-forget segmenter
-            state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
-              console.log("[Episodic Memory] Segmenter error in assemble (tool-first):", err);
-            });
-
             // Return no-op for recall, only anchor text if any
             const systemPromptAddition = anchorPrependText.trim();
             return {
@@ -1096,14 +1297,7 @@ const episodicClawPlugin = {
           }
 
           // ── Fallback path (tool-first disabled) — original behavior ──
-          // before_prompt_build が既にセグメンテーション+メモリ注入を担当しているため、
-          // assemble() では最小限の処理のみ行う（二重注入防止）。
-          // 万一 before_prompt_build がブロックされた場合の保険として、
-          // 簡易的なメモリ注入のみ実行する（トークン予算は ctx.tokenBudget を使用）。
-
-          // セグメンテーションは before_prompt_build で既に実行済みだが、
-          // assemble() が呼ばれる = before_prompt_build がブロックされている可能性もあるため、
-          // 保険として再実行する。
+          // Insurance: re-run segmenter in case before_prompt_build was blocked.
           state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
             console.log("[Episodic Memory] Segmenter error in assemble (fallback):", err);
           });
@@ -1170,6 +1364,12 @@ const episodicClawPlugin = {
       // This is the plugin-only bridge for CLI (A-2 in plan).
       // Uses api.registerMemoryCapability if available, otherwise falls back to
       // enhancing tool descriptions.
+
+      // ── Warning: bridge ingress disabled (legacy_embedded mode) ──
+      if (effectiveBridgeMode === "legacy_embedded") {
+        console.warn("[Episodic Memory] runtimeBridgeMode=legacy_embedded: bridge ingress (before_dispatch/message_sent) is disabled. The agent will rely on legacy embedded path (before_prompt_build/assemble).");
+      }
+
       const TOOL_FIRST_MEMORY_GUIDANCE = `## Episodic Memory Usage (tool-first)
 - Before answering, check if the user's message references past conversations, ongoing tasks, or asks about something you discussed before.
 - If it does: call ep-recall with a focused query built from the key topics. Use k=${tfConfig.k}.
@@ -1178,7 +1378,7 @@ const episodicClawPlugin = {
 - For simple acknowledgments (OK, thanks, etc.): skip ep-recall entirely.
 - Your memory tools are ep-recall (search), ep-save (save), ep-expand (read full), and ep-anchor (session continuity). Always use these before any other memory tool.`;
 
-      if (typeof (api as any).registerMemoryCapability === "function") {
+      if (effectiveToolFirstEnabled && typeof (api as any).registerMemoryCapability === "function") {
         (api as any).registerMemoryCapability({
           promptBuilder: () => TOOL_FIRST_MEMORY_GUIDANCE,
         });
@@ -1217,7 +1417,8 @@ const episodicClawPlugin = {
           // CLI path may not run before_prompt_build/assemble hooks, so we MUST
           // run the gate here. Filter order: novelty -> intent -> fingerprint -> negative cache.
           // If filter says skip, return short no-op and DO NOT call RPC recall.
-          if (tfConfig.enabled) {
+          // When runtimeBridgeMode=cli_universal, tool-first is forced ON.
+          if (effectiveToolFirstEnabled) {
             // Build query using existing Parse/Rewrite logic (NOT raw user message).
             // Use instantDeterministicRewrite with recent user messages when available.
             const ctxMessages = (ctx?.messages || []) as Message[];
