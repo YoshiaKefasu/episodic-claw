@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.4] - 2026-04-11
+
+### Added
+- **OpenRouter Reasoning Control**: New `openrouterConfig.reasoning` schema with `enabled`, `effort`, `maxTokens`, and `exclude` fields for fine-grained control over OpenRouter reasoning/thinking mode during narrative generation.
+- **Reasoning Integration Tests**: Added `test_reasoning.ts` covering enabled/disabled/exclude/maxTokens/effort precedence scenarios.
+
+### Changed
+- **Compat Plugin API Range**: Updated to `>=2026.3.28 <=2026.4.8` reflecting latest OpenClaw version.
+- **Build Versions**: `openclawVersion` and `pluginSdkVersion` aligned to `2026.4.8`.
+
 ## [0.4.3] - 2026-04-10
 
 ### Fixed

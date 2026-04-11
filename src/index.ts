@@ -419,6 +419,12 @@ const PluginConfigSchema = Type.Object(
       model: Type.Optional(Type.String()),
       maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768 })),
       temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      reasoning: Type.Optional(Type.Object({
+        enabled: Type.Optional(Type.Boolean()),
+        effort: Type.Optional(Type.String({ enum: ["none", "minimal", "low", "medium", "high", "xhigh"] })),
+        maxTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+        exclude: Type.Optional(Type.Boolean()),
+      }, { description: "OpenRouter reasoning/thinking control. Default: enabled=true, effort=high." })),
     }, { description: "Nested OpenRouter config. Takes precedence over flat fields." })),
     enableBackgroundWorkers: Type.Optional(Type.Boolean({
       description: "Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery). Default: true. Does not affect narrative generation."
@@ -496,6 +502,7 @@ const episodicClawPlugin = {
               model: cfg.openrouterModel,
               maxTokens: cfg.narrativeMaxTokens,
               temperature: cfg.narrativeTemperature,
+              reasoning: cfg.openrouterReasoning,
             })
           : null;
         const narrativeWorker = openRouterClient

@@ -11,6 +11,12 @@ export interface OpenRouterConfig {
   baseUrl: string;         // default: "https://openrouter.ai/api/v1"
   timeoutMs: number;       // default: 30000
   maxRetries: number;      // default: 3
+  // Reasoning config (normalized from openrouterConfig.reasoning)
+  reasoning?: {
+    effort?: string;
+    maxTokens?: number;
+    exclude?: boolean;
+  };
 }
 
 const DEFAULT_CONFIG: Omit<OpenRouterConfig, "apiKey"> = {
@@ -82,6 +88,23 @@ export class OpenRouterClient {
     };
     if (this.config.maxTokens !== undefined) {
       body.max_tokens = this.config.maxTokens;
+    }
+
+    // Conditionally include reasoning config
+    if (this.config.reasoning) {
+      const reasoning: Record<string, any> = {};
+      if (this.config.reasoning.effort !== undefined) {
+        reasoning.effort = this.config.reasoning.effort;
+      }
+      if (this.config.reasoning.maxTokens !== undefined) {
+        reasoning.max_tokens = this.config.reasoning.maxTokens;
+      }
+      if (this.config.reasoning.exclude === true) {
+        reasoning.exclude = true;
+      }
+      if (Object.keys(reasoning).length > 0) {
+        body.reasoning = reasoning;
+      }
     }
 
     const controller = new AbortController();

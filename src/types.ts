@@ -36,6 +36,15 @@ export interface FileEvent {
   path?: string;
 }
 
+export type OpenRouterReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface OpenRouterReasoningConfig {
+  enabled?: boolean;
+  effort?: OpenRouterReasoningEffort;
+  maxTokens?: number;
+  exclude?: boolean;
+}
+
 export interface EpisodicPluginConfig {
   tombstoneRetentionDays?: number;
   /** Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery).
@@ -119,6 +128,14 @@ export interface EpisodicPluginConfig {
     model?: string;
     maxTokens?: number;
     temperature?: number;
+    reasoning?: OpenRouterReasoningConfig;
+  };
+  /** Normalized reasoning config after applying defaults and validation rules. */
+  openrouterReasoning?: {
+    enabled: boolean;
+    effort?: string;
+    maxTokens?: number;
+    exclude?: boolean;
   };
 }
 

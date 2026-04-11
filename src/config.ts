@@ -1,12 +1,63 @@
 import * as fs from "fs";
 import * as path from "path";
-import { EpisodicPluginConfig, RecallCalibration } from "./types";
+import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
 
 function clampUnitInterval(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+}
+
+/**
+ * Normalize OpenRouter reasoning config from raw user input.
+ *
+ * Rules:
+ *  a. enabled===false => return undefined (do not send reasoning)
+ *  b. if maxTokens and effort both present, prefer maxTokens and drop effort
+ *  c. map maxTokens to normalized maxTokens (reject <=0 or non-integer)
+ *  d. include exclude only when true
+ *  e. invalid maxTokens (<=0 or non-integer) treated as unset
+ */
+export function normalizeOpenRouterReasoning(
+  raw: OpenRouterReasoningConfig | undefined
+): { enabled: boolean; effort?: string; maxTokens?: number; exclude?: boolean } | undefined {
+  if (!raw) return undefined;
+
+  // Rule a: disabled entirely
+  if (raw.enabled === false) return undefined;
+
+  const enabled = true;
+  let effort: string | undefined;
+  let maxTokens: number | undefined;
+  let exclude: boolean | undefined;
+
+  const validEfforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+  if (typeof raw.effort === "string" && validEfforts.has(raw.effort)) {
+    effort = raw.effort;
+  }
+
+  // Rule e: validate maxTokens — must be positive integer
+  if (typeof raw.maxTokens === "number" && Number.isInteger(raw.maxTokens) && raw.maxTokens > 0) {
+    maxTokens = raw.maxTokens;
+  }
+
+  // Rule b: if both maxTokens and effort present, prefer maxTokens and drop effort
+  if (maxTokens !== undefined) {
+    effort = undefined;
+  }
+
+  // Rule c (default): if no valid effort and no valid maxTokens, default effort to "high"
+  if (effort === undefined && maxTokens === undefined) {
+    effort = "high";
+  }
+
+  // Rule d: include exclude only when true
+  if (raw.exclude === true) {
+    exclude = true;
+  }
+
+  return { enabled, effort, maxTokens, exclude };
 }
 
 /**
@@ -52,6 +103,10 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate),
     maxPoolChars: Math.max(1000, rawConfig?.maxPoolChars ?? 15000),
     narrativePreviousEpisodeRef: rawConfig?.narrativePreviousEpisodeRef ?? true,
+    // Reasoning config: default enabled=true, effort=high when unset
+    openrouterReasoning: normalizeOpenRouterReasoning(
+      rawConfig?.openrouterConfig?.reasoning ?? { enabled: true, effort: "high" }
+    ),
   };
 }
 

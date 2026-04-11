@@ -1,8 +1,8 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.3",
-  "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, and crash-safe durability.",
+  "version": "0.4.4",
+  "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
   "author": {
@@ -180,6 +180,34 @@
             "maximum": 1,
             "default": 0.4,
             "description": "Sampling temperature for narrative generation. Default: 0.4 (factual, consistent)."
+          },
+          "reasoning": {
+            "type": "object",
+            "description": "OpenRouter reasoning/thinking control for narrative generation. Default: enabled=true, effort=high (output quality prioritized). Adjust to low/medium/none if latency or token cost is a concern.",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Enable reasoning/thinking mode. Default: true. Set false to disable reasoning entirely."
+              },
+              "effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "default": "high",
+                "description": "Reasoning effort level. Default: high. Higher effort may increase latency and token usage but improve output quality."
+              },
+              "maxTokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional. Max reasoning tokens cap. When set alongside effort, maxTokens takes precedence and effort is dropped."
+              },
+              "exclude": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, sends reasoning.exclude=true to request the model to exclude reasoning output from the response. Default: false."
+              }
+            }
           }
         }
       },
