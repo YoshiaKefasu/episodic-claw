@@ -12,6 +12,26 @@ import { Message, extractText } from "./segmenter";
 import { estimateTokens } from "./utils";
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import * as stopwords from "stopwords-iso";
+import { detectLanguage, initLanguageDetector, type DetectedLanguage } from "./lang-detect";
+import { tokenizeCjk } from "./cjk-tokenizer";
+
+// ─── TS-side recall result cache ────────────────────────────────────────────
+// Caches the last recall outcome by queryHash for RECALL_CACHE_TTL_MS.
+// Prevents redundant Embedding API round-trips within a single conversation turn.
+type RecallResultCache = {
+  queryHash: string;
+  agentWs: string;
+  result: RecallInjectionOutcome;
+  cachedAt: number;
+};
+
+const RECALL_CACHE_TTL_MS = 60_000; // 1 minute
+const _recallResultCacheMap = new Map<string, RecallResultCache>();
+
+/** Invalidate the TS-side recall cache for a specific workspace. */
+export function invalidateTsRecallCache(agentWs: string): void {
+  _recallResultCacheMap.delete(agentWs);
+}
 
 // ─── Attachment noise patterns (channel-agnostic) ────────────────────────────
 // These patterns cover attachment markers used by OpenClaw across all channels:
@@ -53,6 +73,9 @@ const MEDIA_ONLY_SENTINEL = /^\s*(?:\[media attached[^\]]*\]|<media:[^>]+>(?:\s*
 /**
  * Check if a message is attachment-dominant (no meaningful user-authored text).
  * Channel-agnostic: covers Telegram, LINE, Discord, and gateway auto-reply patterns.
+ *
+ * @deprecated Use {@link classifyAndStripAttachment} instead — it combines
+ * dominance check and noise stripping in a single pass for better performance.
  */
 export function isAttachmentDominant(text: string): boolean {
   // Check for media-only sentinel pattern
@@ -98,6 +121,9 @@ export function isAttachmentDominant(text: string): boolean {
 /**
  * Strip attachment noise from message text, preserving caption/user-authored text.
  * Channel-agnostic: handles all OpenClaw attachment marker formats.
+ *
+ * @deprecated Use {@link classifyAndStripAttachment} instead — it combines
+ * dominance check and noise stripping in a single pass for better performance.
  */
 export function stripAttachmentNoise(text: string): string {
   let cleaned = text;
@@ -107,6 +133,51 @@ export function stripAttachmentNoise(text: string): string {
   // Clean up leftover whitespace
   cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
   return cleaned;
+}
+
+/**
+ * Classify and strip attachment noise in a single pass.
+ * Combines isAttachmentDominant + stripAttachmentNoise to halve regex iterations.
+ * Returns { isDominant, cleanedText }.
+ */
+export function classifyAndStripAttachment(text: string): {
+  isDominant: boolean;
+  cleanedText: string;
+} {
+  // Sentinel check first (cheap)
+  if (MEDIA_ONLY_SENTINEL.test(text.trim())) {
+    return { isDominant: true, cleanedText: "" };
+  }
+
+  let cleaned = text;
+  let markerCount = 0;
+
+  for (const pattern of ATTACHMENT_BOILERPLATE) {
+    const matches = cleaned.match(pattern);
+    if (matches) markerCount += matches.length;
+    cleaned = cleaned.replace(pattern, "");
+  }
+
+  // Clean up leftover whitespace
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+
+  // Dominance check on cleaned text
+  const cjkChars = (cleaned.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
+
+  // Count attachment indicator tokens in original text
+  let indicatorCount = 0;
+  for (const pattern of ATTACHMENT_INDICATORS) {
+    const matches = text.match(pattern);
+    if (matches) indicatorCount += matches.length;
+  }
+  const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
+
+  const isDominant =
+    cleaned.length < 2 ||
+    (cjkChars === 0 && cleaned.length < 5) ||
+    (indicatorCount > 0 && wordCount <= indicatorCount);
+
+  return { isDominant, cleanedText: cleaned };
 }
 
 /**
@@ -122,6 +193,23 @@ export function detectDominantScript(text: string): "cjk" | "latin" {
   const cjkRatio = cjkChars / chars.length;
 
   return cjkRatio >= 0.3 ? "cjk" : "latin";
+}
+
+/**
+ * Split mixed-script text into CJK and Latin segments for separate processing.
+ * CJK segments are joined with spaces for morphological analysis.
+ * Latin segments are extracted as 3+ char tokens.
+ */
+export function splitByScript(text: string): { cjk: string; latin: string } {
+  const cjkChars = text.match(
+    /[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]+/gu
+  ) || [];
+  const latinTokens = text.match(/\b[A-Za-z]{3,}\b/g) || [];
+
+  return {
+    cjk: cjkChars.join(" "),
+    latin: latinTokens.join(" "),
+  };
 }
 
 // ─── Module-scope stopword cache (initialized once for performance) ──────────
@@ -151,7 +239,7 @@ function getStopwords(config?: EpisodicPluginConfig): Set<string> {
   return stopwordsSet;
 }
 
-export function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): string {
+export async function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): Promise<string> {
   // Phase 0: Filter out attachment-dominant messages and strip attachment noise
   const eligibleTexts: string[] = [];
   let skippedCount = 0;
@@ -160,16 +248,15 @@ export function instantDeterministicRewrite(messages: Message[], config?: Episod
     const rawText = extractText(m.content);
     const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
 
-    if (isAttachmentDominant(text)) {
-      // Try to salvage caption text
-      const caption = stripAttachmentNoise(text);
-      if (caption.length >= 3) {
-        eligibleTexts.push(caption);
+    const { isDominant, cleanedText } = classifyAndStripAttachment(text);
+    if (isDominant) {
+      if (cleanedText.length >= 3) {
+        eligibleTexts.push(cleanedText);
       } else {
         skippedCount += 1;
       }
     } else {
-      eligibleTexts.push(text);
+      eligibleTexts.push(cleanedText);
     }
   }
 
@@ -185,38 +272,51 @@ export function instantDeterministicRewrite(messages: Message[], config?: Episod
     .filter(Boolean)
     .join("\n");
 
-  // Phase 2+3: Polyglot keyword extraction + assembly
-  const keywords = extractPolyglotKeywords(cleaned, config);
+  // Phase 2+3: Polyglot keyword extraction + assembly (async for kuromojin)
+  const keywords = await extractPolyglotKeywords(cleaned, config);
   return keywords.length > 0 ? keywords.join(" ") : cleaned;
 }
 
-export function extractPolyglotKeywords(text: string, config?: EpisodicPluginConfig): string[] {
+/**
+ * Extract polyglot keywords using language detection + morphological analysis.
+ * Phase 1: Japanese uses kuromojin; ZH/KO fall back to regex; Latin uses regex + stopwords.
+ * Mixed-text handling: CJK and Latin segments are processed separately and interleaved.
+ */
+export async function extractPolyglotKeywords(text: string, config?: EpisodicPluginConfig): Promise<string[]> {
   const stopwordsSet = getStopwords(config);
 
-  // Detect dominant script to determine extraction priority
-  const dominantScript = detectDominantScript(text);
+  // Split text by script for mixed-text handling
+  const { cjk: cjkText, latin: latinText } = splitByScript(text);
+
+  // Detect language of the CJK segment for routing
+  const lang = cjkText ? detectLanguage(cjkText) : "unknown";
+
+  // Extract CJK keywords via language-appropriate tokenizer
+  let cjkKeywords: string[] = [];
+  if (cjkText) {
+    const result = await tokenizeCjk(cjkText, lang);
+    cjkKeywords = result.keywords;
+  }
 
   // Extract Latin keywords (3+ chars, non-stopwords)
   const latinKeywords: string[] = [];
-  const enMatches = text.match(/\b[A-Za-z]{3,}\b/g) || [];
-  enMatches.forEach(w => {
-    if (!stopwordsSet.has(w.toLowerCase())) latinKeywords.push(w);
-  });
+  if (latinText) {
+    const enMatches = latinText.match(/\b[A-Za-z]{3,}\b/g) || [];
+    enMatches.forEach(w => {
+      if (!stopwordsSet.has(w.toLowerCase())) latinKeywords.push(w);
+    });
+  }
 
-  // Extract CJK keywords (Han/Katakana/Hangul, 2+ chars, non-stopwords)
-  const cjkKeywords: string[] = [];
-  const cjkMatches = text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]{2,}/gu) || [];
-  cjkMatches.forEach(w => {
-    if (!stopwordsSet.has(w)) cjkKeywords.push(w);
-  });
+  // Filter CJK keywords through stopwords (for regex fallback and any single-char noise)
+  const filteredCjkKeywords = cjkKeywords.filter(w => !stopwordsSet.has(w));
 
   // Script-aware interleaving:
   // - CJK-dominant text: prioritize CJK (8 CJK + 4 Latin)
   // - Latin-dominant text: prioritize Latin (8 Latin + 4 CJK)
   // This prevents one script from filling all 12 slots
-  const cjkFirst = dominantScript === "cjk";
-  const primaryPool = cjkFirst ? cjkKeywords : latinKeywords;
-  const secondaryPool = cjkFirst ? latinKeywords : cjkKeywords;
+  const cjkFirst = lang === "ja" || lang === "zh" || lang === "ko" || (cjkText && latinKeywords.length === 0);
+  const primaryPool = cjkFirst ? filteredCjkKeywords : latinKeywords;
+  const secondaryPool = cjkFirst ? latinKeywords : filteredCjkKeywords;
   const primaryCount = 8;
   const secondaryCount = 4;
 
@@ -241,7 +341,7 @@ export type RecallDiagnostics = {
 export type RecallInjectionOutcome = {
   text: string;
   episodeIds: string[];
-  reason: "injected" | "no_messages" | "max_tokens_zero" | "empty_query" | "recall_empty" | "recall_failed" | "degraded_low_confidence";
+  reason: "injected" | "no_messages" | "max_tokens_zero" | "empty_query" | "insufficient_keywords" | "recall_empty" | "recall_failed" | "degraded_low_confidence";
   queryHash: string;
   injectedEpisodeCount: number;
   truncatedEpisodeCount: number;
@@ -390,9 +490,9 @@ export class EpisodicRetriever {
     for (const m of recentMessages) {
       const rawText = extractText(m.content);
       const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
-      if (isAttachmentDominant(text)) {
-        const caption = stripAttachmentNoise(text);
-        if (caption.length >= 3) {
+      const { isDominant, cleanedText } = classifyAndStripAttachment(text);
+      if (isDominant) {
+        if (cleanedText.length >= 3) {
           eligibleCount += 1;
         } else {
           skippedCount += 1;
@@ -402,14 +502,33 @@ export class EpisodicRetriever {
       }
     }
 
-    const query = instantDeterministicRewrite(recentMessages, this.config);
+    const query = await instantDeterministicRewrite(recentMessages, this.config);
     const dominantScript = query ? detectDominantScript(query) : "none";
 
     if (!query) {
       return { text: "", episodeIds: [], reason: "empty_query", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics(),
         recallQueryDebug: { recentMessageCount, eligibleRecentMessages: eligibleCount, skippedImageLikeMessages: skippedCount, dominantScript: "none", finalQuery: "" } };
     }
+
+    // Skip recall when query has too few keywords — insufficient signal for meaningful retrieval
+    const queryKeywords = query.split(/\s+/).filter(Boolean);
+    if (queryKeywords.length <= 2) {
+      return { text: "", episodeIds: [], reason: "insufficient_keywords", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics(),
+        recallQueryDebug: { recentMessageCount, eligibleRecentMessages: eligibleCount, skippedImageLikeMessages: skippedCount, dominantScript, finalQuery: query } };
+    }
     const queryHash = createHash("sha1").update(query).digest("hex");
+
+    // ─── TS-side cache hit check ────────────────────────────────────────────────
+    const cachedEntry = _recallResultCacheMap.get(agentWs);
+    if (
+      cachedEntry &&
+      cachedEntry.queryHash === queryHash &&
+      Date.now() - cachedEntry.cachedAt < RECALL_CACHE_TTL_MS
+    ) {
+      console.log(`[Episodic Recall] TS-cache hit for hash=${queryHash.substring(0, 8)}, skipping RPC.`);
+      return cachedEntry.result;
+    }
+
     const calibration = this.config ? buildRecallCalibration(this.config) : undefined;
     const minAutoInjectScore = autoInjectGuardMinScore(this.config);
 
@@ -523,22 +642,20 @@ export class EpisodicRetriever {
 
       for (const [ws, injectedIds] of injectedIdsByWs.entries()) {
         if (injectedIds.length === 0) continue;
-        try {
-          await this.rpcClient.recallFeedback({
-            agentWs: ws,
-            feedbackId: randomUUID(),
-            queryHash,
-            shown: injectedIds,
-            used: [],
-            expanded: [],
-            source: "assemble",
-          });
-        } catch (feedbackErr) {
+        this.rpcClient.recallFeedback({
+          agentWs: ws,
+          feedbackId: randomUUID(),
+          queryHash,
+          shown: injectedIds,
+          used: [],
+          expanded: [],
+          source: "assemble",
+        }).catch(feedbackErr => {
           console.warn("[Episodic Memory] recall feedback failed:", feedbackErr);
-        }
+        });
       }
 
-      return {
+      const outcome: RecallInjectionOutcome = {
         text: assembled,
         episodeIds: injectedEpisodeIds,
         reason: "injected",
@@ -549,6 +666,9 @@ export class EpisodicRetriever {
         diagnostics,
         recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
       };
+      // Cache the successful outcome
+      _recallResultCacheMap.set(agentWs, { queryHash, agentWs, result: outcome, cachedAt: Date.now() });
+      return outcome;
 
     } catch (err) {
       console.error("[Episodic Memory] Retrieval failed:", err);

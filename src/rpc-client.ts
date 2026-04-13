@@ -485,18 +485,7 @@ export class EpisodicCoreClient {
         resolve: (val) => { clearTimeout(timer); resolve(val); },
         reject: (err) => { clearTimeout(timer); reject(err); }
       });
-      try {
-        const traceLog = "/root/.openclaw/ep-save-trace.log";
-        require("fs").appendFileSync(traceLog, `[rpc-client TRACE 2] request method=${method}. params object keys: ${Object.keys(params).join(",")}, summary present: ${'summary' in params}\n`);
-      } catch(e) {}
-      
       const reqStr = JSON.stringify({ jsonrpc: "2.0", method, params, id }) + "\n";
-      
-      try {
-        const traceLog = "/root/.openclaw/ep-save-trace.log";
-        require("fs").appendFileSync(traceLog, `[rpc-client TRACE 3] Final reqStr: ${reqStr.trim()}\n`);
-      } catch(e) {}
-      
       this.socket!.write(reqStr);
     });
   }
@@ -573,13 +562,6 @@ export class EpisodicCoreClient {
     savedBy?: string;
     surprise?: number;
   }): Promise<{ path: string, slug: string }> {
-    try {
-      const traceLog = require("path").join(require("os").tmpdir(), "ep-save-trace.log");
-      require("fs").appendFileSync(
-        traceLog,
-        `\n[rpc-client TRACE 1] generateEpisodeSlug called. summary type=${typeof params.summary}, length=${params.summary?.length}, topics=${(params.topics ?? []).length}\n`
-      );
-    } catch(e) {}
     return this.request<{ path: string, slug: string }>("ai.ingest", {
       summary: params.summary,
       topics: params.topics ?? [],

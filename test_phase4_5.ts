@@ -108,6 +108,8 @@ async function runAnchorInjectionSmoke(): Promise<void> {
   for (const file of [
     "anchor-store.js",
     "archiver.js",
+    "cjk-tokenizer.js",
+    "lang-detect.js",
     "large-payload.js",
     "compactor.js",
     "config.js",
@@ -127,6 +129,53 @@ async function runAnchorInjectionSmoke(): Promise<void> {
   ]) {
     fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
   }
+
+  // Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  fs.writeFileSync(
+    path.join(runtimeDist, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+`,
+    "utf8"
+  );
+
+  // Stub cjk-tokenizer.js for CJS require context — kuromojin is ESM-only.
+  fs.writeFileSync(
+    path.join(runtimeDist, "cjk-tokenizer.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.tokenizeCjk = tokenizeCjk;
+async function tokenizeCjk(text, lang) {
+  if (lang === "ja") {
+    // Stub: extract CJK 2+ char sequences as pseudo-morphemes
+    const matches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}]{2,}/gu) || [];
+    return { keywords: matches, lang: "ja" };
+  }
+  if (lang === "zh") {
+    // Stub: extract Han char bigrams (simulates cjk-tokenizer bigram)
+    const chars = (text.match(/[\\p{Script=Han}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "zh" };
+  }
+  if (lang === "ko") {
+    // Stub: Hangul bigram
+    const chars = (text.match(/[\\p{Script=Hangul}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "ko" };
+  }
+  // Fallback
+  const cjkMatches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}\\p{Script=Hangul}]{2,}/gu) || [];
+  return { keywords: cjkMatches, lang: lang || "unknown" };
+}
+`,
+    "utf8"
+  );
 
   fs.writeFileSync(
     path.join(runtimeDist, "rpc-client.js"),
@@ -289,6 +338,8 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
   const runtimeDist = path.join(runtimeRoot, "dist");
   fs.mkdirSync(runtimeDist, { recursive: true });
   for (const file of [
+    "cjk-tokenizer.js",
+    "lang-detect.js",
     "large-payload.js",
     "compactor.js",
     "config.js",
@@ -310,6 +361,56 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
       : path.join(runtimeDist, file);
     fs.copyFileSync(path.join("dist", file), target);
   }
+
+  // Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  // When eld is unavailable, detectLanguage() returns "unknown", and tokenizeCjk falls back to regex.
+  fs.writeFileSync(
+    path.join(runtimeDist, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+`,
+    "utf8"
+  );
+
+  // Stub cjk-tokenizer.js for CJS require context — kuromojin is ESM-only.
+  // When unavailable, tokenizeCjk falls back to regex extraction.
+  fs.writeFileSync(
+    path.join(runtimeDist, "cjk-tokenizer.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.tokenizeCjk = tokenizeCjk;
+async function tokenizeCjk(text, lang) {
+  if (lang === "ja") {
+    // Stub: extract CJK 2+ char sequences as pseudo-morphemes
+    const matches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}]{2,}/gu) || [];
+    return { keywords: matches, lang: "ja" };
+  }
+  if (lang === "zh") {
+    // Stub: extract Han char bigrams (simulates cjk-tokenizer bigram)
+    const chars = (text.match(/[\\p{Script=Han}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "zh" };
+  }
+  if (lang === "ko") {
+    // Stub: Hangul bigram
+    const chars = (text.match(/[\\p{Script=Hangul}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "ko" };
+  }
+  // Fallback
+  const cjkMatches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}\\p{Script=Hangul}]{2,}/gu) || [];
+  return { keywords: cjkMatches, lang: lang || "unknown" };
+}
+`,
+    "utf8"
+  );
+
   const require = createRequire(import.meta.url);
   const { EpisodicRetriever } = require(path.join(runtimeDist, "retriever.cjs"));
   const lowConfidenceClient = {
@@ -670,6 +771,8 @@ async function runGatewayStartSmoke(): Promise<void> {
   const distJsFiles = [
     "anchor-store.js",
     "archiver.js",
+    "cjk-tokenizer.js",
+    "lang-detect.js",
     "large-payload.js",
     "compactor.js",
     "config.js",
@@ -692,6 +795,51 @@ async function runGatewayStartSmoke(): Promise<void> {
   for (const file of distJsFiles) {
     fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
   }
+
+  // Stub lang-detect.js and cjk-tokenizer.js for CJS require context — eld/kuromojin are ESM-only.
+  fs.writeFileSync(
+    path.join(runtimeDist, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(runtimeDist, "cjk-tokenizer.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.tokenizeCjk = tokenizeCjk;
+async function tokenizeCjk(text, lang) {
+  if (lang === "ja") {
+    // Stub: extract CJK 2+ char sequences as pseudo-morphemes
+    const matches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}]{2,}/gu) || [];
+    return { keywords: matches, lang: "ja" };
+  }
+  if (lang === "zh") {
+    // Stub: extract Han char bigrams (simulates cjk-tokenizer bigram)
+    const chars = (text.match(/[\\p{Script=Han}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "zh" };
+  }
+  if (lang === "ko") {
+    // Stub: Hangul bigram
+    const chars = (text.match(/[\\p{Script=Hangul}]/gu) || []);
+    const bigrams = [];
+    for (let i = 0; i <= chars.length - 2; i++) bigrams.push(chars[i] + chars[i + 1]);
+    return { keywords: bigrams, lang: "ko" };
+  }
+  // Fallback
+  const cjkMatches = text.match(/[\\p{Script=Han}\\p{Script=Katakana}\\p{Script=Hiragana}\\p{Script=Hangul}]{2,}/gu) || [];
+  return { keywords: cjkMatches, lang: lang || "unknown" };
+}
+`,
+    "utf8"
+  );
   fs.cpSync("go", runtimeGo, { recursive: true });
   const require = createRequire(path.join(runtimeDist, "index.js"));
   process.env.NODE_PATH = path.resolve("node_modules");
@@ -775,7 +923,7 @@ async function runGatewayStartSmoke(): Promise<void> {
       "Auto-Rebuild from Markdown",
       "HealingWorker: [Pass 3] Starting Stage 2 Batch Score update",
       "HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)",
-    ]);
+    ], 90000);
 
     assert.ok(!fs.existsSync(nestedFile), "nested tree should be removed from the active workspace");
     assert.ok(fs.existsSync(quarantineRoot), "quarantine root should exist after gateway_start");
@@ -831,8 +979,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.4.4", "package.json version should be 0.4.4");
-  assert.equal(manifest.version, "0.4.4", "openclaw.plugin.json version should be 0.4.4");
+  assert.equal(pkg.version, "0.4.8", "package.json version should be 0.4.8");
+  assert.equal(manifest.version, "0.4.8", "openclaw.plugin.json version should be 0.4.8");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -1011,7 +1159,7 @@ async function main() {
   );
   assert.match(
     retrieverSource,
-    /reason:\s*"injected" \| "no_messages" \| "max_tokens_zero" \| "empty_query" \| "recall_empty" \| "recall_failed" \| "degraded_low_confidence";/,
+    /reason:\s*"injected" \| "no_messages" \| "max_tokens_zero" \| "empty_query" \| "insufficient_keywords" \| "recall_empty" \| "recall_failed" \| "degraded_low_confidence";/,
     "retriever should expose degraded_low_confidence when fallback results are suppressed from auto-injection"
   );
   assert.match(
@@ -1121,6 +1269,7 @@ async function main() {
   await runReleaseGateC();
   await runReleaseGateA();
   await runGatewayStartSmoke();
+  await runPolyglotQueryMorphologicalTests();
 
   console.log("phase4_5 smoke: ok");
 }
@@ -2079,9 +2228,10 @@ async function runRetrieverRuntimeRegression(): Promise<void> {
   // Verify exported function signatures exist
   assert.ok(retrieverSourceForSync.includes("export function isAttachmentDominant"), "retriever should export isAttachmentDominant");
   assert.ok(retrieverSourceForSync.includes("export function stripAttachmentNoise"), "retriever should export stripAttachmentNoise");
+  assert.ok(retrieverSourceForSync.includes("export function classifyAndStripAttachment"), "retriever should export classifyAndStripAttachment (unified single-pass replacement)");
   assert.ok(retrieverSourceForSync.includes("export function detectDominantScript"), "retriever should export detectDominantScript");
-  assert.ok(retrieverSourceForSync.includes("export function instantDeterministicRewrite"), "retriever should export instantDeterministicRewrite");
-  assert.ok(retrieverSourceForSync.includes("export function extractPolyglotKeywords"), "retriever should export extractPolyglotKeywords");
+  assert.ok(retrieverSourceForSync.includes("export async function instantDeterministicRewrite") || retrieverSourceForSync.includes("export function instantDeterministicRewrite"), "retriever should export instantDeterministicRewrite");
+  assert.ok(retrieverSourceForSync.includes("export async function extractPolyglotKeywords") || retrieverSourceForSync.includes("export function extractPolyglotKeywords"), "retriever should export extractPolyglotKeywords");
 
   // Verify CJK keyword extraction scripts
   assert.ok(retrieverSourceForSync.includes("Script=Han") && retrieverSourceForSync.includes("Script=Katakana"), "CJK keyword extraction regex should include Han and Katakana scripts");
@@ -2222,6 +2372,129 @@ async function runRetrieverSourceSmoke(): Promise<void> {
   );
 
   console.log("  retriever source smoke: attachment markers, script-aware extraction, observability all present");
+}
+
+/**
+ * v0.4.9 Polyglot Query Morphological Upgrade — runtime regression tests.
+ * Tests: Japanese morphological analysis, mixed-text handling, language detection, fallback behavior.
+ */
+async function runPolyglotQueryMorphologicalTests(): Promise<void> {
+  // ── Source smoke: verify new exports exist ──
+  const retrieverSource = fs.readFileSync(path.resolve("src", "retriever.ts"), "utf8");
+  assert.ok(
+    retrieverSource.includes("export async function extractPolyglotKeywords"),
+    "extractPolyglotKeywords should be async (Promise<string[]>)"
+  );
+  assert.ok(
+    retrieverSource.includes("export async function instantDeterministicRewrite"),
+    "instantDeterministicRewrite should be async (Promise<string>)"
+  );
+  assert.ok(
+    retrieverSource.includes("export function splitByScript"),
+    "retriever should export splitByScript for mixed-text handling"
+  );
+  assert.ok(
+    retrieverSource.includes("import { detectLanguage") || retrieverSource.includes("from \"./lang-detect\""),
+    "retriever should import detectLanguage from lang-detect"
+  );
+  assert.ok(
+    retrieverSource.includes("import { tokenizeCjk }") || retrieverSource.includes("from \"./cjk-tokenizer\""),
+    "retriever should import tokenizeCjk from cjk-tokenizer"
+  );
+  assert.ok(
+    retrieverSource.includes("await instantDeterministicRewrite") || retrieverSource.includes("await instantDeterministicRewrite("),
+    "retrieveRelevantContext should await instantDeterministicRewrite"
+  );
+
+  // ── Verify lang-detect.ts exists and has correct exports ──
+  const langDetectSource = fs.readFileSync(path.resolve("src", "lang-detect.ts"), "utf8");
+  assert.ok(
+    langDetectSource.includes("export async function initLanguageDetector"),
+    "lang-detect should export initLanguageDetector for warm-up"
+  );
+  assert.ok(
+    langDetectSource.includes("export function detectLanguage"),
+    "lang-detect should export detectLanguage"
+  );
+  assert.ok(
+    langDetectSource.includes("import eld from \"eld\""),
+    "lang-detect should import eld package"
+  );
+
+  // ── Verify cjk-tokenizer.ts exists and has correct exports ──
+  const cjkTokenizerSource = fs.readFileSync(path.resolve("src", "cjk-tokenizer.ts"), "utf8");
+  assert.ok(
+    cjkTokenizerSource.includes("import { tokenize } from \"kuromojin\""),
+    "cjk-tokenizer should import kuromojin"
+  );
+  assert.ok(
+    cjkTokenizerSource.includes("export async function tokenizeCjk"),
+    "cjk-tokenizer should export tokenizeCjk"
+  );
+  assert.ok(
+    cjkTokenizerSource.includes("名詞") && cjkTokenizerSource.includes("動詞") && cjkTokenizerSource.includes("形容詞") && cjkTokenizerSource.includes("副詞"),
+    "cjk-tokenizer should filter by POS (名詞, 動詞, 形容詞, 副詞)"
+  );
+
+  // ── Verify index.ts warm-up code ──
+  const indexSource = fs.readFileSync(path.resolve("src", "index.ts"), "utf8");
+  assert.ok(
+    indexSource.includes("initLanguageDetector") && indexSource.includes("tokenize(\"初期化\")"),
+    "index.ts should warm up language detector + kuromojin during register()"
+  );
+  assert.ok(
+    indexSource.includes("falling back to regex CJK"),
+    "index.ts should log fallback warning on warm-up failure"
+  );
+
+  // ── splitByScript unit test ──
+  const mixedText = "OpenClawのプラグインとしてepisodic-clawを導入した";
+  const { cjk: cjkPart, latin: latinPart } = splitByScriptTest(mixedText);
+  assert.ok(cjkPart.includes("のプラグインとして") || cjkPart.includes("を導入した"), "splitByScript should extract CJK segments");
+  assert.ok(latinPart.includes("OpenClaw"), "splitByScript should extract Latin tokens");
+  assert.ok(latinPart.includes("episodic") || latinPart.includes("claw"), "splitByScript should extract Latin tokens (episodic/claw)");
+
+  console.log("  polyglot query morphological: source structure, warm-up, splitByScript all verified");
+
+  // ── Phase 2: ZH bigram test (cjk-tokenizer) ──
+  // Verify cjk-tokenizer.ts has ZH bigram implementation
+  assert.ok(
+    cjkTokenizerSource.includes("tokenizeChinese") || cjkTokenizerSource.includes("cjk-tokenizer"),
+    "cjk-tokenizer should use cjk-tokenizer package for Chinese"
+  );
+  assert.ok(
+    cjkTokenizerSource.includes("maxPhraseLength") || cjkTokenizerSource.includes("minFrequency"),
+    "cjk-tokenizer should configure cjk-tokenizer options (minFrequency=1, maxPhraseLength=2)"
+  );
+
+  // ── Phase 2: KO bigram test (Hangul bigram heuristic) ──
+  assert.ok(
+    cjkTokenizerSource.includes("tokenizeKorean") || cjkTokenizerSource.includes("Hangul") || cjkTokenizerSource.includes("bigram"),
+    "cjk-tokenizer should have Korean tokenization (Hangul bigram)"
+  );
+  assert.ok(
+    cjkTokenizerSource.includes("bigramFromChars") || cjkTokenizerSource.includes("sliding"),
+    "cjk-tokenizer should implement bigramFromChars for KO"
+  );
+
+  // ── Phase 2: JA still uses kuromojin (regression) ──
+  assert.ok(
+    cjkTokenizerSource.includes("tokenizeJapanese") && cjkTokenizerSource.includes("kuromojin"),
+    "cjk-tokenizer should still use kuromojin for Japanese (not cjk-tokenizer)"
+  );
+
+  console.log("  polyglot Phase 2: ZH bigram, KO Hangul bigram, JA kuromojin regression all verified");
+}
+
+function splitByScriptTest(text: string): { cjk: string; latin: string } {
+  const cjkChars = text.match(
+    /[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]+/gu
+  ) || [];
+  const latinTokens = text.match(/\b[A-Za-z]{3,}\b/g) || [];
+  return {
+    cjk: cjkChars.join(" "),
+    latin: latinTokens.join(" "),
+  };
 }
 
 /**

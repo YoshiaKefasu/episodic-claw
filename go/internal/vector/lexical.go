@@ -11,7 +11,7 @@ import (
 	"episodic-core/internal/logger"
 
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
+	"github.com/blevesearch/bleve/v2/analysis/lang/cjk"
 	"github.com/cockroachdb/pebble"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -33,9 +33,9 @@ func openLexicalIndex(dbDir string) (bleve.Index, error) {
 
 	// Create a text field mapping
 	textFieldMapping := bleve.NewTextFieldMapping()
-	// Currently using standard analyzer due to CJK needing special dependencies.
-	// Standard breaks unicode reasonably well, bigram analyzer can be built later if strictly required.
-	textFieldMapping.Analyzer = standard.Name
+	// CJK analyzer unigram-tokenizes CJK scripts (Han, Hiragana, Katakana, Hangul)
+	// and uses whitespace tokenization for Latin scripts.
+	textFieldMapping.Analyzer = cjk.AnalyzerName
 
 	docMapping.AddFieldMappingsAt("Content", textFieldMapping)
 	mapping.DefaultMapping = docMapping

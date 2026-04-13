@@ -26,7 +26,7 @@
     "build:go": "npm-run-all build:go:linux build:go:win",
     "postinstall": "node scripts/postinstall.cjs",
     "test": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase4_5.ts && npx tsx test_reasoning.ts",
-    "test:reasoning": "npx tsx test_reasoning.ts && npx tsx test_tool_first.ts",
+    "test:reasoning": "npx tsx test_reasoning.ts",
     "test:old": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase3.ts",
     "prepublishOnly": "npm run build"
   },
@@ -50,6 +50,9 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.48",
+    "cjk-tokenizer": "^0.1.0",
+    "eld": "^2.0.3",
+    "kuromojin": "^3.0.1",
     "stopwords-iso": "^1.1.0",
     "uuid": "^9.0.1"
   },
@@ -58,7 +61,7 @@
     "@types/uuid": "^9.0.8",
     "cross-env": "^10.1.0",
     "npm-run-all": "^4.1.5",
-    "typescript": "^5.4.5",
-    "tsx": "^4.19.2"
+    "tsx": "^4.19.2",
+    "typescript": "^5.4.5"
   }
 }
