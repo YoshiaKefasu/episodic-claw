@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.10] - 2026-04-15
+
+### Fixed
+- **Media Query Leak Fix**: Fixed an issue where Gateway auto-reply boilerplate (e.g., `send image prefer message`) and system metadata (`System:`, `Conversation info`, `Sender`) from multiple image attachments were leaking into the recall query.
+- **Attachment Extraction Accuracy**: Replaced `isAttachmentDominant` and `stripAttachmentNoise`'s multi-pass regex iterations with a single-pass `classifyAndStripAttachment` function.
+- **Tail-priority Extraction (KISS Simplification)**: Instead of a complex structural parser, attachment text extraction now uses a simple and robust boundary split based on `Keep caption in the text body.` This accurately isolates user-authored captions while completely ignoring multiline headers, fenced JSON blocks, and untrusted metadata.
+- **`[media attached]` Pattern Enhancement**: The regex now handles pipe-continued 2nd-line file paths, effectively preventing stray file paths from entering the recall query.
+- **Fallback Compatibility**: Added support for stripping bare `media:image` and `media:document` markers (Gateway WebUI formatting) and `<media:image>` without compromising backwards compatibility.
+
+### Changed
+- **`isAttachmentDominant()` / `stripAttachmentNoise()`**: Converted to simple delegators that call `classifyAndStripAttachment()` internally. This eliminates hardcoded `.replace()` chains and restores DRY compliance.
+- **Dynamic Sentinel Construction**: `MEDIA_ONLY_SENTINEL` is now dynamically constructed from an array (`MEDIA_ONLY_SENTINEL_PARTS`) to ensure patterns are easily readable, maintainable, and visually synchronized with `ATTACHMENT_BOILERPLATE`.
+
 ## [0.4.9] - 2026-04-14
 
 ### Added
