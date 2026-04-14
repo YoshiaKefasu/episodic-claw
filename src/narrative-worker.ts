@@ -9,6 +9,7 @@ import { OpenRouterClient } from "./openrouter-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 import { buildFallbackSummary } from "./summary-escalation";
+import { stripReasoningTagsFromText } from "./reasoning-tags";
 import type { Message } from "./segmenter";
 import type { CacheQueueItem } from "./narrative-queue";
 
@@ -31,9 +32,43 @@ const RETRY_BASE_DELAY_MS = 1000;
 const MAX_CACHE_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 1000;
 const LEASE_SECONDS = 120;
+const MIN_NARRATIVE_TOKENS = 10;
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 type CacheItem = CacheQueueItem;
+
+/**
+ * Sanitize OpenRouter LLM output to remove OpenClaw agent response format tags
+ * and other non-narrative artifacts that leak through when the model echoes
+ * conversation content instead of producing a clean summary.
+ *
+ * Applied post-LLM, pre-save. Strips:
+ * - Reasoning/final/thinking tags via stripReasoningTagsFromText (handles <final>, <thinking>, <antthinking> etc.)
+ * - [analysis], [[reply_to_current]], [reply_to_current] OpenClaw response format tags
+ * - [output] / [/output] bracket tags (line-start only)
+ * - Excessive whitespace from tag removal
+ */
+export function sanitizeNarrativeOutput(text: string): string {
+  // Step 1: Strip <final>, </final>, <thinking>, </thinking> etc.
+  let cleaned = stripReasoningTagsFromText(text, { mode: "strict", trim: "both" });
+
+  // Step 2: Strip OpenClaw agent response format tags
+  cleaned = cleaned
+    .replace(/\[\[reply_to_current\]\]/g, "")
+    .replace(/\[reply_to_current\]/g, "")
+    .replace(/^\s*\[analysis\]\s*/gim, "")
+    .replace(/^\s*\[\/analysis\]\s*/gim, "")
+    .replace(/^\s*\[output\]\s*/gim, "")
+    .replace(/^\s*\[\/output\]\s*/gim, "");
+
+  // Step 3: Clean up residual whitespace from tag removal
+  cleaned = cleaned
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+
+  return cleaned;
+}
 
 export class NarrativeWorker {
   private isProcessing = false;
@@ -189,10 +224,21 @@ export class NarrativeWorker {
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        const text = await this.client.chatCompletion({ systemPrompt, userMessage });
+        const rawText = await this.client.chatCompletion({ systemPrompt, userMessage });
+        const text = sanitizeNarrativeOutput(rawText);
+
+        // Quality gate: skip empty or trivially short outputs
+        const tokens = estimateTokens(text);
+        if (tokens < MIN_NARRATIVE_TOKENS) {
+          console.warn(
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output too short (${tokens} tokens < ${MIN_NARRATIVE_TOKENS}). Retrying...`
+          );
+          continue;
+        }
+
         return {
           text,
-          tokens: estimateTokens(text),
+          tokens,
           model: this.config.openrouterModel ?? "openrouter/free",
         };
       } catch (err) {

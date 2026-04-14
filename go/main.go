@@ -757,6 +757,27 @@ func handleCacheRetry(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Item not found in any cache queue"}, ID: req.ID})
 }
 
+// Note: iterates cacheQueues without lock, consistent with handleCacheAck
+func handleCacheRequeue(conn net.Conn, req RPCRequest) {
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	for agentWs, q := range cacheQueues {
+		if err := q.Requeue(params.ID); err == nil {
+			EmitLog("[Episodic DB] Requeued cache job [%s] from %s for re-narrativization", params.ID, agentWs)
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "requeued", ID: req.ID})
+			return
+		}
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Item not found or not in done status"}, ID: req.ID})
+}
+
 func handleGetLatestNarrative(conn net.Conn, req RPCRequest) {
 	var params struct {
 		AgentWs string `json:"agentWs"`
@@ -2971,6 +2992,8 @@ func handleConnection(conn net.Conn) {
 			go handleCacheAck(conn, req)
 		case "cache.retry":
 			go handleCacheRetry(conn, req)
+		case "cache.requeue":
+			go handleCacheRequeue(conn, req)
 		case "cache.getLatestNarrative":
 			go handleGetLatestNarrative(conn, req)
 		case "ping":

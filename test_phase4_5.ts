@@ -1318,7 +1318,7 @@ async function runReleaseGateA(): Promise<void> {
   const mockOpenRouter = {
     chatCompletion: async (_params: any) => {
       narrativizeCallCount++;
-      return "Test narrative body"; // OpenRouterClient.chatCompletion returns a string
+      return "The user asked about the weather today. The assistant reported sunny conditions with a high of 25 degrees. The conversation then shifted to weekend plans and upcoming development tasks.";
     },
   };
 
@@ -1665,7 +1665,7 @@ async function runReleaseGateC(): Promise<void> {
   };
 
   const mockOpenRouter = {
-    chatCompletion: async () => ({ text: "Test narrative body", tokens: 10, model: "test" }),
+    chatCompletion: async () => "The user asked about the weather today. The assistant reported sunny conditions with a high of 25 degrees. The conversation then shifted to weekend plans and upcoming development tasks.",
   };
 
   const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);

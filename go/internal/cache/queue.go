@@ -199,7 +199,7 @@ func (q *Queue) LeaseNext(agentID, workerID string, leaseSeconds int) (*QueueIte
 	return nil, nil // No items available
 }
 
-// Ack marks an item as done and removes it from the queue.
+// Ack marks an item as done (preserves rawText for potential re-narrativization).
 func (q *Queue) Ack(id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -207,9 +207,11 @@ func (q *Queue) Ack(id string) error {
 	// Find the item by scanning (simple approach; could be optimized with index)
 	return q.updateItemByScan(id, func(item *QueueItem) bool {
 		item.Status = StatusDone
+		item.LeaseOwner = ""
+		item.LeaseUntil = ""
 		item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		return true
-	}, true) // delete after update
+	}, false) // deleteAfter=false: rawText is preserved for potential re-narrativization
 }
 
 // Retry increments attempts and returns item to queued state with backoff, or moves to dead-letter.
@@ -239,6 +241,27 @@ func (q *Queue) Retry(id, errMsg string, maxAttempts int, backoffSec int) error 
 			}
 		}
 		item.BackoffUntil = time.Now().UTC().Add(time.Duration(backoff) * time.Second).Format(time.RFC3339)
+		return true
+	}, false)
+}
+
+// Requeue moves a "done" item back to "queued" for re-narrativization.
+// Returns error if item not found or not in "done" status.
+func (q *Queue) Requeue(id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.updateItemByScan(id, func(item *QueueItem) bool {
+		if item.Status != StatusDone {
+			return false // Only requeue "done" items
+		}
+		item.Status = StatusQueued
+		item.Attempts = 0
+		item.LeaseOwner = ""
+		item.LeaseUntil = ""
+		item.BackoffUntil = ""
+		item.LastError = ""
+		item.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		return true
 	}, false)
 }
@@ -371,13 +394,13 @@ func (q *Queue) GetLatestNarrative(agentWs, agentID string) (episodeID string, b
 }
 
 // Stats returns queue statistics.
-func (q *Queue) Stats() (queued, leased, deadLetter int, err error) {
+func (q *Queue) Stats() (queued, leased, done, deadLetter int, err error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	iter, err := q.db.NewIter(&pebble.IterOptions{})
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	defer iter.Close()
 
@@ -391,11 +414,13 @@ func (q *Queue) Stats() (queued, leased, deadLetter int, err error) {
 			queued++
 		case StatusLeased:
 			leased++
+		case StatusDone:
+			done++
 		case StatusDeadLetter:
 			deadLetter++
 		}
 	}
-	return queued, leased, deadLetter, nil
+	return queued, leased, done, deadLetter, nil
 }
 
 // --- private methods ---

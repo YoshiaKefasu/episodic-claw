@@ -629,6 +629,14 @@ export class EpisodicCoreClient {
     return this.request<string>("cache.retry", { id, workerId, error, maxAttempts, backoffSec });
   }
 
+  /**
+   * Requeue a "done" cache item for re-narrativization.
+   * Moves the item from "done" back to "queued" so the NarrativeWorker picks it up again.
+   */
+  async cacheRequeue(id: string): Promise<string> {
+    return this.request<string>("cache.requeue", { id });
+  }
+
   async cacheGetLatestNarrative(agentWs: string, agentId: string): Promise<{ episodeId: string; body: string; found: boolean }> {
     return this.request("cache.getLatestNarrative", { agentWs, agentId });
   }

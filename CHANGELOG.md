@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.9] - 2026-04-14
+
+### Added
+- **Narrative Output Sanitizer**: `sanitizeNarrativeOutput()` strips OpenClaw agent response format tags (`<final>`, `[[reply_to_current]]`, `[analysis]`, etc.) from OpenRouter LLM output before saving episodes.
+- **Narrative Quality Gate**: `MIN_NARRATIVE_TOKENS = 10` — outputs shorter than 10 tokens trigger a retry instead of being saved.
+- **Persistent Cache rawText**: `Ack()` now preserves rawText (`deleteAfter=false`) for potential re-narrativization and debugging.
+- **Requeue RPC**: `cache.requeue` endpoint to move `done` items back to `queued` for re-narrativization.
+- **`cacheRequeue()` TS method**: TypeScript client can now trigger requeue via RPC.
+- **TS-side Recall Cache**: `_recallResultCacheMap` (Map per agentWs, 60s TTL) prevents redundant Embedding API round-trips.
+- **Duplicate Recall Guard**: `lastRecallTurnMessageCount` in `AgentRuntimeState` — `assemble()` skips recall if `before_prompt_build` already ran it for this turn.
+- **`classifyAndStripAttachment()`**: Unified single-pass function combining `isAttachmentDominant` + `stripAttachmentNoise` for better performance.
+- **`invalidateTsRecallCache()`**: Exported function to invalidate TS-side recall cache per workspace.
+
+### Changed
+- **`Ack()` no longer deletes items**: Items are marked `status: "done"` instead of being physically removed from PebbleDB.
+- **`Stats()` returns 4 values**: `done` count added (queued, leased, done, deadLetter).
+- **`recallFeedback()` is fire-and-forget**: Changed from `await try-catch` to `.catch()` chain for non-blocking execution.
+- **Go Bleve CJK analyzer**: `standard` → `cjk` analyzer for lexical search (unigram tokenization of CJK scripts).
+- **`@deprecated` JSDoc** added to `isAttachmentDominant()` and `stripAttachmentNoise()` — use `classifyAndStripAttachment()` instead.
+
+### Fixed
+- Debug TRACE logs removed from `rpc-client.ts` (`request()`, `generateEpisodeSlug()`).
+- Mock output in Gate A test adjusted to pass quality gate.
+
 ## [0.4.8] - 2026-04-12
 
 ### Fixed
