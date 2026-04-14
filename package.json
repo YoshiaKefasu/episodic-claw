@@ -1,6 +1,6 @@
 {
   "name": "episodic-claw",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Episodic Memory Engine for OpenClaw",
   "license": "MPL-2.0",
   "main": "./index.ts",
@@ -25,7 +25,7 @@
     "build:go:win": "cross-env GOOS=windows GOARCH=amd64 go build -C go -o ../dist/episodic-core.exe .",
     "build:go": "npm-run-all build:go:linux build:go:win",
     "postinstall": "node scripts/postinstall.cjs",
-    "test": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase4_5.ts && npx tsx test_reasoning.ts",
+    "test": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase4_5.ts && npx tsx test_reasoning.ts && npx tsx test_classify_attachment.ts",
     "test:reasoning": "npx tsx test_reasoning.ts",
     "test:old": "cross-env EPISODIC_USE_GO_RUN=1 node --experimental-transform-types test_phase3.ts",
     "prepublishOnly": "npm run build"

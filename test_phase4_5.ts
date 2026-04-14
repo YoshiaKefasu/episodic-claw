@@ -979,8 +979,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.4.8", "package.json version should be 0.4.8");
-  assert.equal(manifest.version, "0.4.8", "openclaw.plugin.json version should be 0.4.8");
+  assert.equal(pkg.version, "0.4.9", "package.json version should be 0.4.9");
+  assert.equal(manifest.version, "0.4.9", "openclaw.plugin.json version should be 0.4.9");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"
@@ -2126,17 +2126,27 @@ YAML narrative body content for continuity testing.`, "utf8");
 // ── Standalone copies of retriever sanitization functions (avoid ./config import issues) ──
 const TEST_ATTACHMENT_BOILERPLATE: RegExp[] = [
   // [media attached: ...] or [media attached 1/2: ...] — indexed multi-attachment support
-  /\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi,
+  // Covers: [media attached: /path], [media attached 1/2: media://inbound/...], etc.
+  // NOTE: (?:\s*\|\s*[^\n]*)* captures pipe-continued 2nd-line paths
+  /\[media attached(?:\s+\d+\/\d+)?:[^\]]*\](?:\s*\|\s*[^\n]*)*/gi,
   // <media:image>, <media:document>, <media:audio>, <media:video> with optional (N ...) suffix
   /<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi,
   // [User sent media without caption]
   /\[User sent media without caption\]/gi,
-  // To send an image back, prefer ... (match up to period, preserve text after)
-  /To send an image back[^\n]*?(?:prefer|caption|Keep caption|URL)\.[ \t]*/gi,
+  // To send an image back... (multi-line auto-reply boilerplate up to "Keep caption in the text body.")
+  /To send an image back[\s\S]*?Keep caption in the text body\./gi,
   // standalone "attached files" / "attachment" lines without meaningful text
   /^\s*attached files\s*$/gi,
   // media://inbound/<id> standalone
   /media:\/\/inbound\/[^\s]+/gi,
+  // [media attached: N files] — summary header line
+  /\[media attached:\s*\d+\s*files?\]/gi,
+  // Standalone "(image/jpeg)" or "(image/png)" MIME type annotations
+  /\(image\/\w+\)/gi,
+  // Bare "media:image" or "media:document" without angle brackets (Gateway WebUI format)
+  /^media:(image|document|audio|video)\s*$/gim,
+  // MEDIA: inline URL/path hints from auto-reply boilerplate
+  /MEDIA:[^\s]+/gi,
 ];
 
 const TEST_ATTACHMENT_INDICATORS: RegExp[] = [
@@ -2145,46 +2155,104 @@ const TEST_ATTACHMENT_INDICATORS: RegExp[] = [
   /\/(?:usr|home|tmp|var|data|media|storage)(?:\/[^/\s]+)+/gi,
 ];
 
-const TEST_MEDIA_ONLY_SENTINEL = /^\s*(?:\[media attached[^\]]*\]|<media:[^>]+>(?:\s*\([^)]*\))?|\[User sent media without caption\]|attached files|media:\/\/inbound\/[^\s]+|\s)*$/i;
+// Media-only sentinel: built from string array, matching production MEDIA_ONLY_SENTINEL_PARTS
+const TEST_MEDIA_ONLY_SENTINEL_PARTS = [
+  "\\[media attached[^\\]]*\\](?:\\s*\\|[^\\n]*)*",
+  "<media:[^>]+>(?:\\s*\\([^)]*\\))?",
+  "\\[User sent media without caption\\]",
+  "attached files",
+  "media://inbound/[^\\s]+",
+  "To send an image back[^\\n]*",
+  "\\(image/\\w+\\)",
+  "Keep caption[^\\n]*",
+  "media:(?:image|document|audio|video)",
+  "MEDIA:[^\\s]+",
+  "\\s",
+];
+const TEST_MEDIA_ONLY_SENTINEL = new RegExp(
+  `^\\s*(?:${TEST_MEDIA_ONLY_SENTINEL_PARTS.join("|")})*$`, "i"
+);
 
-function testIsAttachmentDominant(text: string): boolean {
-  if (TEST_MEDIA_ONLY_SENTINEL.test(text.trim())) return true;
-  // First strip all attachment markers to get the actual user text
-  const nonMarkerText = text.replace(/\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi, "")
-    .replace(/<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi, "")
-    .replace(/\[User sent media without caption\]/gi, "")
-    .replace(/To send an image back[^\n]*/gi, "")
-    .replace(/media:\/\/inbound\/[^\s]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // If after removing markers there's very little text left, it's attachment-dominant
-  // Use a more lenient threshold: 2 chars for CJK (which can be meaningful with just 2-3 chars)
-  const cjkChars = (nonMarkerText.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
-  if (nonMarkerText.length < 2) return true;
-  // For Latin-heavy text, require more content (to avoid false positives from short English words)
-  if (cjkChars === 0 && nonMarkerText.length < 5) return true;
-
-  // Count attachment indicator tokens in the non-marker text only
-  let indicatorCount = 0;
-  for (const pattern of TEST_ATTACHMENT_INDICATORS) {
-    const matches = nonMarkerText.match(pattern);
-    if (matches) indicatorCount += matches.length;
+function testClassifyAndStripAttachment(text: string): { isDominant: boolean; cleanedText: string } {
+  if (TEST_MEDIA_ONLY_SENTINEL.test(text.trim())) {
+    return { isDominant: true, cleanedText: "" };
   }
 
-  const wordCount = nonMarkerText.split(/\s+/).filter(Boolean).length;
-  if (indicatorCount > 0 && wordCount <= indicatorCount) return true;
+  const hasMediaHeader = /\[media attached/i.test(text);
+  const hasBoilerplateEnd = /Keep caption in the text body\./i.test(text);
 
-  return false;
+  if (hasMediaHeader && hasBoilerplateEnd) {
+    const boundaryIdx = text.lastIndexOf("Keep caption in the text body.");
+    if (boundaryIdx !== -1) {
+      const afterBoundary = text.slice(boundaryIdx + "Keep caption in the text body.".length);
+
+      let tailCleaned = afterBoundary;
+      tailCleaned = tailCleaned.replace(/^System:\s.*$/gm, "");
+      tailCleaned = tailCleaned.replace(
+        /^(Conversation info|Sender|Replied message)\s+\(untrusted[^)]*\):.*$/gim, ""
+      );
+      tailCleaned = tailCleaned.replace(/```json[\s\S]*?```/g, "");
+      tailCleaned = tailCleaned.replace(/^media:(image|document|audio|video)\s*$/gim, "");
+      tailCleaned = tailCleaned.replace(/<media:(image|document|audio|video)>(?:\s*\([^)]*\))?/gi, "");
+      tailCleaned = tailCleaned.replace(/media:\/\/inbound\/[^\s]+/gi, "");
+      tailCleaned = tailCleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+
+      if (tailCleaned.length >= 2) {
+        const cjkChars = (tailCleaned.match(
+          /[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu
+        ) || []).length;
+
+        let indicatorCount = 0;
+        for (const pattern of TEST_ATTACHMENT_INDICATORS) {
+          const matches = tailCleaned.match(pattern);
+          if (matches) indicatorCount += matches.length;
+        }
+        const wordCount = tailCleaned.split(/\s+/).filter(Boolean).length;
+
+        const isDominant = tailCleaned.length < 2 ||
+          (cjkChars === 0 && tailCleaned.length < 5) ||
+          (indicatorCount > 0 && wordCount <= indicatorCount);
+
+        return { isDominant, cleanedText: tailCleaned };
+      }
+      return { isDominant: true, cleanedText: "" };
+    }
+  }
+
+  let cleaned = text;
+  let markerCount = 0;
+
+  for (const pattern of TEST_ATTACHMENT_BOILERPLATE) {
+    const matches = cleaned.match(pattern);
+    if (matches) markerCount += matches.length;
+    cleaned = cleaned.replace(pattern, "");
+  }
+
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+
+  const cjkChars = (cleaned.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
+
+  let indicatorCount = 0;
+  for (const pattern of TEST_ATTACHMENT_INDICATORS) {
+    const matches = cleaned.match(pattern);
+    if (matches) indicatorCount += matches.length;
+  }
+  const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
+
+  const isDominant =
+    cleaned.length < 2 ||
+    (cjkChars === 0 && cleaned.length < 5) ||
+    (indicatorCount > 0 && wordCount <= indicatorCount);
+
+  return { isDominant, cleanedText: cleaned };
+}
+
+function testIsAttachmentDominant(text: string): boolean {
+  return testClassifyAndStripAttachment(text).isDominant;
 }
 
 function testStripAttachmentNoise(text: string): string {
-  let cleaned = text;
-  for (const pattern of TEST_ATTACHMENT_BOILERPLATE) {
-    cleaned = cleaned.replace(pattern, "");
-  }
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-  return cleaned;
+  return testClassifyAndStripAttachment(text).cleanedText;
 }
 
 function testDetectDominantScript(text: string): "cjk" | "latin" {
@@ -2205,12 +2273,20 @@ async function runRetrieverRuntimeRegression(): Promise<void> {
 
   // Verify key patterns exist in both test helper and production
   const testHelperPatterns = [
-    /\\[media attached\(\?:\\s\+\\d\+\\\/\\d\+\)\?:\[\^\\\]\]\*\\]/,
+    /\\[media attached\(\?:\\s\+\\d\+\\\/\\d\+\)\?:\[\^\\\]\]\*\\]\(\?:\\s\*\\\|\\s\*\[\^\\n\]\*\)\*/,
     /<media:\(image\|document\|audio\|video\)>/,
     /\\[User sent media without caption\\]/,
-    /To send an image back\[\^\\n\]\*\?\(\?:prefer\|caption\|Keep caption\|URL\)\\\.\[ \\t\]\*/,
+    /To send an image back\[\\s\\S\]\*\?Keep caption/,
     /media:\\\/\\\/inbound\\\/\[\^\\s\]\+/,
+    /\\[media attached:\\s\*\\d\+\\s\*files\?\\]/,
   ];
+  // Check for the image/\\w+ pattern with proper escaping
+  const hasMimePattern = retrieverSourceForSync.includes('image/\\\\w+');
+  const hasBareMediaPattern = retrieverSourceForSync.includes('media:(image|document|audio|video)');
+  const hasMediaURLPattern = retrieverSourceForSync.includes('MEDIA:[^\\\\s]+');
+  assert.ok(hasMimePattern, "production retriever.ts should have MIME type pattern");
+  assert.ok(hasBareMediaPattern, "production retriever.ts should have bare media:type pattern");
+  assert.ok(hasMediaURLPattern, "production retriever.ts should have MEDIA: URL pattern");
 
   for (const pattern of testHelperPatterns) {
     assert.ok(
@@ -2221,8 +2297,8 @@ async function runRetrieverRuntimeRegression(): Promise<void> {
 
   // Verify CJK-lenient threshold logic exists in production
   assert.ok(
-    retrieverSourceForSync.includes("cjkChars") && retrieverSourceForSync.includes("nonMarkerText.length < 2"),
-    "production retriever.ts should have CJK-lenient threshold (nonMarkerText.length < 2)"
+    retrieverSourceForSync.includes("cjkChars") && retrieverSourceForSync.includes("cleaned.length < 2"),
+    "production retriever.ts should have CJK-lenient threshold (cleaned.length < 2)"
   );
 
   // Verify exported function signatures exist
@@ -2294,7 +2370,7 @@ async function runRetrieverRuntimeRegression(): Promise<void> {
   assert.ok(cleaned2.length < 3, "Media-only message 2 should produce empty text after stripping");
 
   // ── Test 9: Mixed media + caption produces caption-only query ──
-  const mixedMsg = "[media attached 1/2: media://inbound/abc]\nTo send an image back, prefer the image URL. 猫の写真";
+  const mixedMsg = "[media attached 1/2: media://inbound/abc]\nTo send an image back, prefer the message tool. Keep caption in the text body.\n猫の写真";
   const cleanedMixed = testStripAttachmentNoise(mixedMsg);
   assert.ok(cleanedMixed.includes("猫の写真"), "Mixed message should preserve caption");
   assert.ok(!cleanedMixed.includes("media attached"), "Mixed message should strip attachment marker");

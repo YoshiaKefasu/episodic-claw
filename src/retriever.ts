@@ -44,17 +44,26 @@ export function invalidateTsRecallCache(agentWs: string): void {
 const ATTACHMENT_BOILERPLATE: RegExp[] = [
   // [media attached: ...] or [media attached 1/2: ...] — indexed multi-attachment support
   // Covers: [media attached: /path], [media attached 1/2: media://inbound/...], etc.
-  /\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi,
+  // NOTE: (?:\s*\|\s*[^\n]*)* captures pipe-continued 2nd-line paths
+  /\[media attached(?:\s+\d+\/\d+)?:[^\]]*\](?:\s*\|\s*[^\n]*)*/gi,
   // <media:image>, <media:document>, <media:audio>, <media:video> with optional (N ...) suffix
   /<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi,
   // [User sent media without caption]
   /\[User sent media without caption\]/gi,
-  // To send an image back, prefer ... (match up to period, preserve text after)
-  /To send an image back[^\n]*?(?:prefer|caption|Keep caption|URL)\.[ \t]*/gi,
+  // To send an image back... (multi-line auto-reply boilerplate up to "Keep caption in the text body.")
+  /To send an image back[\s\S]*?Keep caption in the text body\./gi,
   // standalone "attached files" / "attachment" lines without meaningful text
   /^\s*attached files\s*$/gi,
   // media://inbound/<id> standalone
   /media:\/\/inbound\/[^\s]+/gi,
+  // [media attached: N files] — summary header line (e.g., "[media attached: 10 files]")
+  /\[media attached:\s*\d+\s*files?\]/gi,
+  // Standalone "(image/jpeg)" or "(image/png)" MIME type annotations leaked from multi-line markers
+  /\(image\/\w+\)/gi,
+  // Bare "media:image" or "media:document" without angle brackets (Gateway WebUI format)
+  /^media:(image|document|audio|video)\s*$/gim,
+  // MEDIA: inline URL/path hints from auto-reply boilerplate
+  /MEDIA:[^\s]+/gi,
 ];
 
 // Patterns that indicate a message is attachment-dominant (no real user text)
@@ -67,8 +76,25 @@ const ATTACHMENT_INDICATORS: RegExp[] = [
   /\/(?:usr|home|tmp|var|data|media|storage)(?:\/[^/\s]+)+/gi,
 ];
 
-// Media-only sentinel: a message consisting almost entirely of attachment markers
-const MEDIA_ONLY_SENTINEL = /^\s*(?:\[media attached[^\]]*\]|<media:[^>]+>(?:\s*\([^)]*\))?|\[User sent media without caption\]|attached files|media:\/\/inbound\/[^\s]+|\s)*$/i;
+// Media-only sentinel: a message consisting almost entirely of attachment markers.
+// Built from a string array so each pattern is on its own line with a comment,
+// making it easy to keep in sync with ATTACHMENT_BOILERPLATE.
+const MEDIA_ONLY_SENTINEL_PARTS = [
+  "\\[media attached[^\\]]*\\](?:\\s*\\|[^\\n]*)*",  // [media attached: ...] with pipe continuation
+  "<media:[^>]+>(?:\\s*\\([^)]*\\))?",                // <media:image> etc.
+  "\\[User sent media without caption\\]",            // LINE/Discord no-caption marker
+  "attached files",                                    // standalone "attached files" line
+  "media://inbound/[^\\s]+",                          // Gateway media URI
+  "To send an image back[^\\n]*",                     // auto-reply template first line
+  "\\(image/\\w+\\)",                                 // MIME type (image/jpeg)
+  "Keep caption[^\\n]*",                               // auto-reply tail line
+  "media:(?:image|document|audio|video)",             // bare media:type (no angle brackets)
+  "MEDIA:[^\\s]+",                                     // MEDIA: URL hints
+  "\\s",                                               // whitespace
+];
+const MEDIA_ONLY_SENTINEL = new RegExp(
+  `^\\s*(?:${MEDIA_ONLY_SENTINEL_PARTS.join("|")})*$`, "i"
+);
 
 /**
  * Check if a message is attachment-dominant (no meaningful user-authored text).
@@ -78,44 +104,7 @@ const MEDIA_ONLY_SENTINEL = /^\s*(?:\[media attached[^\]]*\]|<media:[^>]+>(?:\s*
  * dominance check and noise stripping in a single pass for better performance.
  */
 export function isAttachmentDominant(text: string): boolean {
-  // Check for media-only sentinel pattern
-  if (MEDIA_ONLY_SENTINEL.test(text.trim())) return true;
-
-  // Count attachment markers vs actual text
-  let markerCount = 0;
-  for (const pattern of ATTACHMENT_BOILERPLATE) {
-    const matches = text.match(pattern);
-    if (matches) markerCount += matches.length;
-  }
-
-  // If attachment markers dominate the text, it's attachment-dominant
-  const nonMarkerText = text.replace(/\[media attached(?:\s+\d+\/\d+)?:[^\]]*\]/gi, "")
-    .replace(/<media:(image|document|audio|video)>(\s*\([^)]*\))?/gi, "")
-    .replace(/\[User sent media without caption\]/gi, "")
-    .replace(/To send an image back[^\n]*?(?:prefer|caption|Keep caption|URL)\.[ \t]*/gi, "")
-    .replace(/media:\/\/inbound\/[^\s]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // If after removing markers there's very little text left, it's attachment-dominant
-  // Use a more lenient threshold: 2 chars for CJK (which can be meaningful with just 2-3 chars)
-  const cjkChars = (nonMarkerText.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
-  if (nonMarkerText.length < 2) return true;
-  // For Latin-heavy text, require more content (to avoid false positives from short English words)
-  if (cjkChars === 0 && nonMarkerText.length < 5) return true;
-
-  // Count attachment indicator tokens
-  let indicatorCount = 0;
-  for (const pattern of ATTACHMENT_INDICATORS) {
-    const matches = text.match(pattern);
-    if (matches) indicatorCount += matches.length;
-  }
-
-  // If filename/path tokens outnumber meaningful text, skip
-  const wordCount = nonMarkerText.split(/\s+/).filter(Boolean).length;
-  if (indicatorCount > 0 && wordCount <= indicatorCount) return true;
-
-  return false;
+  return classifyAndStripAttachment(text).isDominant;
 }
 
 /**
@@ -126,13 +115,7 @@ export function isAttachmentDominant(text: string): boolean {
  * dominance check and noise stripping in a single pass for better performance.
  */
 export function stripAttachmentNoise(text: string): string {
-  let cleaned = text;
-  for (const pattern of ATTACHMENT_BOILERPLATE) {
-    cleaned = cleaned.replace(pattern, "");
-  }
-  // Clean up leftover whitespace
-  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-  return cleaned;
+  return classifyAndStripAttachment(text).cleanedText;
 }
 
 /**
@@ -147,6 +130,60 @@ export function classifyAndStripAttachment(text: string): {
   // Sentinel check first (cheap)
   if (MEDIA_ONLY_SENTINEL.test(text.trim())) {
     return { isDominant: true, cleanedText: "" };
+  }
+
+  // Phase B: tail-priority extraction
+  // MUST run BEFORE ATTACHMENT_BOILERPLATE strip because L54 removes
+  // "Keep caption in the text body." as part of the boilerplate block.
+  const hasMediaHeader = /\[media attached/i.test(text);
+  const hasBoilerplateEnd = /Keep caption in the text body\./i.test(text);
+
+  if (hasMediaHeader && hasBoilerplateEnd) {
+    const boundaryIdx = text.lastIndexOf("Keep caption in the text body.");
+    if (boundaryIdx !== -1) {
+      const afterBoundary = text.slice(boundaryIdx + "Keep caption in the text body.".length);
+
+      let tailCleaned = afterBoundary;
+      // Remove System: lines
+      tailCleaned = tailCleaned.replace(/^System:\s.*$/gm, "");
+      // Remove untrusted metadata headers
+      tailCleaned = tailCleaned.replace(
+        /^(Conversation info|Sender|Replied message)\s+\(untrusted[^)]*\):.*$/gim, ""
+      );
+      // Remove fenced json blocks (```json ... ```)
+      tailCleaned = tailCleaned.replace(/```json[\s\S]*?```/g, "");
+      // Remove bare media:type lines
+      tailCleaned = tailCleaned.replace(/^media:(image|document|audio|video)\s*$/gim, "");
+      // Remove <media:...> tags
+      tailCleaned = tailCleaned.replace(/<media:(image|document|audio|video)>(?:\s*\([^)]*\))?/gi, "");
+      // Remove media://inbound/ URIs
+      tailCleaned = tailCleaned.replace(/media:\/\/inbound\/[^\s]+/gi, "");
+      // Normalize whitespace
+      tailCleaned = tailCleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+
+      // If tail extraction produced meaningful text, use it as the cleaned result
+      if (tailCleaned.length >= 2) {
+        const cjkChars = (tailCleaned.match(
+          /[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu
+        ) || []).length;
+
+        // INDICATORS safety net
+        let indicatorCount = 0;
+        for (const pattern of ATTACHMENT_INDICATORS) {
+          const matches = tailCleaned.match(pattern);
+          if (matches) indicatorCount += matches.length;
+        }
+        const wordCount = tailCleaned.split(/\s+/).filter(Boolean).length;
+
+        const isDominant = tailCleaned.length < 2 ||
+          (cjkChars === 0 && tailCleaned.length < 5) ||
+          (indicatorCount > 0 && wordCount <= indicatorCount);
+
+        return { isDominant, cleanedText: tailCleaned };
+      }
+      // Tail was empty after cleanup — pure attachment noise
+      return { isDominant: true, cleanedText: "" };
+    }
   }
 
   let cleaned = text;
@@ -164,10 +201,10 @@ export function classifyAndStripAttachment(text: string): {
   // Dominance check on cleaned text
   const cjkChars = (cleaned.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}\p{Script=Hangul}]/gu) || []).length;
 
-  // Count attachment indicator tokens in original text
+  // Count attachment indicator tokens in CLEANED text (not original)
   let indicatorCount = 0;
   for (const pattern of ATTACHMENT_INDICATORS) {
-    const matches = text.match(pattern);
+    const matches = cleaned.match(pattern);
     if (matches) indicatorCount += matches.length;
   }
   const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
