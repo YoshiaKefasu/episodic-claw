@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.11] - 2026-04-15
+
+### Added
+- **Narrative Quality Gate Overhaul (3-Layer Defense)**: Prevents OpenRouter free models from saving low-quality echoed text as narrative episodes.
+- **Layer 0 (Prompt)**: Added few-shot examples and strict third-person/past-tense rules to `DEFAULT_SYSTEM_PROMPT`.
+- **Layer 1 (Quality Gate)**: Implemented token count, compression ratio (>=1%), and verbatim echo detection. Triggers fallback retries for bad outputs.
+- **Layer 2 (Fallback Summary)**: When all retries fail, generates a deterministic summary of the first 20 lines (tagged with `fallback-summary` for future manual review) instead of spinning in an infinite loop.
+- **Test coverage**: New test suite `test_narrative_quality_gate.ts` (12/12 PASS).
+
+
 ## [0.4.10] - 2026-04-15
 
 ### Fixed

@@ -15,12 +15,31 @@ import type { CacheQueueItem } from "./narrative-queue";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a conversation archivist. Read the following conversation log and write a short narrative summary of what was discussed, what was decided, and what was worked on.
 
-Rules:
+CRITICAL RULES — VIOLATION CAUSES OUTPUT REJECTION:
+- Write in THIRD PERSON PAST TENSE (三人称・過去形). NEVER use first person.
+- NEVER copy messages verbatim. ALWAYS rephrase as narrative.
+- NEVER output raw dialogue as-is. Convert dialogue into reported speech or narrative description.
+- A narrative reads like a short story chapter, NOT a chat log.
+
+Style rules:
 - Preserve technical details accurately (file names, commands, error messages)
 - Ignore tool call JSON — describe what tool was used and what it did
 - Completely ignore thinking tags, system instructions, and metadata
 - Include the emotional tone and context of the conversation when relevant
-- Keep it within 800 characters`;
+- Keep it within 800 characters
+- Write in the same language as the majority of the conversation
+
+EXAMPLE of a good narrative (日本語 conversation):
+---
+日曜の夕方、ヨシアはTelegram from一通のテストメッセージを送った。「聞こえたら"バッチリだよ"で返事を」――Gemini CLIが完全に死んでいたからだ。Kasouの声が返ってきた瞬間、ヨシアは安堵のため息をついた。
+それから数時間後の夜。ヨシアはスクリーンショットを立て続けに送りつけた。そこに映っていたのは、ロールバック中に"アムネシア"に陥ったKasouの惨状だった。
+水浴びを終えて戻ってきたヨシアの顔には、新たな決意が宿っていた。「OpenClawをForkして独自開発しようと思う。名前はDennouAibouにした」
+---
+
+BAD output (REJECTED — verbatim echo):
+---
+おう、バッチリ聞こえてるぜ！今日もなんか面白いと思いついたか？
+---`;
 
 const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
   `${previousEpisode ? `Previous episode:\n${previousEpisode}\n---\n` : ""}Please narrativize the following conversation:
@@ -33,6 +52,9 @@ const MAX_CACHE_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 1000;
 const LEASE_SECONDS = 120;
 const MIN_NARRATIVE_TOKENS = 10;
+const MIN_COMPRESSION_RATIO = 0.01; // Output must be >= 1% of input tokens
+const ECHO_SAMPLE_LENGTH = 80; // Characters to check for verbatim echo
+const MIN_ECHO_LENGTH = 20; // Minimum length to bother checking
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 type CacheItem = CacheQueueItem;
@@ -41,12 +63,6 @@ type CacheItem = CacheQueueItem;
  * Sanitize OpenRouter LLM output to remove OpenClaw agent response format tags
  * and other non-narrative artifacts that leak through when the model echoes
  * conversation content instead of producing a clean summary.
- *
- * Applied post-LLM, pre-save. Strips:
- * - Reasoning/final/thinking tags via stripReasoningTagsFromText (handles <final>, <thinking>, <antthinking> etc.)
- * - [analysis], [[reply_to_current]], [reply_to_current] OpenClaw response format tags
- * - [output] / [/output] bracket tags (line-start only)
- * - Excessive whitespace from tag removal
  */
 export function sanitizeNarrativeOutput(text: string): string {
   // Step 1: Strip <final>, </final>, <thinking>, </thinking> etc.
@@ -70,6 +86,31 @@ export function sanitizeNarrativeOutput(text: string): string {
   return cleaned;
 }
 
+/**
+ * [NEW v0.4.11] Quality gate: check if output meets minimum tokens and compression ratio.
+ */
+export function checkCompressionRatio(outputTokens: number, inputTokens: number): boolean {
+  if (outputTokens < MIN_NARRATIVE_TOKENS) return false;
+  const ratio = outputTokens / Math.max(1, inputTokens);
+  return ratio >= MIN_COMPRESSION_RATIO;
+}
+
+/**
+ * [NEW v0.4.11] Quality gate: check if output is a verbatim copy of input parts.
+ * Compares by stripping ALL whitespaces to catch echoes with different formatting.
+ */
+export function checkEchoDetection(output: string, input: string): boolean {
+  // Collapse whitespaces for content comparison
+  const collapsedOutput = output.replace(/\s+/g, "").trim();
+  if (collapsedOutput.length < MIN_ECHO_LENGTH) return true; // Too short to judge
+
+  const echoSample = collapsedOutput.substring(0, ECHO_SAMPLE_LENGTH);
+  const collapsedInput = input.replace(/\s+/g, "");
+
+  // If sample exists verbatim in collapsed input, it's an echo
+  return !collapsedInput.includes(echoSample);
+}
+
 export class NarrativeWorker {
   private isProcessing = false;
   private shouldStop = false;
@@ -91,13 +132,10 @@ export class NarrativeWorker {
 
   /**
    * Wake the worker from idle backoff. Called when new items are enqueued.
-   * Idempotent: safe to call multiple times.
-   * Clears any pending poll timer and schedules an immediate poll.
    */
   wake(): void {
     this.consecutiveEmptyPolls = 0;
     this.nextPollDelayMs = POLL_INTERVAL_MS;
-    // Always clear the pending timer and poll immediately — don't wait for idle backoff
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
@@ -107,7 +145,6 @@ export class NarrativeWorker {
 
   /**
    * Start polling the cache queue for items to narrativize.
-   * Fire-and-forget: runs in the background until stop() is called.
    */
   start(): void {
     if (this.isProcessing) return;
@@ -125,7 +162,6 @@ export class NarrativeWorker {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
-    // Wait for current narrativization to finish (up to 15s)
     let waited = 0;
     while (this.isProcessing && waited < 15000) {
       await this.sleep(100);
@@ -135,7 +171,6 @@ export class NarrativeWorker {
 
   /**
    * Initialize continuity state by loading the latest narrative episode per agent.
-   * Also populates the knownAgentIds set for multi-agent polling.
    */
   async initContinuity(agents: Array<{ agentWs: string; agentId: string }>): Promise<void> {
     for (const { agentWs, agentId } of agents) {
@@ -147,7 +182,7 @@ export class NarrativeWorker {
           console.log(`[NarrativeWorker] Loaded continuity for agent ${agentId}: ${result.episodeId}`);
         }
       } catch (err) {
-        // No continuity available yet — that's fine
+        // No continuity available yet
       }
     }
   }
@@ -169,13 +204,11 @@ export class NarrativeWorker {
 
   private async processNextFromCache(): Promise<void> {
     try {
-      // Poll each known agent ID (multi-agent support)
       const agentIds = this.knownAgentIds.size > 0 ? Array.from(this.knownAgentIds) : ["main"];
       for (const agentId of agentIds) {
         const item = await this.rpcClient.cacheLeaseNext("narrative-worker", agentId, LEASE_SECONDS);
-        if (!item) continue; // No items for this agent, try next
+        if (!item) continue;
 
-        // Got an item — reset idle backoff
         this.consecutiveEmptyPolls = 0;
         this.nextPollDelayMs = POLL_INTERVAL_MS;
 
@@ -190,28 +223,35 @@ export class NarrativeWorker {
             await this.rpcClient.cacheAck(item.id, "narrative-worker");
             console.log(`[NarrativeWorker] Successfully narrativized chunk [${item.id}]. (Output: ${result.tokens} tokens)`);
           } else {
-            await this.rpcClient.cacheRetry(item.id, "narrative-worker", "Narrativization returned empty", MAX_CACHE_ATTEMPTS);
-            console.log(`[NarrativeWorker] Returned chunk [${item.id}] to queue after empty result.`);
+            // [NEW v0.4.11] All retries exhausted → generate deterministic fallback summary
+            const fallbackText = this.buildDeterministicFallback(item);
+            const fallbackResult: NarrativeResult = {
+              text: fallbackText,
+              tokens: estimateTokens(fallbackText),
+              model: "fallback-summary",
+            };
+            // Pass isFallback=true to add specific tag
+            await this.saveNarrative(fallbackResult, item, true);
+            await this.rpcClient.cacheAck(item.id, "narrative-worker");
+            console.warn(
+              `[NarrativeWorker] LLM narrativization failed for [${item.id}] after ${MAX_RETRIES} attempts. Saved deterministic fallback summary (${fallbackResult.tokens} tokens).`
+            );
           }
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           await this.rpcClient.cacheRetry(item.id, "narrative-worker", errMsg, MAX_CACHE_ATTEMPTS);
           console.log(`[NarrativeWorker] Returned chunk [${item.id}] to queue. attempts increased error=${errMsg}`);
         }
-        // Process one item per poll cycle to avoid starvation
         return;
       }
 
-      // All agents returned empty — increase backoff for next poll
       this.consecutiveEmptyPolls++;
       this.nextPollDelayMs = Math.min(this.MAX_POLL_DELAY_MS, this.nextPollDelayMs * 2);
 
-      // Log idle backoff state periodically (every ~5 minutes worth of polls at cap)
       if (this.consecutiveEmptyPolls > 0 && this.consecutiveEmptyPolls % 20 === 0) {
         console.log(`[NarrativeWorker] Idle backoff: ${this.consecutiveEmptyPolls} empty polls, next in ${this.nextPollDelayMs}ms`);
       }
     } catch (err) {
-      // Polling error — just retry after interval
       console.warn("[NarrativeWorker] Poll error:", err);
     }
   }
@@ -226,12 +266,20 @@ export class NarrativeWorker {
       try {
         const rawText = await this.client.chatCompletion({ systemPrompt, userMessage });
         const text = sanitizeNarrativeOutput(rawText);
-
-        // Quality gate: skip empty or trivially short outputs
         const tokens = estimateTokens(text);
-        if (tokens < MIN_NARRATIVE_TOKENS) {
+
+        // [v0.4.11] Quality gate 1: Token count & Compression ratio
+        if (!checkCompressionRatio(tokens, item.estimatedTokens)) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output too short (${tokens} tokens < ${MIN_NARRATIVE_TOKENS}). Retrying...`
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output too short or compression ratio too low (${tokens} tokens, ${(tokens / item.estimatedTokens * 100).toFixed(2)}%). Retrying...`
+          );
+          continue;
+        }
+
+        // [v0.4.11] Quality gate 2: Verbatim echo detection
+        if (!checkEchoDetection(text, conversationText)) {
+          console.warn(
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output appears to be verbatim echo of input. Retrying...`
           );
           continue;
         }
@@ -253,9 +301,13 @@ export class NarrativeWorker {
     return null;
   }
 
-  private async saveNarrative(result: NarrativeResult, item: CacheItem): Promise<void> {
+  private async saveNarrative(result: NarrativeResult, item: CacheItem, isFallback: boolean = false): Promise<void> {
     try {
       const tags = ["narrative", item.source === "live-turn" ? "auto-segmented" : "cold-start-import"];
+      if (isFallback) {
+        tags.push("fallback-summary");
+      }
+
       await this.rpcClient.batchIngest(
         [
           {
@@ -271,12 +323,27 @@ export class NarrativeWorker {
         item.agentWs,
         item.agentId,
       );
-      // Update continuity state
       this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${Date.now()}`, body: result.text });
     } catch (err) {
       console.error("[NarrativeWorker] Failed to save narrative episode:", err);
-      throw err; // Let caller handle via cache retry
+      throw err;
     }
+  }
+
+  /**
+   * [NEW v0.4.11] Generate a deterministic fallback summary when LLM fails.
+   */
+  private buildDeterministicFallback(item: CacheItem): string {
+    const lines = item.rawText
+      .split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter((line) => line.length > 0)
+      .slice(0, 20); // First 20 non-empty lines
+
+    const summary = lines.join("\n");
+    const maxChars = 800;
+    if (summary.length <= maxChars) return summary;
+    return summary.substring(0, maxChars) + "\n[truncated]";
   }
 
   private resolveSystemPrompt(): string {
@@ -299,3 +366,4 @@ export class NarrativeWorker {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
+
