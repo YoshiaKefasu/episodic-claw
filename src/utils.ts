@@ -9,8 +9,8 @@
  */
 export function estimateTokens(text: string): number {
     let count = 0;
-    for (const char of text) {
-        count += char.charCodeAt(0) > 0x2E80 ? 1.5 : 0.25; 
+    for (let i = 0; i < text.length; i++) {
+        count += text.charCodeAt(i) > 0x2E80 ? 1.5 : 0.25; 
     }
     return Math.ceil(count);
 }

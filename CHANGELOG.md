@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.12] - 2026-04-16
+
+### Changed
+- **Fallback Summary Removed (Phase A)**: `buildDeterministicFallback()` deleted. When all LLM retries fail, the item is now re-queued via `cacheRetry()` with backoff instead of saving raw text as a fallback episode. This eliminates 3-way pollution: context contamination (lastNarrativeByAgent), vector store pollution, and UX pollution (garbage MD files). Raw text is preserved in PebbleDB (`deleteAfter=false`) for manual requeue via `cache.requeue` RPC.
+- **`saveNarrative()` simplified**: Removed `isFallback` parameter and `fallback-summary` tag branch. Only successfully narrativized content reaches the save path now.
+- **Quality Gate Log Enhancement (Phase B)**: Compression ratio and echo detection warnings now include concrete numbers (e.g., `47/48000 = 0.10% < 1%`) and the item ID for easier debugging.
+- **Echo Detection Optimization (Phase E)**: `checkEchoDetection()` now scans only the first 5000 characters of input (`MAX_ECHO_SCAN_CHARS`) instead of collapsing the entire ~192KB input string. Reduces memory allocation by ~85% on 48K-token texts.
+- **Token Estimation Optimization (Phase F)**: `estimateTokens()` changed from `for...of` iterator to `for...let i` index loop. Eliminates string iterator overhead without changing behavior.
+- **Quality Gate 500ms Sleep (Phase G)**: Added 500ms sleep before retry on compression ratio and echo detection failures. Free-tier models tend to produce identical output on rapid retries; the brief pause gives the model time to vary its response.
+
+### Removed
+- **`buildDeterministicFallback()` method**: Deleted from `narrative-worker.ts`.
+- **`isFallback` parameter**: Removed from `saveNarrative()` signature.
+- **`import { buildFallbackSummary }`**: Unused import removed from `narrative-worker.ts`.
+
+
 ## [0.4.11] - 2026-04-15
 
 ### Added

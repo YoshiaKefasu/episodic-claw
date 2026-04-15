@@ -8,7 +8,7 @@ import { estimateTokens } from "./utils";
 import { OpenRouterClient } from "./openrouter-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
-import { buildFallbackSummary } from "./summary-escalation";
+
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import type { Message } from "./segmenter";
 import type { CacheQueueItem } from "./narrative-queue";
@@ -55,6 +55,7 @@ const MIN_NARRATIVE_TOKENS = 10;
 const MIN_COMPRESSION_RATIO = 0.01; // Output must be >= 1% of input tokens
 const ECHO_SAMPLE_LENGTH = 80; // Characters to check for verbatim echo
 const MIN_ECHO_LENGTH = 20; // Minimum length to bother checking
+const MAX_ECHO_SCAN_CHARS = 5000; // Only scan first 5000 chars of input (echoes are near the beginning)
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 type CacheItem = CacheQueueItem;
@@ -100,15 +101,16 @@ export function checkCompressionRatio(outputTokens: number, inputTokens: number)
  * Compares by stripping ALL whitespaces to catch echoes with different formatting.
  */
 export function checkEchoDetection(output: string, input: string): boolean {
-  // Collapse whitespaces for content comparison
+  // Collapse whitespaces in output (small, typically <500 chars)
   const collapsedOutput = output.replace(/\s+/g, "").trim();
   if (collapsedOutput.length < MIN_ECHO_LENGTH) return true; // Too short to judge
 
   const echoSample = collapsedOutput.substring(0, ECHO_SAMPLE_LENGTH);
-  const collapsedInput = input.replace(/\s+/g, "");
 
-  // If sample exists verbatim in collapsed input, it's an echo
-  return !collapsedInput.includes(echoSample);
+  // Only collapse the first MAX_ECHO_SCAN_CHARS of input (avoid 192KB full copy for 48K-token texts)
+  // Echoes are always near the beginning of the input
+  const inputPrefix = input.substring(0, MAX_ECHO_SCAN_CHARS).replace(/\s+/g, "");
+  return !inputPrefix.includes(echoSample);
 }
 
 export class NarrativeWorker {
@@ -223,18 +225,12 @@ export class NarrativeWorker {
             await this.rpcClient.cacheAck(item.id, "narrative-worker");
             console.log(`[NarrativeWorker] Successfully narrativized chunk [${item.id}]. (Output: ${result.tokens} tokens)`);
           } else {
-            // [NEW v0.4.11] All retries exhausted → generate deterministic fallback summary
-            const fallbackText = this.buildDeterministicFallback(item);
-            const fallbackResult: NarrativeResult = {
-              text: fallbackText,
-              tokens: estimateTokens(fallbackText),
-              model: "fallback-summary",
-            };
-            // Pass isFallback=true to add specific tag
-            await this.saveNarrative(fallbackResult, item, true);
-            await this.rpcClient.cacheAck(item.id, "narrative-worker");
+            // [v0.4.12] Quality gate exhausted → re-queue with backoff instead of saving fallback
+            // Fallback summary would pollute: context (lastNarrativeByAgent), vector store, and UX
+            // rawText is preserved in PebbleDB (Ack deleteAfter=false) for manual requeue later
+            await this.rpcClient.cacheRetry(item.id, "narrative-worker", "Quality gate exhausted: all retries failed", MAX_CACHE_ATTEMPTS);
             console.warn(
-              `[NarrativeWorker] LLM narrativization failed for [${item.id}] after ${MAX_RETRIES} attempts. Saved deterministic fallback summary (${fallbackResult.tokens} tokens).`
+              `[NarrativeWorker] Quality gate: all ${MAX_RETRIES} LLM attempts exhausted for [${item.id}]. Re-queued for later retry (${item.attempts}/${MAX_CACHE_ATTEMPTS}).`
             );
           }
         } catch (err) {
@@ -271,16 +267,21 @@ export class NarrativeWorker {
         // [v0.4.11] Quality gate 1: Token count & Compression ratio
         if (!checkCompressionRatio(tokens, item.estimatedTokens)) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output too short or compression ratio too low (${tokens} tokens, ${(tokens / item.estimatedTokens * 100).toFixed(2)}%). Retrying...`
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: compression ratio too low ` +
+            `(${tokens}/${item.estimatedTokens} = ${(tokens / item.estimatedTokens * 100).toFixed(2)}% < ${MIN_COMPRESSION_RATIO * 100}%). ` +
+            `Retrying for [${item.id}]...`
           );
+          await this.sleep(500); // [v0.4.12] Brief pause before retry — free models tend to produce similar output without pause
           continue;
         }
 
         // [v0.4.11] Quality gate 2: Verbatim echo detection
         if (!checkEchoDetection(text, conversationText)) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: output appears to be verbatim echo of input. Retrying...`
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: verbatim echo detected for [${item.id}]. ` +
+            `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
           );
+          await this.sleep(500); // [v0.4.12] Brief pause before retry
           continue;
         }
 
@@ -301,12 +302,9 @@ export class NarrativeWorker {
     return null;
   }
 
-  private async saveNarrative(result: NarrativeResult, item: CacheItem, isFallback: boolean = false): Promise<void> {
+  private async saveNarrative(result: NarrativeResult, item: CacheItem): Promise<void> {
     try {
       const tags = ["narrative", item.source === "live-turn" ? "auto-segmented" : "cold-start-import"];
-      if (isFallback) {
-        tags.push("fallback-summary");
-      }
 
       await this.rpcClient.batchIngest(
         [
@@ -323,27 +321,13 @@ export class NarrativeWorker {
         item.agentWs,
         item.agentId,
       );
+      // Only update continuity state for successfully narrativized content
+      // (fallback summaries no longer reach this path — they are re-queued via cacheRetry)
       this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${Date.now()}`, body: result.text });
     } catch (err) {
       console.error("[NarrativeWorker] Failed to save narrative episode:", err);
       throw err;
     }
-  }
-
-  /**
-   * [NEW v0.4.11] Generate a deterministic fallback summary when LLM fails.
-   */
-  private buildDeterministicFallback(item: CacheItem): string {
-    const lines = item.rawText
-      .split(/\r?\n/)
-      .map((line) => line.replace(/\s+/g, " ").trim())
-      .filter((line) => line.length > 0)
-      .slice(0, 20); // First 20 non-empty lines
-
-    const summary = lines.join("\n");
-    const maxChars = 800;
-    if (summary.length <= maxChars) return summary;
-    return summary.substring(0, maxChars) + "\n[truncated]";
   }
 
   private resolveSystemPrompt(): string {
