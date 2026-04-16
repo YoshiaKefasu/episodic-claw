@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -61,7 +61,7 @@
       },
       "segmentationWarmupCount": {
         "type": "integer",
-        "description": "How many messages the AI needs to observe to learn your 'chat style' before using dynamic sensitivity. Default: 20.\n⚠️ [Blast Radius] If too high: The AI stays in a dumb 'fixed threshold' mode for way too long. If too low: It finishes learning on skewed data and its slicing logic gets permanently bugged."
+        "description": "How many messages the AI needs to observe to learn your 'chat style' before using dynamic sensitivity. Default: 10.\n⚠️ [Blast Radius] If too high: The AI stays in a dumb 'fixed threshold' mode for way too long. If too low: It finishes learning on skewed data and its slicing logic gets permanently bugged."
       },
       "segmentationMinRawSurprise": {
         "type": "number",

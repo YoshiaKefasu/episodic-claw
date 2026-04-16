@@ -100,6 +100,8 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
     openrouterApiKey: rawConfig?.openrouterApiKey || process.env.OPENROUTER_API_KEY || "",
     // openrouterConfig (nested) vs flat fields: nested takes precedence
     openrouterModel: rawConfig?.openrouterConfig?.model ?? rawConfig?.openrouterModel ?? "openrouter/free",
+    // [v0.4.15] Max tokens for narrative generation — previously dropped by v0.4.14 Fix B
+    openrouterMaxTokens: rawConfig?.openrouterConfig?.maxTokens,
     narrativeTemperature: Math.max(0, Math.min(1, rawConfig?.openrouterConfig?.temperature ?? rawConfig?.narrativeTemperature ?? 0.4)),
     narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate),

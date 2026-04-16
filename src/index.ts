@@ -414,17 +414,6 @@ const PluginConfigSchema = Type.Object(
       maximum: 1,
       description: "Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead."
     })),
-    openrouterConfig: Type.Optional(Type.Object({
-      model: Type.Optional(Type.String()),
-      maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768 })),
-      temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-      reasoning: Type.Optional(Type.Object({
-        enabled: Type.Optional(Type.Boolean()),
-        effort: Type.Optional(Type.String({ enum: ["none", "minimal", "low", "medium", "high", "xhigh"] })),
-        maxTokens: Type.Optional(Type.Integer({ minimum: 1 })),
-        exclude: Type.Optional(Type.Boolean()),
-      }, { description: "OpenRouter reasoning/thinking control. Default: enabled=true, effort=high." })),
-    }, { description: "Nested OpenRouter config. Takes precedence over flat fields." })),
     enableBackgroundWorkers: Type.Optional(Type.Boolean({
       description: "Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery). Default: true. Does not affect narrative generation."
     })),
@@ -499,6 +488,7 @@ const episodicClawPlugin = {
           ? new OpenRouterClient({
               apiKey: cfg.openrouterApiKey,
               model: cfg.openrouterModel,
+              maxTokens: cfg.openrouterMaxTokens,
               temperature: cfg.narrativeTemperature,
               reasoning: cfg.openrouterReasoning,
             })
@@ -549,7 +539,7 @@ const episodicClawPlugin = {
       // 12往復の会話（ユーザー12 + アシスタント12）。1Mコンテキスト窓では十分な間隔。
       // openclaw.plugin.json の recallReInjectionCooldownTurns でユーザーが調整可能。
       // 0 に設定するとガードが無効化される。
-      const recallReInjectionCooldownTurns = Math.max(0, cfg.recallReInjectionCooldownTurns ?? 10);
+      const recallReInjectionCooldownTurns = cfg.recallReInjectionCooldownTurns ?? 24;
 
       // [Fix D-3] setMeta rate-limit（フォールバック連発対策）
       // ingest() が N 回呼ばれても setMeta は最大 5 秒に 1 回のみ発行する。

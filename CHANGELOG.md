@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.15] - 2026-04-17
+
+### Fixed
+- **`openrouterConfig.maxTokens` transmission path restored (CRITICAL)**: Removing `narrativeMaxTokens` in v0.4.14 also destroyed the only code path that forwarded `openrouterConfig.maxTokens` to the OpenRouter API call. User settings like `openrouterConfig: { maxTokens: 4096 }` were completely ignored, causing OpenRouter to use the model's default context window instead. Added `openrouterMaxTokens` flat field in `loadConfig()`, `types.ts`, and `index.ts` to restore the path.
+
+### Changed
+- **`openrouterConfig` nested type removed from `types.ts` and TypeBox schema**: The `openrouterConfig` nested object in `EpisodicPluginConfig` was never returned by `loadConfig()` — all 4 sub-fields (`model`, `maxTokens`, `temperature`, `reasoning`) were already destructured into flat fields (`openrouterModel`, `openrouterMaxTokens`, `narrativeTemperature`, `openrouterReasoning`). The dead nested type was a contract violation that could mislead future developers into writing `cfg.openrouterConfig?.maxTokens` (always `undefined`). Removed from both `types.ts` and `index.ts` TypeBox schema; `openclaw.plugin.json` retains the nested object as the user-facing config entry point.
+- **`segmentationWarmupCount` default documentation fixed**: `openclaw.plugin.json` described the default as `20`, but the runtime default was `10` (changed in v0.4.0 Phase 3). Updated description to `Default: 10` to match reality.
+- **`recallReInjectionCooldownTurns` dead `?? 10` fallback replaced**: `index.ts` had a `?? 10` fallback that was unreachable (because `loadConfig()` already provides `?? 24`), but would have incorrectly overridden `recallReInjectionCooldownTurns: 0` (the "disable guard" setting) to `10`. Replaced with `?? 24` to match `loadConfig()`'s authoritative default and fix the `0`-override bug.
+
+### Added
+- **Config pipeline automated test (`test_config_pipeline.ts`)**: 29 tests that verify every `EpisodicPluginConfig` field appears in `loadConfig()` output, nested→flat field extraction paths, default value consistency between code and `openclaw.plugin.json`, edge cases (0 values, clamping, undefined handling), and regression guards for previously missing fields (v0.4.13–v0.4.15). Prevents the recurring bug pattern where a type definition exists but `loadConfig()` silently ignores it.
+
 ## [0.4.14] - 2026-04-17
 
 ### Fixed

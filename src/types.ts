@@ -111,6 +111,9 @@ export interface EpisodicPluginConfig {
   openrouterApiKey?: string;
   /** Deprecated: legacy alias for openrouterConfig.model. Use openrouterConfig.model instead. */
   openrouterModel?: string;
+  /** Max tokens cap for narrative generation. Sources from openrouterConfig.maxTokens.
+   *  Omit to use the model's default context window. */
+  openrouterMaxTokens?: number;
   /** Narrative system prompt (inline text). */
   narrativeSystemPrompt?: string;
   /** Narrative user prompt template (inline text). */
@@ -121,13 +124,6 @@ export interface EpisodicPluginConfig {
   narrativePreviousEpisodeRef?: boolean;
   /** Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead. */
   narrativeTemperature?: number;
-  /** Nested OpenRouter config for narrative generation. */
-  openrouterConfig?: {
-    model?: string;
-    maxTokens?: number;
-    temperature?: number;
-    reasoning?: OpenRouterReasoningConfig;
-  };
   /** Normalized reasoning config after applying defaults and validation rules. */
   openrouterReasoning?: {
     enabled: boolean;
