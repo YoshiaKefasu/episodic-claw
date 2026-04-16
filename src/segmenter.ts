@@ -24,177 +24,7 @@ export function extractText(content: any): string {
   return normalizeMessageText(content);
 }
 
-// ─── Session mapping for message_sent resolution (v0.4.7) ─────────────────
-// Short-lived TTL + LRU bounded map: conversationId -> session info.
 
-export type SessionMappingEntry = {
-  sessionKey: string;
-  agentId: string;
-  agentWs: string;
-  expiresAt: number; // ms epoch
-};
-
-export class SessionMappingCache {
-  private store: Map<string, SessionMappingEntry> = new Map();
-  private accessOrder: string[] = [];
-
-  constructor(
-    private ttlMs: number = 5 * 60 * 1000, // 5 minutes default
-    private maxSize: number = 200,
-  ) {}
-
-  set(conversationId: string, entry: SessionMappingEntry): void {
-    entry.expiresAt = Date.now() + this.ttlMs;
-    this.store.set(conversationId, entry);
-    // Update access order
-    const idx = this.accessOrder.indexOf(conversationId);
-    if (idx !== -1) this.accessOrder.splice(idx, 1);
-    this.accessOrder.push(conversationId);
-    // LRU eviction
-    while (this.store.size > this.maxSize && this.accessOrder.length > 0) {
-      const oldest = this.accessOrder.shift()!;
-      this.store.delete(oldest);
-    }
-  }
-
-  get(conversationId: string): SessionMappingEntry | null {
-    const entry = this.store.get(conversationId);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-      this.store.delete(conversationId);
-      const idx = this.accessOrder.indexOf(conversationId);
-      if (idx !== -1) this.accessOrder.splice(idx, 1);
-      return null;
-    }
-    // Refresh access order
-    const idx = this.accessOrder.indexOf(conversationId);
-    if (idx !== -1) this.accessOrder.splice(idx, 1);
-    this.accessOrder.push(conversationId);
-    return entry;
-  }
-
-  delete(conversationId: string): void {
-    this.store.delete(conversationId);
-    const idx = this.accessOrder.indexOf(conversationId);
-    if (idx !== -1) this.accessOrder.splice(idx, 1);
-  }
-
-  clear(): void {
-    this.store.clear();
-    this.accessOrder.length = 0;
-  }
-
-  get size(): number {
-    return this.store.size;
-  }
-}
-
-// ─── Hook payload adapters (v0.4.7 fix: real OpenClaw contracts) ──────────
-// These functions translate raw OpenClaw hook events into Message[] deltas
-// that the segmenter's processIncrementalTurn can consume.
-//
-// Real contracts (NOT event.messages):
-//   before_dispatch: { content?, body?, sessionKey?, senderId?, isGroup?, timestamp? }
-//   message_sent:    { to?, content?, success?, error? }
-
-/**
- * Build a user-role delta Message[] from a before_dispatch event.
- *
- * OpenClaw before_dispatch event shape:
- *   { content: string | ContentBlock[] | ContentBlock, body?: string, ... }
- *
- * The content/body carries the inbound user message text. There is NO event.messages array.
- */
-export function buildBeforeDispatchDelta(event: unknown): Message[] {
-  if (!event || typeof event !== "object") return [];
-
-  const evt = event as Record<string, unknown>;
-  const messages: Message[] = [];
-
-  // Primary: event.content (can be string, array of blocks, or single block)
-  const content = evt.content;
-  if (content !== undefined && content !== null) {
-    messages.push({ role: "user", content, timestamp: typeof evt.timestamp === "string" ? evt.timestamp : undefined });
-    return messages;
-  }
-
-  // Fallback: event.body (plain string body text)
-  const body = evt.body;
-  if (typeof body === "string" && body.trim().length > 0) {
-    messages.push({ role: "user", content: body, timestamp: typeof evt.timestamp === "string" ? evt.timestamp : undefined });
-    return messages;
-  }
-
-  return [];
-}
-
-/**
- * Build an assistant-role delta Message[] from a message_sent event.
- *
- * OpenClaw message_sent event shape:
- *   { to?: string, content: string | ContentBlock[] | ContentBlock, success?: boolean, error?: string }
- *
- * Returns empty array when success !== true (caller should no-op).
- */
-export function buildMessageSentDelta(event: unknown): Message[] {
-  if (!event || typeof event !== "object") return [];
-
-  const evt = event as Record<string, unknown>;
-
-  // Only ingest on confirmed success
-  if (evt.success !== true) return [];
-
-  const content = evt.content;
-  if (content === undefined || content === null) return [];
-
-  return [{ role: "assistant", content }];
-}
-
-/**
- * Collect ALL available session/conversation keys from ctx.
- * Returns a deduplicated array of non-empty string keys found in ctx,
- * in priority order: sessionKey > conversationId > conversation.id > sessionId.
- */
-export function getAllConversationKeys(ctx: unknown): string[] {
-  if (!ctx || typeof ctx !== "object") return [];
-  const c = ctx as Record<string, unknown>;
-  const keys: string[] = [];
-  const seen = new Set<string>();
-
-  const tryAdd = (val: unknown) => {
-    if (typeof val === "string" && val.trim().length > 0) {
-      if (!seen.has(val)) {
-        seen.add(val);
-        keys.push(val);
-      }
-    }
-  };
-
-  tryAdd(c.sessionKey);
-  tryAdd(c.conversationId);
-  if (c.conversation && typeof c.conversation === "object") {
-    const conv = c.conversation as Record<string, unknown>;
-    tryAdd(conv.id);
-  }
-  tryAdd(c.sessionId);
-
-  return keys;
-}
-
-/**
- * Resolve a stable conversation/session key from the hook context.
- *
- * Priority:
- *   1. ctx.sessionKey (direct, set by before_dispatch)
- *   2. ctx.conversationId (used to look up SessionMappingCache entry)
- *   3. ctx.conversation?.id
- *   4. ctx.sessionId
- *   5. Fallback: null (caller should no-op)
- */
-export function normalizeConversationKey(ctx: unknown): string | null {
-  const allKeys = getAllConversationKeys(ctx);
-  return allKeys.length > 0 ? allKeys[0] : null;
-}
 
 export class EventSegmenter {
   private buffer: Message[] = [];
@@ -557,153 +387,6 @@ export class EventSegmenter {
     return false;
   }
 
-  /**
-   * Incremental ingest entry point for hook-driven payloads (v0.4.7).
-   *
-   * Unlike processTurn, this does NOT depend on lastProcessedLength or
-   * cumulative message history. It accepts a delta (single turn payload)
-   * and appends it to the buffer with dedup + boundary checks.
-   *
-   * Designed for before_dispatch / message_sent hook payloads where the
-   * full conversation history is not available.
-   *
-   * @param deltaMessages - new messages from a single hook event
-   * @param agentWs - agent workspace path
-   * @param agentId - agent identifier
-   * @param source - diagnostic source label (e.g. "before_dispatch", "message_sent")
-   */
-  async processIncrementalTurn(
-    deltaMessages: Message[],
-    agentWs: string,
-    agentId: string,
-    source: string = "hook",
-  ): Promise<boolean> {
-    if (deltaMessages.length === 0) {
-      console.log(`[Episodic Memory] processIncrementalTurn: empty delta from ${source}, skipping.`);
-      return false;
-    }
-
-    // Filter out excluded roles and summarize tool_use
-    const filteredMessages = deltaMessages
-      .filter(m => !EXCLUDED_ROLES.has(m.role))
-      .map(m => {
-        if (m.role === "tool_use") {
-          let toolNames: string[] = [];
-          if (Array.isArray(m.content)) {
-            toolNames = m.content
-              .filter((b: any) => b.type === "tool_use" && b.name)
-              .map((b: any) => b.name);
-          }
-          const namesStr = toolNames.length > 0 ? toolNames.join(", ") : "unknown_tool";
-          return { ...m, content: `[Tool Used: ${namesStr}]` };
-        }
-        return m;
-      });
-
-    // Dedup against recent buffer entries
-    const recentKeys = new Set(
-      this.buffer.slice(-this.dedupWindow).map(m => `${m.role}:${extractText(m.content).trim()}`)
-    );
-    const dedupedMessages = filteredMessages.filter(m => {
-      const text = extractText(m.content).trim();
-      if (!text) return false;
-      const key = `${m.role}:${text}`;
-      if (recentKeys.has(key)) return false;
-      recentKeys.add(key);
-      return true;
-    });
-    if (dedupedMessages.length === 0) {
-      console.log(`[Episodic Memory] processIncrementalTurn: all ${deltaMessages.length} message(s) were duplicates/empty from ${source}, skipping.`);
-      return false;
-    }
-
-    if (this.buffer.length === 0) {
-      // First turn, just absorb
-      this.buffer.push(...dedupedMessages);
-      this.scheduleIdleFlush(agentWs, agentId);
-      return false;
-    }
-
-    // Check time gap boundary
-    if (this.isTimeGapBoundary(dedupedMessages)) {
-      console.log(`[Episodic Memory] Time gap boundary detected (${this.segmentationTimeGapMinutes}min threshold) via ${source}. Forcing segment...`);
-      await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap");
-      this.buffer = [...dedupedMessages];
-      this.scheduleIdleFlush(agentWs, agentId);
-      return true;
-    }
-
-    // Compute surprise score for the incremental delta
-    const OLD_SLICE_MAX_CHARS = 3000;
-    const NEW_SLICE_MAX_CHARS = 2000;
-    const oldSlice = this.buffer.slice(-10)
-      .map(m => extractText(m.content))
-      .join("\n")
-      .slice(0, OLD_SLICE_MAX_CHARS);
-    const newSlice = dedupedMessages.slice(0, 5)
-      .map(m => extractText(m.content))
-      .join("\n")
-      .slice(0, NEW_SLICE_MAX_CHARS);
-
-    if (!newSlice) {
-      console.log(`[Episodic Memory] processIncrementalTurn: no text content from ${source}.`);
-      return false;
-    }
-
-    const estimatedChars = this.buffer.reduce((acc, m) => acc + extractText(m.content).length, 0);
-    const sizeLimitExceeded = estimatedChars > this.maxBufferChars;
-    this.turnSeq += 1;
-
-    try {
-      const score = await this.rpc.segmentScore({
-        agentWs,
-        agentId: agentId || "auto",
-        turn: this.turnSeq,
-        text1: oldSlice,
-        text2: newSlice,
-        lambda: this.getEffectiveLambda(),
-        warmupCount: this.segmentationWarmupCount,
-        minRawSurprise: this.segmentationMinRawSurprise,
-        cooldownTurns: this.segmentationCooldownTurns,
-        stdFloor: this.segmentationStdFloor,
-        fallbackThreshold: this.segmentationFallbackThreshold,
-      });
-
-      const surprise = score?.rawSurprise ?? 0;
-      const shouldBoundary = sizeLimitExceeded || !!score?.isBoundary;
-
-      if (shouldBoundary || this.turnSeq % 5 === 0) {
-        const mean = (score?.mean ?? 0).toFixed(4);
-        const std = (score?.std ?? 0).toFixed(4);
-        const th = (score?.threshold ?? 0).toFixed(4);
-        const z = (score?.z ?? 0).toFixed(2);
-        console.log(
-          `[Episodic Memory] SegmentScore (incremental/${source}): raw=${surprise.toFixed(4)} ` +
-          `mean=${mean} std=${std} threshold=${th} z=${z} ` +
-          `boundary=${shouldBoundary} reason=${score?.reason ?? "n/a"}`
-        );
-      }
-
-      if (shouldBoundary) {
-        const reason = sizeLimitExceeded ? "size-limit" : "surprise-boundary";
-        console.log(`[Episodic Memory] ${reason} exceeded (incremental/${source}). Finalizing previous episode...`);
-        this.handleSegmentBoundary(agentWs, agentId, surprise, reason).catch(err => {
-          console.error("[Episodic Memory] Error in segment boundary handling (incremental):", err);
-        });
-        this.buffer = [...dedupedMessages];
-        this.scheduleIdleFlush(agentWs, agentId);
-      } else {
-        this.buffer.push(...dedupedMessages);
-        this.scheduleIdleFlush(agentWs, agentId);
-      }
-      return true;
-    } catch (err) {
-      console.error(`[Episodic Memory] Error in processIncrementalTurn (${source}):`, err);
-      this.buffer.push(...dedupedMessages);
-      this.scheduleIdleFlush(agentWs, agentId);
-    }
-    return false;
-  }
 
   /**
    * Mode branching: pool+queue (v0.4.0 narrative) vs legacy chunkAndIngest (v0.3.x).
@@ -726,16 +409,13 @@ export class EventSegmenter {
     if (!this.pool || !this.narrativeWorker) return;
 
     const item = this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
-    // Clear segmenter buffer and idle flush timer; messages are now in the pool.
+    // Clear segmenter buffer and idle flush timer; data is now in the pool.
     this.buffer = [];
     this.lastProcessedLength = 0;
     this.clearIdleFlushTimer();
 
     if (item) {
-      // Flush occurred: clear pool buffer and process.
-      this.pool.clear();
-
-      // Split into 64K chunks and enqueue to cache DB
+      // Flush occurred: split and enqueue to cache DB
       // Preserve idle-timeout reason for observability — don't collapse it into size-limit
       const cacheReason = (
         reason === "idle-timeout" ? "idle-timeout" :
@@ -743,10 +423,20 @@ export class EventSegmenter {
         "size-limit"
       ) as "idle-timeout" | "surprise-boundary" | "size-limit";
       const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise);
-      // Pass wake callback to wake the worker from idle backoff
-      enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake()).catch(err =>
-        console.error("[Episodic Memory] Cache enqueue failed:", err)
-      );
+
+      // [v0.4.13] Defer pool.clear() until after enqueue confirmation
+      // (requires enqueueNarrativeChunks to re-throw errors — see Phase 0)
+      // Buffer/lastProcessedLength are cleared immediately above — data is already
+      // copied to pool via pool.add(this.buffer.slice(), ...), so no race with callers.
+      enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake())
+        .then(() => {
+          // Enqueue succeeded — safe to clear pool
+          this.pool!.clear();
+        })
+        .catch(err => {
+          console.error("[Episodic Memory] Cache enqueue failed:", err);
+          // Pool retains data for retry on next flush/forceFlush
+        });
     }
     // If item is null, pool is still buffering; do not clear it.
   }
@@ -776,12 +466,16 @@ export class EventSegmenter {
         // Pool mode (v0.4.2): add to pool, split, and enqueue to cache DB
         this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
         const item = this.pool.forceFlush(agentWs, agentId);
-        this.pool.clear();
         if (item) {
           const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0);
-          // Pass wake callback to wake the worker from idle backoff
+          // [v0.4.13] Await enqueue first, then clear pool — consistent with poolAndQueue semantics
           await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
         }
+        // [AUDIT NOTE] this.pool.clear() runs AFTER await enqueueNarrativeChunks() (fixed in v0.4.13).
+        // If enqueue throws, pool data is preserved — the outer try/catch skips this line.
+        // Pre-v0.4.13 had pool.clear() before the await, which was a data-loss risk on enqueue failure.
+        // [v0.4.13] Clear pool AFTER successful enqueue (data preserved on failure)
+        this.pool.clear();
         this.buffer = [];
         this.lastProcessedLength = 0;
         return;

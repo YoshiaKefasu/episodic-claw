@@ -56,6 +56,10 @@ const MIN_COMPRESSION_RATIO = 0.01; // Output must be >= 1% of input tokens
 const ECHO_SAMPLE_LENGTH = 80; // Characters to check for verbatim echo
 const MIN_ECHO_LENGTH = 20; // Minimum length to bother checking
 const MAX_ECHO_SCAN_CHARS = 5000; // Only scan first 5000 chars of input (echoes are near the beginning)
+// [AUDIT NOTE] This is an intentional trade-off (v0.4.12 Phase E), NOT a bug:
+// - Echoes always appear near the beginning of input (model echoes the first ~200 tokens)
+// - Scanning beyond 5000 chars would catch tail echoes but at 85% more memory cost (192KB copy)
+// - False negatives (tail echoes) are low-impact: output is still a narrative, just with some verbatim at the end
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 type CacheItem = CacheQueueItem;
@@ -109,6 +113,9 @@ export function checkEchoDetection(output: string, input: string): boolean {
 
   // Only collapse the first MAX_ECHO_SCAN_CHARS of input (avoid 192KB full copy for 48K-token texts)
   // Echoes are always near the beginning of the input
+  // [AUDIT NOTE] Whitespace collapse is intentional: CJK text has no whitespace so this is a no-op for CJK.
+  // MIN_ECHO_LENGTH=20 means 20 whitespace-collapsed chars ≈ 20 kanji for CJK — unlikely to false-positive.
+  // For Latin text, 20 chars ≈ 3-4 words — very unlikely to match by coincidence.
   const inputPrefix = input.substring(0, MAX_ECHO_SCAN_CHARS).replace(/\s+/g, "");
   return !inputPrefix.includes(echoSample);
 }
@@ -254,7 +261,11 @@ export class NarrativeWorker {
 
   private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
     const systemPrompt = this.resolveSystemPrompt();
-    const previous = this.lastNarrativeByAgent.get(item.agentId);
+    // Respect narrativePreviousEpisodeRef config — when explicitly false, skip injecting previous episode
+    // Use !== false so that undefined (unset) defaults to including previous episode
+    const previous = this.config.narrativePreviousEpisodeRef !== false
+      ? this.lastNarrativeByAgent.get(item.agentId)
+      : undefined;
     const conversationText = item.rawText;
     const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
 

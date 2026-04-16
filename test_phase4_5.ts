@@ -979,8 +979,8 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.4.11", "package.json version should be 0.4.11");
-  assert.equal(manifest.version, "0.4.11", "openclaw.plugin.json version should be 0.4.11");
+  assert.equal(pkg.version, "0.4.13", "package.json version should be 0.4.13");
+  assert.equal(manifest.version, "0.4.13", "openclaw.plugin.json version should be 0.4.13");
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"

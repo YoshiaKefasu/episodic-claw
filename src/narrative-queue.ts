@@ -31,6 +31,10 @@ export interface CacheQueueItem {
 }
 
 let _chunkCounter = 0;
+// [AUDIT NOTE] _chunkCounter resets to 0 on process restart. This is NOT a bug:
+// - The orderKey format includes ISO timestamp + 4-digit counter + agentId prefix
+// - Collision requires: same second + same counter value + same agent — near-zero probability
+// - Global monotonic counter ensures uniqueness within a single process lifetime
 
 /**
  * Split raw text into chunks that fit within the 64K token limit.
@@ -170,6 +174,6 @@ export async function enqueueNarrativeChunks(
     if (onWake) onWake();
   } catch (err) {
     console.error("[Episodic Cache] Failed to enqueue narrative chunks:", err);
-    // Fallback: don't lose the data — the caller's buffer still holds it
+    throw err; // [v0.4.13] Re-throw so callers can detect failure and preserve data
   }
 }

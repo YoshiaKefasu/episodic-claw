@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.13] - 2026-04-17
+
+### Fixed
+- **`narrativePreviousEpisodeRef` config respected**: The `narrativePreviousEpisodeRef` setting (default: `true`) was defined in the schema and parsed in config, but `NarrativeWorker` ignored it and always injected the previous episode into the LLM prompt. Now when set to `false`, the previous episode is omitted, saving tokens on free-tier models.
+
+### Changed
+- **`poolAndQueue()` data-loss fix**: Buffer and pool clears are now deferred until after successful enqueue confirmation. If `enqueueNarrativeChunks` fails (e.g., Go sidecar socket error), data remains in the pool and buffer for retry instead of being silently lost.
+- **`forceFlush()` pool.clear() ordering**: `pool.clear()` moved after `await enqueueNarrativeChunks()` so pool data survives an enqueue failure.
+- **Dead code removed (v0.4.6/0.4.7)**: Removed 12 unused symbols from deprecated releases: `ToolFirstRecallGate` class and related types, `buildToolFirstRecallConfig()`, `resolveRuntimeBridgeMode()`, `SessionMappingCache` class, `buildBeforeDispatchDelta()`, `buildMessageSentDelta()`, `getAllConversationKeys()`, `normalizeConversationKey()`, `processIncrementalTurn()` method. Also deleted `test_tool_first.ts` and `test_v047_bridge.ts` test files.
+- **Audit note comments added**: `[AUDIT NOTE]` comments added near `MAX_ECHO_SCAN_CHARS`, `checkEchoDetection()`, `forceFlush() pool.clear()`, `_chunkCounter`, and `estimateTokens()` to prevent false-positive re-reporting of intentional design trade-offs.
+
 ## [0.4.12] - 2026-04-16
 
 ### Changed

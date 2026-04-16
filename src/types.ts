@@ -137,8 +137,6 @@ export interface EpisodicPluginConfig {
     maxTokens?: number;
     exclude?: boolean;
   };
-  /** Runtime Bridge Mode master switch (v0.4.7). Controls whether the plugin uses the universal bridge (before_dispatch/message_sent) or legacy embedded path. Default: "auto". */
-  runtimeBridgeMode?: RuntimeBridgeMode;
 }
 
 export interface RecallCalibration {
@@ -227,38 +225,3 @@ export interface NarrativeResult {
   model: string;
 }
 
-// ─── Tool-first recall (v0.4.6) ─────────────────────────────────────────────
-
-export interface ToolFirstRecallConfig {
-  enabled: boolean;
-  k: number;
-  /** Max characters in a query fingerprint before truncation */
-  maxFingerprintChars: number;
-  /** Max entries in the negative cache (LRU eviction) */
-  negativeCacheMaxSize: number;
-  /** Backoff sequence in turns: [3, 6, 12] */
-  backoffTurns: number[];
-}
-
-export type ToolFirstGateResult =
-  | { pass: true; query: string; queryHash: string }
-  | { pass: false; skipReason: ToolFirstSkipReason };
-
-export type ToolFirstSkipReason =
-  | "novelty_fail"
-  | "intent_fail"
-  | "fingerprint_dup"
-  | "negative_cache_backoff"
-  | "disabled"
-  | "empty_query";
-
-export interface NegativeCacheEntry {
-  fingerprint: string;
-  noHitCount: number;
-  backoffUntilTurn: number;
-  lastSeenTurn: number;
-}
-
-// ─── Runtime Bridge Mode master switch (v0.4.7) ───────────────────────────────
-
-export type RuntimeBridgeMode = "auto" | "legacy_embedded" | "cli_universal";
