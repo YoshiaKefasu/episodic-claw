@@ -409,11 +409,6 @@ const PluginConfigSchema = Type.Object(
     narrativePreviousEpisodeRef: Type.Optional(Type.Boolean({
       description: "Pass the full previous episode to the LLM for context continuity. Default: true."
     })),
-    narrativeMaxTokens: Type.Optional(Type.Integer({
-      minimum: 256,
-      maximum: 32768,
-      description: "Deprecated: legacy alias for openrouterConfig.maxTokens. Use openrouterConfig.maxTokens instead."
-    })),
     narrativeTemperature: Type.Optional(Type.Number({
       minimum: 0,
       maximum: 1,
@@ -504,7 +499,6 @@ const episodicClawPlugin = {
           ? new OpenRouterClient({
               apiKey: cfg.openrouterApiKey,
               model: cfg.openrouterModel,
-              maxTokens: cfg.narrativeMaxTokens,
               temperature: cfg.narrativeTemperature,
               reasoning: cfg.openrouterReasoning,
             })

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.14] - 2026-04-17
+
+### Fixed
+- **`recallQueryRecentMessageCount` config now respected**: The `recallQueryRecentMessageCount` setting was defined in the schema and parsed by the type system, but `loadConfig()` never read it — causing the hardcoded default of 4 to always be used regardless of user configuration. Now properly parsed with clamping (1–12).
+- **`queryExcludedKeywords` config now respected**: The `queryExcludedKeywords` array was defined in the schema and type system, but `loadConfig()` never read it — causing user-specified stop words to never be added to the recall query filter. Now defaults to `[]`.
+
+### Changed
+- **`narrativeMaxTokens` removed (dead legacy)**: The flat `narrativeMaxTokens` field was marked "Deprecated" in the type system but accepted by the schema, creating a confusing contradiction. Since `openclaw.plugin.json` has `additionalProperties: false`, the flat field was always rejected by validation — only `openrouterConfig.maxTokens` worked. Removed the flat field from schema, types, and config to eliminate the dead code path. `max_tokens` is no longer sent to OpenRouter unless `openrouterConfig.maxTokens` is explicitly set, allowing the model's default context window.
+- **ORPHAN schema cleanup**: Removed `toolFirstRecall` and `runtimeBridgeMode` from `openclaw.plugin.json`, `index.ts` TypeBox schema, and `types.ts`. These were v0.4.6/v0.4.7 features whose code was deleted in v0.4.13 but whose schema definitions were left behind.
+
 ## [0.4.13] - 2026-04-17
 
 ### Fixed

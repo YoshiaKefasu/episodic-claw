@@ -93,11 +93,13 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
     recallTopicsMissingPenalty: rawConfig?.recallTopicsMissingPenalty ?? 0.0,
     recallReInjectionCooldownTurns: Math.max(0, rawConfig?.recallReInjectionCooldownTurns ?? 24),
     lexicalRebuildIntervalDays: rawConfig?.lexicalRebuildIntervalDays ?? 7,
+    // [v0.4.14] Recall query config — previously missing from loadConfig(), user settings were ignored
+    recallQueryRecentMessageCount: Math.max(1, Math.min(12, rawConfig?.recallQueryRecentMessageCount ?? 4)),
+    queryExcludedKeywords: rawConfig?.queryExcludedKeywords ?? [],
     // Narrative architecture (v0.4.0)
     openrouterApiKey: rawConfig?.openrouterApiKey || process.env.OPENROUTER_API_KEY || "",
     // openrouterConfig (nested) vs flat fields: nested takes precedence
     openrouterModel: rawConfig?.openrouterConfig?.model ?? rawConfig?.openrouterModel ?? "openrouter/free",
-    narrativeMaxTokens: rawConfig?.openrouterConfig?.maxTokens ?? rawConfig?.narrativeMaxTokens,
     narrativeTemperature: Math.max(0, Math.min(1, rawConfig?.openrouterConfig?.temperature ?? rawConfig?.narrativeTemperature ?? 0.4)),
     narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate),

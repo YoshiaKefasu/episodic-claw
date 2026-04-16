@@ -119,8 +119,6 @@ export interface EpisodicPluginConfig {
   maxPoolChars?: number;
   /** Pass the full previous episode to the LLM for context continuity. */
   narrativePreviousEpisodeRef?: boolean;
-  /** Deprecated: legacy alias for openrouterConfig.maxTokens. Use openrouterConfig.maxTokens instead. */
-  narrativeMaxTokens?: number;
   /** Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead. */
   narrativeTemperature?: number;
   /** Nested OpenRouter config for narrative generation. */
