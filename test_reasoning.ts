@@ -55,8 +55,8 @@ function testNormalizeDefaults() {
   assert.equal(result!.enabled, true);
   assert.equal(result!.effort, "high");
   assert.equal(result!.maxTokens, undefined);
-  assert.equal(result!.exclude, undefined);
-  console.log("  ✓ normalizeOpenRouterReasoning: defaults (enabled=true, effort=high)");
+  assert.equal(result!.exclude, true);
+  console.log("  ✓ normalizeOpenRouterReasoning: defaults (enabled=true, effort=high, exclude=true)");
 }
 
 function testNormalizeDisabled() {
@@ -144,8 +144,8 @@ function testNormalizeEmptyObject() {
   assert.equal(result!.enabled, true);
   assert.equal(result!.effort, "high", "empty object should default effort to high");
   assert.equal(result!.maxTokens, undefined);
-  assert.equal(result!.exclude, undefined);
-  console.log("  ✓ normalizeOpenRouterReasoning: empty object => enabled=true, effort=high");
+  assert.equal(result!.exclude, true);
+  console.log("  ✓ normalizeOpenRouterReasoning: empty object => enabled=true, effort=high, exclude=true");
 }
 
 function testNormalizeEnabledNoEffort() {

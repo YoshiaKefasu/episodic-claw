@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.17] - 2026-04-17
+
+### Fixed
+- **Narrative output assistant-mode collapse prevented (CRITICAL)**: Gemma free models were producing "helpful assistant" outputs instead of third-person narrative — bullet lists, numbered lists, Markdown headings, emojis, signatures, and CoT planning phrases leaked into the output. The old quality gate (v0.4.11) only checked compression ratio and verbatim echo, so assistant-mode outputs passed through silently. Worse, bad outputs were re-injected as `previousEpisode` in the next LLM call, causing cascading quality degradation. Three-axis fix applied:
+  - **Axis 1 (Prompt Architecture)**: `DEFAULT_SYSTEM_PROMPT` reduced from ~30 lines to 1-line role declaration. `DEFAULT_USER_PROMPT_TEMPLATE` redesigned as contract-first structure: rules at top with "HIGHEST PRIORITY" framing, explicit forbidden-phrase blacklist (English CoT starters + Japanese assistant phrases), `<<<LOG>>>`/`<<<END_LOG>>>` delimiters, and "Write narrative text only." output priming. Bad examples and Markdown symbols removed to prevent model mimicry.
+  - **Axis 2 (Reasoning Config)**: `normalizeOpenRouterReasoning()` now defaults `exclude: true` when not explicitly set to `false`. OpenRouter includes reasoning tokens in responses by default; Gemma models leak them without `<thinking>` tags. `openclaw.plugin.json` default also changed to `true`. This is the most reliable CoT prevention at the API level.
+  - **Axis 3 (Format Quality Gate)**: New `checkNarrativeFormat()` function with 5 regex-based gates: (1) Markdown headers/bullet/numbered lists, (2) English CoT planning phrases in first 100 chars, (3) Japanese assistant-mode phrases at start of first line only (`firstLine.trimStart().startsWith()`) to avoid False Positives on legitimate role-play dialogue mid-sentence, (4) Emoji/kaomoji, (5) first-line narrative-start validation. Failed outputs trigger retry with 500ms pause. `sanitizeNarrativeOutput()` also gained Step 2.5 CoT prefix stripping as a safety net.
+- **Custom prompts updated to contract-first**: Both `episodic_claw_narrative_system.md` and `episodic_claw_narrative_user.md` were restructured from long system-heavy prompts with `##` headings, numbered rules, and BAD examples into contract-first format matching Axis 1 design. The old system prompt's Markdown structure was being directly mimicked by weak models (especially Gemma free), producing the exact formatting violations it was trying to prevent.
+- **Go lint: unused parameter `apiKey` in `startSleepTimer()`**: Changed to `_ string` to satisfy `unusedparams` analyzer.
+
+### Changed
+- **Gate 3 (Japanese assistant phrases) scoped to first-line start**: Originally checked full text with `text.includes(phrase)`, which caused False Positives when a conversation character legitimately said "ありがとうございます" as role-play dialogue. Changed to `firstLine.trimStart().startsWith(phrase)` — assistant-mode collapse always starts the output with these phrases; legitimate narrative embeds them mid-sentence.
+
+### Added
+- **`checkNarrativeFormat()` quality gate (v0.4.17)**: 5-gate format validator for narrative output, integrated into `narrativizeWithRetry()` as Gate 3 (after compression ratio and echo detection).
+- **False Positive guard test**: Verifies that Japanese assistant phrases embedded mid-sentence as character dialogue are NOT rejected by the format gate.
+- **CoT prefix stripping in `sanitizeNarrativeOutput()`**: Step 2.5 safety net strips untagged reasoning prefixes like "Okay, let me..." before the narrative content.
+
 ## [0.4.16] - 2026-04-19
 
 ### Fixed

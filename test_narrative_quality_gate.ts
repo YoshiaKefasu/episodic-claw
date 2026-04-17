@@ -1,4 +1,4 @@
-import { sanitizeNarrativeOutput, checkCompressionRatio, checkEchoDetection } from "./src/narrative-worker";
+import { sanitizeNarrativeOutput, checkCompressionRatio, checkEchoDetection, checkNarrativeFormat } from "./src/narrative-worker";
 
 let passed = 0;
 let failed = 0;
@@ -110,6 +110,86 @@ assert(
   "v0.4.9 regression: strips <final> tags",
   sanitizeNarrativeOutput("<final>物語の本文</final>"),
   "物語の本文"
+);
+
+// [v0.4.17] sanitizeNarrativeOutput strips untagged CoT prefix
+assert(
+  "v0.4.17: strips untagged CoT prefix 'Okay, let me...'",
+  sanitizeNarrativeOutput("Okay, let me start by understanding the log.\nI need to parse this carefully.\n夜の作業机では、彼はログを追っていた。"),
+  "夜の作業机では、彼はログを追っていた。"
+);
+
+
+// --- checkNarrativeFormat (v0.4.17) ---
+console.log("\n[4] checkNarrativeFormat Tests (v0.4.17)");
+
+// CoT leakage detection
+assert(
+  "CoT prefix 'Okay, let me...' should be rejected",
+  checkNarrativeFormat("Okay, let me start by understanding the conversation log.\n夜の作業机では...").pass,
+  false
+);
+
+assert(
+  "CoT prefix 'First, I need to...' should be rejected",
+  checkNarrativeFormat("First, I need to parse the log.\nそれから...").pass,
+  false
+);
+
+// Assistant-mode detection
+assert(
+  "Bullet list should be rejected",
+  checkNarrativeFormat("- 開発の背景\n- CLIの安定化").pass,
+  false
+);
+
+assert(
+  "Numbered list should be rejected",
+  checkNarrativeFormat("1. CLIの安定化\n2. ベクトル化").pass,
+  false
+);
+
+assert(
+  "Markdown header should be rejected",
+  checkNarrativeFormat("# OpenClawのアップデート\n本文...").pass,
+  false
+);
+
+assert(
+  "Japanese assistant phrase 'ありがとうございます' at start should be rejected",
+  checkNarrativeFormat("ありがとうございます！このプロジェクトをまとめました。").pass,
+  false
+);
+
+assert(
+  "Japanese phrase mid-sentence (role-play) should NOT be rejected (False Positive guard)",
+  checkNarrativeFormat("彼は画面に向かって「ありがとうございます」と答え、次の作業に取りかかった。").pass,
+  true
+);
+
+assert(
+  "Emoji should be rejected",
+  checkNarrativeFormat("プロジェクトが完了した✨").pass,
+  false
+);
+
+// Valid narrative should pass
+assert(
+  "Valid narrative starting with CJK should pass",
+  checkNarrativeFormat("夜更けの作業机では、彼はログを追いながら次の手を探っていた。").pass,
+  true
+);
+
+assert(
+  "Valid narrative starting with time expression should pass",
+  checkNarrativeFormat("日曜の夕方、ヨシアはテストメッセージを送った。").pass,
+  true
+);
+
+assert(
+  "Valid narrative starting with lowercase Latin should pass",
+  checkNarrativeFormat("the evening sun cast long shadows across the desk.").pass,
+  true
 );
 
 

@@ -52,8 +52,9 @@ export function normalizeOpenRouterReasoning(
     effort = "high";
   }
 
-  // Rule d: include exclude only when true
-  if (raw.exclude === true) {
+  // Rule d [v0.4.17]: Default exclude=true for narrative path — prevents CoT token leakage into output
+  // Only disable if user explicitly sets exclude: false
+  if (raw.exclude !== false) {
     exclude = true;
   }
 

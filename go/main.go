@@ -38,12 +38,12 @@ var (
 	lexicalLimit           *int
 	lexicalRebuildInterval *int
 
-	storeMutex      sync.Mutex
-	isReplaying     int32
-	writeMu         sync.Mutex // Atomize writes to net.Conn
-	vectorStores    = make(map[string]*vector.Store)
-	cacheQueues     = make(map[string]*cache.Queue) // agentWs -> cache queue
-	cacheQueuesMu   sync.Mutex
+	storeMutex    sync.Mutex
+	isReplaying   int32
+	writeMu       sync.Mutex // Atomize writes to net.Conn
+	vectorStores  = make(map[string]*vector.Store)
+	cacheQueues   = make(map[string]*cache.Queue) // agentWs -> cache queue
+	cacheQueuesMu sync.Mutex
 
 	// Global rate limiters to respect Google AI Studio quotas across all handlers
 	gemmaLimiter     = rate.NewLimiter(rate.Limit(15.0/60.0), 5)   // 15 RPM
@@ -1880,8 +1880,8 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	}
 	// H-3: Reduced TTL (2h -> 30min) + probe-based recovery
 	const heal429Threshold = 3
-	const heal429TTL = 30 * time.Minute  // was 2h
-	const heal429ProbeCount = 5           // After TTL expiry, only try 5 files before full recovery
+	const heal429TTL = 30 * time.Minute // was 2h
+	const heal429ProbeCount = 5         // After TTL expiry, only try 5 files before full recovery
 
 	var h429 heal429State
 	if raw, closer, metaErr := vstore.GetRawMeta([]byte("meta:heal_429_state")); metaErr == nil {
@@ -1892,7 +1892,7 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	if h429.Count > 0 && time.Since(h429.Since) > heal429TTL {
 		EmitLog("HealingWorker: heal_429 TTL expired (%s elapsed). Entering probe mode (%d files).",
 			time.Since(h429.Since).Round(time.Minute), heal429ProbeCount)
-		h429.Count = 0  // Reset counter, will re-accumulate during probe
+		h429.Count = 0 // Reset counter, will re-accumulate during probe
 		h429.Since = time.Now()
 		if raw, _ := json.Marshal(h429); raw != nil {
 			vstore.SetMeta("heal_429_state", raw) //nolint:errcheck
@@ -2528,7 +2528,7 @@ func startWatchdog() {
 	}()
 }
 
-func startSleepTimer(apiKey string) {
+func startSleepTimer(_ string) {
 	ticker := time.NewTicker(2 * time.Minute)
 	go func() {
 		for range ticker.C {

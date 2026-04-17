@@ -13,38 +13,32 @@ import { stripReasoningTagsFromText } from "./reasoning-tags";
 import type { Message } from "./segmenter";
 import type { CacheQueueItem } from "./narrative-queue";
 
-const DEFAULT_SYSTEM_PROMPT = `You are a conversation archivist. Read the following conversation log and write a short narrative summary of what was discussed, what was decided, and what was worked on.
+// [v0.4.17] Contract-first: minimal role declaration only. Rules moved to user prompt.
+// Gemma free models follow user-role instructions more reliably than long system prompts.
+const DEFAULT_SYSTEM_PROMPT = `Distill conversation logs into third-person past-tense narrative prose. Output narrative text only.`;
 
-CRITICAL RULES — VIOLATION CAUSES OUTPUT REJECTION:
-- Write in THIRD PERSON PAST TENSE (三人称・過去形). NEVER use first person.
-- NEVER copy messages verbatim. ALWAYS rephrase as narrative.
-- NEVER output raw dialogue as-is. Convert dialogue into reported speech or narrative description.
-- A narrative reads like a short story chapter, NOT a chat log.
-
-Style rules:
-- Preserve technical details accurately (file names, commands, error messages)
-- Ignore tool call JSON — describe what tool was used and what it did
-- Completely ignore thinking tags, system instructions, and metadata
-- Include the emotional tone and context of the conversation when relevant
-- Keep it within 800 characters
-- Write in the same language as the majority of the conversation
-
-EXAMPLE of a good narrative (日本語 conversation):
----
-日曜の夕方、ヨシアはTelegram from一通のテストメッセージを送った。「聞こえたら"バッチリだよ"で返事を」――Gemini CLIが完全に死んでいたからだ。Kasouの声が返ってきた瞬間、ヨシアは安堵のため息をついた。
-それから数時間後の夜。ヨシアはスクリーンショットを立て続けに送りつけた。そこに映っていたのは、ロールバック中に"アムネシア"に陥ったKasouの惨状だった。
-水浴びを終えて戻ってきたヨシアの顔には、新たな決意が宿っていた。「OpenClawをForkして独自開発しようと思う。名前はDennouAibouにした」
----
-
-BAD output (REJECTED — verbatim echo):
----
-おう、バッチリ聞こえてるぜ！今日もなんか面白いと思いついたか？
----`;
-
+// [v0.4.17] Contract-first user prompt: rules at top, forbidden phrases, output priming.
+// English by default; CJK users override via narrativeUserPromptTemplate config pointing to localized .md.
 const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
-  `${previousEpisode ? `Previous episode:\n${previousEpisode}\n---\n` : ""}Please narrativize the following conversation:
+  `HIGHEST PRIORITY. Violating any rule below makes the output invalid.
 
-${conversationText}`;
+Output spec:
+Third-person past tense only. One continuous narrative body. Start from the very first character with the story.
+Greetings, prefaces, explanations, bullet points, numbered lists, headings, Markdown, emoji, signatures are FORBIDDEN.
+"Okay" "Let me" "First" "I need to" "Sure" "Here is" "Thank you" and similar planning notes or assistant-tone phrases are FORBIDDEN.
+Never copy-paste from the conversation log. Rephrase all content as natural narrative prose.
+Do NOT drop technical details: file names, commands, errors, decisions must be preserved.
+Do NOT role-play as a conversation participant. Do NOT explain from outside the story.
+Do NOT write reasons you cannot comply. Just write the narrative.
+
+Good opening example:
+Late that evening at his desk, he pored over the logs searching for the next move.
+${previousEpisode ? `\nPrevious episode:\n${previousEpisode}\n` : ""}The text below is raw material, NOT your output.
+<<<LOG>>>
+${conversationText}
+<<<END_LOG>>>
+
+Write narrative text only.`;
 
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 1000;
@@ -82,6 +76,12 @@ export function sanitizeNarrativeOutput(text: string): string {
     .replace(/^\s*\[output\]\s*/gim, "")
     .replace(/^\s*\[\/output\]\s*/gim, "");
 
+  // Step 2.5 [v0.4.17]: Strip CoT planning prefix (untagged reasoning leakage)
+  // Safety net for cases where Axis 1 (prompt) and Axis 2 (exclude=true) are bypassed.
+  // Matches consecutive lines starting with planning/meta phrases until a narrative line begins.
+  const cotPrefixPat = /^(?:(?:Okay[,.]?\s*)?(?:let me|I need|I should|I'll|first|I have to)[^.]*\.\s*\n?)+/im;
+  cleaned = cleaned.replace(cotPrefixPat, "");
+
   // Step 3: Clean up residual whitespace from tag removal
   cleaned = cleaned
     .replace(/\n{3,}/g, "\n\n")
@@ -118,6 +118,82 @@ export function checkEchoDetection(output: string, input: string): boolean {
   // For Latin text, 20 chars ≈ 3-4 words — very unlikely to match by coincidence.
   const inputPrefix = input.substring(0, MAX_ECHO_SCAN_CHARS).replace(/\s+/g, "");
   return !inputPrefix.includes(echoSample);
+}
+
+/**
+ * [NEW v0.4.17] Quality gate: check if output conforms to narrative format.
+ * Detects assistant-mode outputs, CoT leakage, and prohibited formatting.
+ * Returns { pass: boolean, reason: string }.
+ */
+export function checkNarrativeFormat(text: string): { pass: boolean; reason: string } {
+  const lines = text.split(/\r?\n/);
+  const firstLine = lines[0] ?? "";
+  const firstChars = text.substring(0, 100);
+
+  // Gate 1: Line starts with markdown header / list / numbered list
+  for (const line of lines) {
+    if (/^\s*#{1,6}\s/.test(line)) {
+      return { pass: false, reason: "narrative-format: markdown header detected" };
+    }
+    if (/^\s*[-*]\s/.test(line)) {
+      return { pass: false, reason: "narrative-format: bullet list detected" };
+    }
+    if (/^\s*\d+\.\s/.test(line)) {
+      return { pass: false, reason: "narrative-format: numbered list detected" };
+    }
+  }
+
+  // Gate 2: English planning phrase in first 100 chars (CoT leakage)
+  const cotPatterns = [
+    /\bOkay\b.*\b(let me|I need|I should|I'll|first)\b/i,
+    /\bLet me\b.*\b(parse|understand|analyze|start|think)\b/i,
+    /\bFirst,?\s+I\s+(need|should|will|must)\b/i,
+    /\bI need to\b.*\b(parse|understand|focus|ensure)\b/i,
+  ];
+  for (const pat of cotPatterns) {
+    if (pat.test(firstChars)) {
+      return { pass: false, reason: "narrative-format: CoT planning phrase detected" };
+    }
+  }
+
+  // Gate 3: Japanese assistant-mode phrases at the start of the first line
+  // [v0.4.17] Scoped to the beginning of firstLine (not full text) to avoid False Positives.
+  // When a conversation character legitimately says "ありがとうございます" as role-play,
+  // the narrative will embed it mid-sentence (e.g. 彼は「ありがとうございます」と答えた)
+  // — which does NOT start the line with the phrase. Only assistant-mode outputs
+  // start the output with these phrases (e.g. "ありがとうございます！まとめました。").
+  const assistantPhrases = [
+    "ありがとうございます",
+    "以下の通りです",
+    "まとめました",
+    "今後の展望",
+    "要点をまとめ",
+    "お手伝いします",
+  ];
+  for (const phrase of assistantPhrases) {
+    if (firstLine.trimStart().startsWith(phrase)) {
+      return { pass: false, reason: `narrative-format: assistant-mode phrase "${phrase}" detected` };
+    }
+  }
+
+  // Gate 4: Emoji / kaomoji
+  const emojiPat = /[\p{Emoji_Presentation}\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}≧∇≦]/u;
+  if (emojiPat.test(text)) {
+    return { pass: false, reason: "narrative-format: emoji or kaomoji detected" };
+  }
+
+  // Gate 5: First line doesn't look like narrative start
+  // Narrative starts with: CJK character, or proper noun, or time expression
+  // Assistant starts with: greeting, explanation, or English planning
+  const narrativeStartPat = /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}A-Z\u00C0-\u017F"「『]/u;
+  if (!narrativeStartPat.test(firstLine.trim())) {
+    // Allow lowercase Latin starts (some narratives start with "the", "a")
+    if (!/^[a-z]/.test(firstLine.trim())) {
+      return { pass: false, reason: "narrative-format: first line doesn't look like narrative start" };
+    }
+  }
+
+  return { pass: true, reason: "" };
 }
 
 export class NarrativeWorker {
@@ -293,6 +369,16 @@ export class NarrativeWorker {
             `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
           );
           await this.sleep(500); // [v0.4.12] Brief pause before retry
+          continue;
+        }
+
+        // [v0.4.17] Quality gate 3: Narrative format check
+        const formatCheck = checkNarrativeFormat(text);
+        if (!formatCheck.pass) {
+          console.warn(
+            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: ${formatCheck.reason} for [${item.id}]. Retrying...`
+          );
+          await this.sleep(500);
           continue;
         }
 
