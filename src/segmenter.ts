@@ -34,10 +34,6 @@ export class EventSegmenter {
   private dedupWindow: number;
   private maxBufferChars: number;
   private maxCharsPerChunk: number;
-  private segCount = 0;
-  private segMean = 0;
-  private segM2 = 0;
-  private segCooldownRemaining = 0;
   private segmentationLambda: number;
   private segmentationWarmupCount: number;
   private segmentationMinRawSurprise: number;
@@ -154,27 +150,6 @@ export class EventSegmenter {
     return true;
   }
 
-  private updateSegStats(value: number): void {
-    this.segCount += 1;
-    const delta = value - this.segMean;
-    this.segMean += delta / this.segCount;
-    const delta2 = value - this.segMean;
-    this.segM2 += delta * delta2;
-  }
-
-  private getSegStd(): number {
-    if (this.segCount < 2) return this.segmentationStdFloor;
-    const variance = this.segM2 / (this.segCount - 1);
-    return Math.max(Math.sqrt(Math.max(variance, 0)), this.segmentationStdFloor);
-  }
-
-  private shrinkSegStats(): void {
-    if (this.segCount <= 1) return;
-    const shrink = 0.5;
-    this.segCount = Math.max(1, Math.floor(this.segCount * shrink));
-    this.segM2 *= shrink;
-  }
-
   /**
    * Phase 3: Detect time gap between user messages.
    * Compares the last user message in the buffer with the first user message in the new batch.
@@ -195,15 +170,6 @@ export class EventSegmenter {
     const gapMs = firstTs - lastTs;
     const thresholdMs = this.segmentationTimeGapMinutes * 60 * 1000;
     return gapMs > thresholdMs;
-  }
-
-  /**
-   * Phase 3: Simple adaptive lambda — 2-tier (KISS).
-   * Short sessions (<10 turns) use lower lambda for better sensitivity.
-   */
-  private getEffectiveLambda(): number {
-    if (this.segCount < 10) return Math.min(1.5, this.segmentationLambda);
-    return this.segmentationLambda;
   }
 
   /**
@@ -331,7 +297,7 @@ export class EventSegmenter {
         turn: this.turnSeq,
         text1: oldSlice,
         text2: newSlice,
-        lambda: this.getEffectiveLambda(),
+        lambda: this.segmentationLambda,
         warmupCount: this.segmentationWarmupCount,
         minRawSurprise: this.segmentationMinRawSurprise,
         cooldownTurns: this.segmentationCooldownTurns,

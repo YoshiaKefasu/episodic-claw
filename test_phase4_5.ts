@@ -979,8 +979,12 @@ async function main() {
   const storeSource = fs.readFileSync(path.resolve("go", "internal", "vector", "store.go"), "utf8");
   const mainGoSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
 
-  assert.equal(pkg.version, "0.4.14", "package.json version should be 0.4.14");
-  assert.equal(manifest.version, "0.4.14", "openclaw.plugin.json version should be 0.4.14");
+  // Version consistency check — dynamically reads package.json and verifies openclaw.plugin.json matches.
+  // This avoids hardcoding a specific version that breaks every release bump.
+  const expectedVersion = pkg.version;
+  assert.ok(expectedVersion, "package.json should have a version field");
+  assert.equal(manifest.version, expectedVersion,
+    `openclaw.plugin.json version (${manifest.version}) should match package.json version (${expectedVersion})`);
   assert.ok(
     !("contextThreshold" in (manifest.configSchema as any).properties),
     "openclaw.plugin.json should no longer expose contextThreshold"

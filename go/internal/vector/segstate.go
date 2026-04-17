@@ -50,6 +50,20 @@ func (s *Store) GetSegmentationState(agentId string) (SegmentationState, error) 
 	return st, nil
 }
 
+// ShouldCooldownSuppress determines whether a boundary detection should be suppressed
+// by cooldown logic. Returns true if the boundary should be suppressed.
+//
+// The delta guard (delta >= 0) prevents negative deltas caused by TS process restart
+// (which resets turnSeq to 0) from incorrectly suppressing boundaries when
+// LastBoundaryTurn is persisted in Pebble DB.
+func ShouldCooldownSuppress(turn, lastBoundaryTurn, cooldown int) bool {
+	if cooldown <= 0 || lastBoundaryTurn <= 0 || turn <= 0 {
+		return false
+	}
+	delta := turn - lastBoundaryTurn
+	return delta >= 0 && delta <= cooldown
+}
+
 func (s *Store) PutSegmentationState(agentId string, st SegmentationState) error {
 	if agentId == "" {
 		agentId = "auto"

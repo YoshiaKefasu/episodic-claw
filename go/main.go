@@ -815,7 +815,7 @@ func handleGetLatestNarrative(conn net.Conn, req RPCRequest) {
 	}
 
 	// Fallback: scan the episodes directory directly (works even if no cache queue was created yet)
-	episodeID, body, found, err := scanLatestNarrativeEpisode(params.AgentWs, params.AgentID)
+	episodeID, body, found, err := scanLatestNarrativeEpisode(params.AgentWs)
 	if err != nil {
 		EmitLog("[CacheQueue] scanLatestNarrativeEpisode error for %s: %v", params.AgentWs, err)
 	}
@@ -835,7 +835,7 @@ func handleGetLatestNarrative(conn net.Conn, req RPCRequest) {
 
 // scanLatestNarrativeEpisode scans the episodes directory for the latest narrative-tagged episode.
 // This is used as a fallback when the cache queue hasn't been initialized yet (e.g., at startup).
-func scanLatestNarrativeEpisode(agentWs, agentID string) (episodeID string, body string, found bool, err error) {
+func scanLatestNarrativeEpisode(agentWs string) (episodeID string, body string, found bool, err error) {
 	type epInfo struct {
 		id   string
 		time time.Time
@@ -1331,7 +1331,10 @@ func handleSegmentScore(conn net.Conn, req RPCRequest) {
 		return
 	}
 
-	st, _ := vstore.GetSegmentationState(params.AgentId)
+	st, getErr := vstore.GetSegmentationState(params.AgentId)
+	if getErr != nil {
+		logger.Warn(logger.CatStore, "GetSegmentationState failed for agent %s (falling back to zero-value warmup): %v", params.AgentId, getErr)
+	}
 
 	// Decision uses the current state (pre-update).
 	fallback := params.FallbackThreshold
@@ -1389,11 +1392,9 @@ func handleSegmentScore(conn net.Conn, req RPCRequest) {
 	isBoundary := false
 	if !inWarmup {
 		isBoundary = raw >= minRaw && raw > threshold
-		if isBoundary && cooldown > 0 && st.LastBoundaryTurn > 0 && params.Turn > 0 {
-			if params.Turn-st.LastBoundaryTurn <= cooldown {
-				isBoundary = false
-				reason = "cooldown"
-			}
+		if isBoundary && vector.ShouldCooldownSuppress(params.Turn, st.LastBoundaryTurn, cooldown) {
+			isBoundary = false
+			reason = "cooldown"
 		}
 		if !isBoundary && reason == "surprise-z" {
 			reason = "below-threshold"
@@ -1430,7 +1431,9 @@ func handleSegmentScore(conn net.Conn, req RPCRequest) {
 	if isBoundary && params.Turn > 0 {
 		st.LastBoundaryTurn = params.Turn
 	}
-	_ = vstore.PutSegmentationState(params.AgentId, st)
+	if putErr := vstore.PutSegmentationState(params.AgentId, st); putErr != nil {
+		logger.Warn(logger.CatStore, "PutSegmentationState failed for agent %s (state update lost): %v", params.AgentId, putErr)
+	}
 
 	sendResponse(conn, RPCResponse{
 		JSONRPC: "2.0",
@@ -2538,7 +2541,7 @@ func startSleepTimer(apiKey string) {
 
 			// Check all active workspaces
 			for agentWs, vstore := range snapshot {
-				checkSleepThreshold(agentWs, vstore, apiKey)
+				checkSleepThreshold(agentWs, vstore)
 			}
 		}
 	}()
@@ -2586,7 +2589,7 @@ func checkReplayThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 	}(agentWs, vstore)
 }
 
-func checkSleepThreshold(agentWs string, vstore *vector.Store, apiKey string) {
+func checkSleepThreshold(agentWs string, vstore *vector.Store) {
 	val, closer, err := vstore.GetRawMeta([]byte("meta:last_activity"))
 	if err != nil {
 		if closer != nil {

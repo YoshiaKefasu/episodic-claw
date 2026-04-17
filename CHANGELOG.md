@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.16] - 2026-04-19
+
+### Fixed
+- **Segmentation lambda now correctly passes configured value to Go sidecar (CRITICAL)**: `segmenter.ts` had a Welford online statistics implementation (`segCount`, `segMean`, `segM2`, `updateSegStats()`, `getSegStd()`, `shrinkSegStats()`) that was never called, leaving `segCount` permanently at 0. This caused `getEffectiveLambda()` to always return `min(1.5, configuredLambda)` instead of the configured `segmentationLambda` (default 2.0). The RPC call `lambda: this.getEffectiveLambda()` was changed to `lambda: this.segmentationLambda`, restoring the intended `mean + 2.0×std` surprise threshold. All 3 fields and 4 methods were removed as dead code.
+- **Cooldown negative-delta guard prevents post-restart boundary suppression**: After a TS process restart, `turnSeq` resets to 0 while Go persists `LastBoundaryTurn` in Pebble DB. This produced negative deltas (`Turn - LastBoundaryTurn < 0`) that incorrectly triggered cooldown suppression, blocking all boundary detection until the turn counter caught up. The cooldown logic now explicitly checks `delta >= 0 && delta <= cooldown` via the extracted `ShouldCooldownSuppress()` function.
+- **GetSegmentationState / PutSegmentationState errors now logged**: Previously silently ignored, Pebble I/O errors (disk full, permission denied) are now logged at WARN level via `logger.Warn(logger.CatStore, ...)`. The zero-value fallback (warmup mode) remains safe; the logs make failures observable for ops.
+
+### Changed
+- **Cooldown logic extracted to `ShouldCooldownSuppress()` pure function**: The inline cooldown block in `handleSegmentScore()` was extracted into `ShouldCooldownSuppress(turn, lastBoundaryTurn, cooldown int) bool` in `segstate.go`, establishing a single source of truth shared by both production code and regression tests.
+- **Unused function parameters removed**: `scanLatestNarrativeEpisode(agentWs, agentID)` → `scanLatestNarrativeEpisode(agentWs)` and `checkSleepThreshold(agentWs, vstore, apiKey)` → `checkSleepThreshold(agentWs, vstore)`. The `agentID` parameter was never used in the function body; `apiKey` was a leftover from the disabled D1 consolidation pipeline.
+- **Version check in test suite made dynamic**: `test_phase4_5.ts` previously hardcoded `assert.equal(pkg.version, "0.4.14")`, causing `npm test` to fail on every version bump. Now reads `pkg.version` from `package.json` and verifies `openclaw.plugin.json` matches, eliminating recurrent test breakage.
+
+### Added
+- **Cooldown delta regression tests (`cooldown_delta_test.go`)**: 11 table-driven test cases covering negative delta (restart), zero delta (same-turn re-detection), positive within/beyond cooldown, large negative, zero turn, zero LastBoundaryTurn, disabled cooldown (0/-1), and exact boundary. Also includes a test verifying the pre-v0.4.16b behavior (no `delta >= 0` guard) would have suppressed boundaries on negative deltas.
+
 ## [0.4.15] - 2026-04-17
 
 ### Fixed
