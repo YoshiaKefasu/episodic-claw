@@ -16,7 +16,7 @@ function clampUnitInterval(value: unknown, fallback: number): number {
  *  a. enabled===false => return undefined (do not send reasoning)
  *  b. if maxTokens and effort both present, prefer maxTokens and drop effort
  *  c. map maxTokens to normalized maxTokens (reject <=0 or non-integer)
- *  d. include exclude only when true
+ *  d. Default exclude=true for narrative path — prevents CoT token leakage into output. Only omit when user explicitly sets exclude: false
  *  e. invalid maxTokens (<=0 or non-integer) treated as unset
  */
 export function normalizeOpenRouterReasoning(

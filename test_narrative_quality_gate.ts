@@ -193,5 +193,60 @@ assert(
 );
 
 
+// --- v0.4.18 False Positive regression tests ---
+console.log("\n[5] v0.4.18 False Positive Regression Tests");
+
+// Fix 1: cotPrefixPat should NOT strip legitimate narrative starting with "First"
+assert(
+  "v0.4.18: 'First, he walked...' is NOT stripped by sanitizeNarrativeOutput",
+  sanitizeNarrativeOutput("First, he walked to the store. The rain was heavy."),
+  "First, he walked to the store. The rain was heavy."
+);
+
+assert(
+  "v0.4.18: 'First the rain came...' is NOT stripped by sanitizeNarrativeOutput",
+  sanitizeNarrativeOutput("First the rain came, then the wind. He hurried inside."),
+  "First the rain came, then the wind. He hurried inside."
+);
+
+assert(
+  "v0.4.18: 'First, I need to...' IS still stripped by sanitizeNarrativeOutput (CoT)",
+  sanitizeNarrativeOutput("First, I need to parse the log.\n夜の作業机では、彼はログを追っていた。"),
+  "夜の作業机では、彼はログを追っていた。"
+);
+
+// Fix 2: narrativeStartPat should accept digit-starting narratives
+assert(
+  "v0.4.18: '2026年の冬、' starts with digit and should pass checkNarrativeFormat",
+  checkNarrativeFormat("2026年の冬、彼は新しいプロジェクトに着手した。").pass,
+  true
+);
+
+assert(
+  "v0.4.18: '3月15日、' starts with digit and should pass checkNarrativeFormat",
+  checkNarrativeFormat("3月15日、ヨシアは設計図を描き始めた。").pass,
+  true
+);
+
+assert(
+  "v0.4.18: '5年前のあの日、' starts with digit and should pass checkNarrativeFormat",
+  checkNarrativeFormat("5年前のあの日、すべてが変わった。").pass,
+  true
+);
+
+// Fix 3: emojiPat should NOT flag standalone '≧' in technical context
+assert(
+  "v0.4.18: 'delta ≧ 0' technical notation should pass checkNarrativeFormat",
+  checkNarrativeFormat("彼は条件 delta ≧ 0 を確認し、処理を続行した。").pass,
+  true
+);
+
+// Fix 3 regression: full kaomoji '≧∇≦' should STILL be rejected
+assert(
+  "v0.4.18: '≧∇≦' kaomoji should still be rejected",
+  checkNarrativeFormat("お疲れ様でした≧∇≦").pass,
+  false
+);
+
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

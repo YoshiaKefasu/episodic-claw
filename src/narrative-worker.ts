@@ -79,7 +79,7 @@ export function sanitizeNarrativeOutput(text: string): string {
   // Step 2.5 [v0.4.17]: Strip CoT planning prefix (untagged reasoning leakage)
   // Safety net for cases where Axis 1 (prompt) and Axis 2 (exclude=true) are bypassed.
   // Matches consecutive lines starting with planning/meta phrases until a narrative line begins.
-  const cotPrefixPat = /^(?:(?:Okay[,.]?\s*)?(?:let me|I need|I should|I'll|first|I have to)[^.]*\.\s*\n?)+/im;
+  const cotPrefixPat = /^(?:(?:Okay[,.]?\s*)?(?:let me|I need|I should|I'll|first,?\s+I|I have to)[^.]*\.\s*\n?)+/im;
   cleaned = cleaned.replace(cotPrefixPat, "");
 
   // Step 3: Clean up residual whitespace from tag removal
@@ -177,7 +177,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
   }
 
   // Gate 4: Emoji / kaomoji
-  const emojiPat = /[\p{Emoji_Presentation}\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}≧∇≦]/u;
+  const emojiPat = /[\p{Emoji_Presentation}\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]|≧∇≦/u;
   if (emojiPat.test(text)) {
     return { pass: false, reason: "narrative-format: emoji or kaomoji detected" };
   }
@@ -185,7 +185,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
   // Gate 5: First line doesn't look like narrative start
   // Narrative starts with: CJK character, or proper noun, or time expression
   // Assistant starts with: greeting, explanation, or English planning
-  const narrativeStartPat = /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}A-Z\u00C0-\u017F"「『]/u;
+  const narrativeStartPat = /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}0-9A-Z\u00C0-\u017F"「『]/u;
   if (!narrativeStartPat.test(firstLine.trim())) {
     // Allow lowercase Latin starts (some narratives start with "the", "a")
     if (!/^[a-z]/.test(firstLine.trim())) {

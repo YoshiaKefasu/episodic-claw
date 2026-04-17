@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.18] - 2026-04-20
+
+### Fixed
+- **`cotPrefixPat` over-match: `first` stripped legitimate narrative**: The `sanitizeNarrativeOutput()` Step 2.5 pattern matched standalone `first`, deleting valid narrative lines like "First, he walked to the store." Changed `first` → `first,?\s+I` so only first-person CoT phrases ("First, I need to...") are stripped; third-person narrative ("First, he...") is preserved.
+- **`narrativeStartPat` rejected digit-starting narratives**: Gate 5 character class lacked `0-9`, causing date-opened narratives like "2026年の冬、" and "3月15日、" to be rejected by the format gate. Added `0-9` to the character class. Digit-starting assistant output is practically nonexistent, so no false-negative risk.
+- **`emojiPat` individual kaomoji character false positive**: `≧∇≦` inside `[...]` character class matched `≧`, `∇`, `≦` individually, flagging technical notation like "delta ≧ 0" as emoji. Moved `≧∇≦` from character class to alternation (`|≧∇≦`) so only the full 3-character kaomoji triggers rejection.
+- **CHANGELOG v0.4.16 date was future-dated**: `2026-04-19` corrected to `2026-04-17` (actual release date).
+- **`normalizeOpenRouterReasoning()` Rule d JSDoc updated**: Comment was stale (`"include exclude only when true"`) while code had long since changed to `raw.exclude !== false` (defaulting `exclude: true`). JSDoc now accurately reflects the v0.4.17 default behavior: "Default exclude=true for narrative path — prevents CoT token leakage into output. Only omit when user explicitly sets exclude: false."
+
 ## [0.4.17] - 2026-04-17
 
 ### Fixed
@@ -18,7 +27,7 @@
 - **False Positive guard test**: Verifies that Japanese assistant phrases embedded mid-sentence as character dialogue are NOT rejected by the format gate.
 - **CoT prefix stripping in `sanitizeNarrativeOutput()`**: Step 2.5 safety net strips untagged reasoning prefixes like "Okay, let me..." before the narrative content.
 
-## [0.4.16] - 2026-04-19
+## [0.4.16] - 2026-04-17
 
 ### Fixed
 - **Segmentation lambda now correctly passes configured value to Go sidecar (CRITICAL)**: `segmenter.ts` had a Welford online statistics implementation (`segCount`, `segMean`, `segM2`, `updateSegStats()`, `getSegStd()`, `shrinkSegStats()`) that was never called, leaving `segCount` permanently at 0. This caused `getEffectiveLambda()` to always return `min(1.5, configuredLambda)` instead of the configured `segmentationLambda` (default 2.0). The RPC call `lambda: this.getEffectiveLambda()` was changed to `lambda: this.segmentationLambda`, restoring the intended `mean + 2.0×std` surprise threshold. All 3 fields and 4 methods were removed as dead code.
