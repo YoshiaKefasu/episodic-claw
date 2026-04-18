@@ -57,8 +57,15 @@ export class NarrativePool {
   }
 
   private buildFlushItem(reason: PoolFlushItem["reason"], surprise: number, agentWs: string, agentId: string): PoolFlushItem {
+    // [v0.4.19b] Role labels for conversation-boundary-aware chunking + narrative model context
+    // Format: "role: text" — only for primary conversation roles (user, assistant)
     const rawText = this.buffer
-      .map((m) => extractText(m.content))
+      .map((m) => {
+        const text = extractText(m.content);
+        if (!text) return "";
+        const role = m.role === "user" || m.role === "assistant" ? m.role : null;
+        return role ? `${role}: ${text}` : text;
+      })
       .filter(Boolean)
       .join("\n");
 

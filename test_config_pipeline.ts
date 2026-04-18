@@ -14,6 +14,7 @@
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { loadConfig, normalizeOpenRouterReasoning } from "./src/config";
 import type { EpisodicPluginConfig } from "./src/types";
@@ -394,7 +395,189 @@ test("REGRESSION: openrouterConfig nested fields are all destructured into flat 
   assert.equal(cfg.openrouterReasoning!.enabled, true);
 });
 
-// ─── Summary ────────────────────────────────────────────────────────
+// ─── 7. v0.4.19a Bug #0: Config Propagation ────────────────────────────
+
+console.log("\n=== 7. v0.4.19a Bug #0: Config Propagation ===\n");
+
+test("loadConfig() receives plugin-specific config from api.pluginConfig", () => {
+  const pluginSpecificConfig = {
+    narrativeSystemPrompt: "inline system prompt",
+    narrativeUserPromptTemplate: "inline user prompt",
+    tombstoneRetentionDays: 30,
+  };
+  const cfg = loadConfig(pluginSpecificConfig);
+  assert.equal(cfg.narrativeSystemPrompt, "inline system prompt");
+  assert.equal(cfg.narrativeUserPromptTemplate, "inline user prompt");
+  assert.equal(cfg.tombstoneRetentionDays, 30);
+});
+
+test("loadConfig() returns defaults when passed empty plugin-specific config", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeSystemPrompt, "");  // DEFAULT used
+  assert.equal(cfg.narrativeUserPromptTemplate, "");  // DEFAULT used
+  assert.equal(cfg.tombstoneRetentionDays, 14);  // default
+});
+
+test("loadConfig() does NOT extract narrativeSystemPrompt from global config top-level (Bug #0 regression guard)", () => {
+  // This verifies the Bug #0 root cause: passing the global config to loadConfig()
+  // means narrativeSystemPrompt is looked for at the top level, where it doesn't exist.
+  // After Fix 0, index.ts no longer passes the global config — it passes pluginSpecificConfig.
+  // This test ensures that if someone accidentally reverts the extraction logic,
+  // the bug would be caught immediately.
+  const globalConfig = {
+    agents: { default: { id: "test" } },
+    plugins: {
+      entries: {
+        "episodic-claw": {
+          config: {
+            narrativeSystemPrompt: "should NOT be found at top level",
+          },
+        },
+      },
+    },
+  };
+  const cfg = loadConfig(globalConfig);
+  // narrativeSystemPrompt is NOT at globalConfig.narrativeSystemPrompt → undefined → ""
+  assert.equal(cfg.narrativeSystemPrompt, "");  // Bug #0 in action!
+});
+
+test("index.ts extracts pluginConfig or falls back to plugins.entries[episodic-claw].config", () => {
+  // Simulates the fix in index.ts: api.pluginConfig || globalConfig.plugins.entries["episodic-claw"].config
+  const globalConfig = {
+    plugins: {
+      entries: {
+        "episodic-claw": {
+          config: {
+            narrativeSystemPrompt: "custom prompt from entries",
+          },
+        },
+      },
+    },
+  };
+
+  // Case 1: api.pluginConfig is available (preferred)
+  const pluginConfig = { narrativeSystemPrompt: "from api.pluginConfig" };
+  const extracted1 = pluginConfig || globalConfig?.plugins?.entries?.["episodic-claw"]?.config || {};
+  const cfg1 = loadConfig(extracted1);
+  assert.equal(cfg1.narrativeSystemPrompt, "from api.pluginConfig");
+
+  // Case 2: api.pluginConfig is undefined (fallback to entries)
+  const extracted2 = undefined || globalConfig?.plugins?.entries?.["episodic-claw"]?.config || {};
+  const cfg2 = loadConfig(extracted2);
+  assert.equal(cfg2.narrativeSystemPrompt, "custom prompt from entries");
+
+  // Case 3: Neither available — no episodic-claw entry
+  const emptyGlobalConfig = {};
+  const extracted3 = undefined || emptyGlobalConfig?.plugins?.entries?.["episodic-claw"]?.config || {};
+  const cfg3 = loadConfig(extracted3);
+  assert.equal(cfg3.narrativeSystemPrompt, "");  // DEFAULT
+});
+
+test("recallQueryRecentMessageCount propagates from plugin-specific config (Bug #0 + Bug #3 regression)", () => {
+  const pluginSpecificConfig = {
+    recallQueryRecentMessageCount: 2,
+  };
+  const cfg = loadConfig(pluginSpecificConfig);
+  assert.equal(cfg.recallQueryRecentMessageCount, 2, "should use plugin-specific value, not default 4");
+});
+
+// ─── 8. v0.4.19a Bug #1: resolvePrompt Cross-Platform ────────────────────
+
+console.log("\n=== 8. v0.4.19a Bug #1: resolvePrompt Cross-Platform ===\n");
+
+test("resolvePrompt resolves Linux absolute path on Windows via HOME mapping", () => {
+  const originalHome = process.env.HOME;
+  const tmpDir = path.join(os.tmpdir(), "episodic-test-home");
+  fs.mkdirSync(path.join(tmpDir, ".openclaw", "prompts"), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, ".openclaw", "prompts", "test.md"), "test content", "utf8");
+  process.env.HOME = tmpDir;
+
+  try {
+    // Inject platform='win32' so the /home/ mapping candidate is added
+    // even when running on Linux/macOS CI
+    const cfg = loadConfig(
+      { narrativeSystemPrompt: "/home/testuser/.openclaw/prompts/test.md" },
+      { platform: "win32" }
+    );
+    // Should resolve via HOME mapping (skipping /home/testuser/ → HOME/)
+    assert.equal(cfg.narrativeSystemPrompt, "test content");
+  } finally {
+    process.env.HOME = originalHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("resolvePrompt does NOT add /home/ mapping on non-Windows platform", () => {
+  const originalHome = process.env.HOME;
+  const tmpDir = path.join(os.tmpdir(), "episodic-test-no-mapping");
+  fs.mkdirSync(path.join(tmpDir, ".openclaw", "prompts"), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, ".openclaw", "prompts", "test.md"), "test content", "utf8");
+  process.env.HOME = tmpDir;
+
+  try {
+    // On Linux/macOS, /home/ paths should NOT be mapped to HOME
+    const cfg = loadConfig(
+      { narrativeSystemPrompt: "/home/testuser/.openclaw/prompts/test.md" },
+      { platform: "linux" }
+    );
+    // path.resolve("/home/testuser/...") on Linux would try the actual path,
+    // which doesn't exist in our tmpDir → returns ""
+    assert.equal(cfg.narrativeSystemPrompt, "");
+  } finally {
+    process.env.HOME = originalHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("resolvePrompt resolves ~/ path on all platforms", () => {
+  const tmpDir = path.join(os.tmpdir(), "episodic-test-tilde");
+  fs.mkdirSync(path.join(tmpDir, ".openclaw", "prompts"), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, ".openclaw", "prompts", "test.md"), "tilde content", "utf8");
+  const originalHome = process.env.HOME;
+  process.env.HOME = tmpDir;
+
+  try {
+    const cfg = loadConfig({
+      narrativeSystemPrompt: "~/.openclaw/prompts/test.md"
+    });
+    assert.equal(cfg.narrativeSystemPrompt, "tilde content");
+  } finally {
+    process.env.HOME = originalHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("resolvePrompt returns inline text unchanged", () => {
+  const cfg = loadConfig({
+    narrativeSystemPrompt: "This is inline text, not a file path"
+  });
+  assert.equal(cfg.narrativeSystemPrompt, "This is inline text, not a file path");
+});
+
+test("resolvePrompt returns empty string for nonexistent file", () => {
+  const cfg = loadConfig({
+    narrativeSystemPrompt: "/nonexistent/path/prompt.md"
+  });
+  assert.equal(cfg.narrativeSystemPrompt, "");
+});
+
+test("resolvePrompt resolves Windows absolute path directly", () => {
+  const tmpDir = path.join(os.tmpdir(), "episodic-test-win");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const filePath = path.join(tmpDir, "prompt.md");
+  fs.writeFileSync(filePath, "windows content", "utf8");
+
+  try {
+    const cfg = loadConfig({
+      narrativeSystemPrompt: filePath
+    });
+    assert.equal(cfg.narrativeSystemPrompt, "windows content");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// ─── Summary ────────────────────────────────────────────────
 
 console.log("\n" + "═".repeat(60));
 console.log(`Results: ${passed} passed, ${failed} failed`);

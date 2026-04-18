@@ -1682,9 +1682,17 @@ async function runReleaseGateC(): Promise<void> {
     id: "test-item-001",
     agentWs: "/tmp/test-ws",
     agentId: "main",
+    parentIngestId: "ingest-test-001",
+    orderKey: "2026-04-19T00:00:00.000Z-0001-main",
     surprise: singleChunkSurprise,
+    reason: "surprise-boundary",
+    rawText: "user: 今日は天気どう？\nassistant: 晴れで最高25度だよ。",
     estimatedTokens: 100,
     source: "live-turn",
+    status: "queued",
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 
   // Call the real saveNarrative method (which calls batchIngest internally)

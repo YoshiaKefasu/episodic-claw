@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
 
 function clampUnitInterval(value: unknown, fallback: number): number {
@@ -65,7 +66,8 @@ export function normalizeOpenRouterReasoning(
  * Parses and resolves default configuration for the plugin.
  * Handles the configSchema defined in openclaw.plugin.json.
  */
-export function loadConfig(rawConfig: any): EpisodicPluginConfig {
+export function loadConfig(rawConfig: any, opts?: { platform?: string }): EpisodicPluginConfig {
+  const platform = opts?.platform;
   return {
     tombstoneRetentionDays: rawConfig?.tombstoneRetentionDays ?? 14,
     enableBackgroundWorkers: rawConfig?.enableBackgroundWorkers ?? true,
@@ -104,8 +106,8 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
     // [v0.4.15] Max tokens for narrative generation — previously dropped by v0.4.14 Fix B
     openrouterMaxTokens: rawConfig?.openrouterConfig?.maxTokens,
     narrativeTemperature: Math.max(0, Math.min(1, rawConfig?.openrouterConfig?.temperature ?? rawConfig?.narrativeTemperature ?? 0.4)),
-    narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt),
-    narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate),
+    narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt, platform),
+    narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate, platform),
     maxPoolChars: Math.max(1000, rawConfig?.maxPoolChars ?? 15000),
     narrativePreviousEpisodeRef: rawConfig?.narrativePreviousEpisodeRef ?? true,
     // Reasoning config: default enabled=true, effort=high when unset
@@ -115,18 +117,74 @@ export function loadConfig(rawConfig: any): EpisodicPluginConfig {
   };
 }
 
-function resolvePrompt(value: string | undefined): string {
+/**
+ * Resolve a prompt value that may be inline text, a file path, or a ~/ path.
+ * Cross-platform: handles Linux absolute paths (/home/...), Windows paths (Y:\...),
+ * and home-dir shortcuts (~/...) on all platforms.
+ *
+ * @param value - The prompt value to resolve (inline text, file path, or ~/ path)
+ * @param platform - Platform identifier for testing injection (default: process.platform)
+ */
+function resolvePrompt(value: string | undefined, platform: string = process.platform): string {
   if (!value) return "";
   const trimmed = value.trim();
-  if (trimmed.endsWith(".md") || trimmed.endsWith(".txt")) {
-    try {
-      return fs.readFileSync(path.resolve(trimmed), "utf8").trim();
-    } catch {
-      console.warn(`[Episodic Memory] Failed to read prompt file: ${trimmed}`);
-      return "";
+  if (!trimmed.endsWith(".md") && !trimmed.endsWith(".txt")) {
+    return trimmed;  // inline text
+  }
+
+  // Build a list of candidate paths to try in order
+  const candidates: string[] = [];
+
+  // 1. Resolve ~ / ~/path — works on all platforms
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    candidates.push(path.join(homeDir, trimmed.slice(2)));
+  } else if (trimmed === "~") {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    candidates.push(homeDir);
+  }
+
+  // 2. path.resolve(trimmed) — handles Windows absolute (C:\...) and relative paths
+  //    Same behavior as before (backward compatible)
+  candidates.push(path.resolve(trimmed));
+
+  // 3. Cross-platform: If original is a POSIX absolute path (/home/user/...) and
+  //    we're on Windows, try resolving under the Windows user home directory.
+  //    This handles the case where openclaw.json was written on Linux and the
+  //    plugin runs on Windows (WSL, dual-boot config share, etc.)
+  if (platform === "win32" && trimmed.startsWith("/home/")) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    // /home/kasou_yoshia/.openclaw/... → HOME\.openclaw\...
+    // Skip the username segment and join by the path after it
+    const relativeFromHome = trimmed.slice("/home/".length);  // kasou_yoshia/.openclaw/...
+    const firstSlash = relativeFromHome.indexOf("/");
+    if (firstSlash > 0) {
+      const afterUsername = relativeFromHome.slice(firstSlash + 1);  // .openclaw/...
+      candidates.push(path.join(homeDir, afterUsername));
     }
   }
-  return trimmed;
+
+  // Try each candidate in order; first successful read wins
+  for (const candidate of candidates) {
+    try {
+      const content = fs.readFileSync(candidate, "utf8").trim();
+      if (content.length > 0) {
+        if (candidate !== path.resolve(trimmed)) {
+          console.log(`[Episodic Memory] Prompt file resolved via cross-platform path: ${trimmed} → ${candidate}`);
+        }
+        return content;
+      }
+    } catch {
+      // Continue to next candidate
+    }
+  }
+
+  // All candidates failed — log for observability
+  console.warn(
+    `[Episodic Memory] Failed to read prompt file: ${trimmed}` +
+    ` (tried: ${candidates.join(", ")})`
+  );
+  return "";
 }
 
 export function buildRecallCalibration(config: EpisodicPluginConfig): RecallCalibration {

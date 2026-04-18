@@ -42,6 +42,11 @@ export interface OpenClawPluginApi {
       loadConfig: () => any;
     };
   };
+  // [v0.4.19a Fix 0] DennouAibou loader が plugins.entries["episodic-claw"].config
+  // から抽出したプラグイン個別設定。api.runtime.config.loadConfig() はグローバル設定全体
+  // を返すため、narrativeSystemPrompt 等はトップレベルに存在せず undefined になる。
+  // api.pluginConfig はプラグイン個別設定だけを含む正しい入力。
+  pluginConfig?: Record<string, unknown>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -479,7 +484,34 @@ const episodicClawPlugin = {
       _singleton = (global as any)[SINGLETON_KEY] ?? null;
       if (!_singleton) {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
-        const cfg = loadConfig(openClawGlobalConfig);
+        // [v0.4.19a Fix 0] プラグイン個別設定を優先。api.pluginConfig は DennouAibou の loader が
+        // plugins.entries["episodic-claw"].config から抽出した値。
+        // フォールバックとしてグローバル設定からも抽出を試みる（後方互換）。
+        const pluginSpecificConfig = api.pluginConfig ||
+          openClawGlobalConfig?.plugins?.entries?.["episodic-claw"]?.config || {};
+        const cfg = loadConfig(pluginSpecificConfig);
+
+        // [v0.4.19c] Config structure diagnostic — helps debug config propagation issues
+        // [v0.4.19c rev.2] Fixed: hasEpisodicClawInGlobal path was missing .entries layer (always returned false).
+        // Removed hasRecallQueryDirect (plugin-specific key never exists at global config root → always false = YAGNI violation).
+        // Added hasConfigOverrides: detects if user has set any plugin config values.
+        const configStructure = {
+          hasPluginConfig: !!api.pluginConfig,
+          pluginConfigKeys: api.pluginConfig ? Object.keys(api.pluginConfig) : [],
+          hasPluginsInGlobal: !!openClawGlobalConfig?.plugins,
+          hasEpisodicClawInGlobal: !!openClawGlobalConfig?.plugins?.entries?.["episodic-claw"]?.config,
+          hasConfigOverrides: Object.keys(pluginSpecificConfig).length > 0,
+          topLevelKeys: typeof openClawGlobalConfig === "object" ? Object.keys(openClawGlobalConfig).slice(0, 20) : [],
+        };
+        console.log(
+          `[Episodic Memory] Config structure: ${JSON.stringify(configStructure)}`
+        );
+        console.log(
+          `[Episodic Memory] Config loaded: recallQueryRecentMessageCount=${cfg.recallQueryRecentMessageCount}, ` +
+          `narrativeSystemPrompt=${cfg.narrativeSystemPrompt ? `(custom, ${cfg.narrativeSystemPrompt.length} chars)` : "(default)"}, ` +
+          `model=${cfg.openrouterModel}`
+        );
+
         const rpcClient = new EpisodicCoreClient();
         const retriever = new EpisodicRetriever(rpcClient, cfg);
 

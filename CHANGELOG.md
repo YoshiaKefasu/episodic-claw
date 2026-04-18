@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.19] - 2026-04-19
+
+### Fixed
+- **OpenRouter free-tier response instability**: Added typed error classification and explicit handling for HTTP 200 responses that contain `error` instead of `choices`. Empty or malformed completions are now classified as `missing_choices`, `empty_content`, or `non_string_content`, and wrapped provider failures are classified as `provider_503`, `provider_429`, or `provider_400_policy`.
+- **Narrative retry policy strengthened**: Narrative generation now uses 12 attempts with a 3-second base delay and a 600-second cap, so temporary upstream failures have more time to recover before the cache item is re-queued.
+- **Fallback and idempotency hardening**: Custom models now fall back to `openrouter/free` after primary exhaustion, and duplicate saves are suppressed by rawText hash so the same chunk is not ingested repeatedly after transient acknowledgements.
+- **Test fixture contract mismatch fixed**: `test_phase4_5.ts` now supplies the required `CacheQueueItem.rawText` field (plus the surrounding queue metadata), preventing `hashRawText()` from crashing on undefined input.
+
+### Added
+- **Dedicated OpenRouter client test coverage**: Added `test_openrouter_client.ts` for wrapped 503 retries, wrapped 400 policy failures, and empty choices classification.
+- **Release hygiene updates**: Consolidated the v0.4.19a–d work into the release notes, plan docs, and runtime comments while keeping the package version at `0.4.19`.
+
 ## [0.4.18] - 2026-04-20
 
 ### Fixed

@@ -5,7 +5,7 @@
  */
 
 import { estimateTokens } from "./utils";
-import { OpenRouterClient } from "./openrouter-client";
+import { OpenRouterClient, OpenRouterError } from "./openrouter-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 
@@ -19,11 +19,11 @@ const DEFAULT_SYSTEM_PROMPT = `Distill conversation logs into third-person past-
 
 // [v0.4.17] Contract-first user prompt: rules at top, forbidden phrases, output priming.
 // English by default; CJK users override via narrativeUserPromptTemplate config pointing to localized .md.
-const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
+export const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
   `HIGHEST PRIORITY. Violating any rule below makes the output invalid.
 
 Output spec:
-Third-person past tense only. One continuous narrative body. Start from the very first character with the story.
+Third-person past tense only. Write continuous narrative prose, not bullet points or headings. Use natural paragraph breaks. For longer narratives, separate the text into at least two paragraphs. Start from the very first character with the story.
 Greetings, prefaces, explanations, bullet points, numbered lists, headings, Markdown, emoji, signatures are FORBIDDEN.
 "Okay" "Let me" "First" "I need to" "Sure" "Here is" "Thank you" and similar planning notes or assistant-tone phrases are FORBIDDEN.
 Never copy-paste from the conversation log. Rephrase all content as natural narrative prose.
@@ -40,8 +40,11 @@ ${conversationText}
 
 Write narrative text only.`;
 
-const MAX_RETRIES = 5;
-const RETRY_BASE_DELAY_MS = 1000;
+const MAX_RETRIES = 12;
+const FALLBACK_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 3000;
+const MAX_RETRY_DELAY_MS = 600_000; // 10min cap
+const SAVE_HASH_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_CACHE_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 1000;
 const LEASE_SECONDS = 120;
@@ -193,6 +196,21 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     }
   }
 
+  // Gate 6: Minimum paragraph structure
+  // [v0.4.19b] Narrative output with 500+ characters should have at least 2 paragraphs
+  // (separated by \n\n). Single-paragraph wall-of-text indicates model failure
+  // to structure output — common with free models producing "stream of consciousness".
+  const MIN_CHARS_FOR_PARAGRAPH_CHECK = 500;
+  const MIN_PARAGRAPH_COUNT = 2;
+
+  if (text.length >= MIN_CHARS_FOR_PARAGRAPH_CHECK) {
+    // Count paragraph breaks: sequences of \n\n (possibly with whitespace)
+    const paragraphBreaks = text.split(/\n\s*\n/);
+    if (paragraphBreaks.length < MIN_PARAGRAPH_COUNT) {
+      return { pass: false, reason: `narrative-format: single-paragraph wall-of-text (${text.length} chars, ${paragraphBreaks.length} paragraph(s)). Minimum ${MIN_PARAGRAPH_COUNT} paragraphs required for texts over ${MIN_CHARS_FOR_PARAGRAPH_CHECK} chars.` };
+    }
+  }
+
   return { pass: true, reason: "" };
 }
 
@@ -208,6 +226,8 @@ export class NarrativeWorker {
   private consecutiveEmptyPolls = 0;
   private nextPollDelayMs = POLL_INTERVAL_MS;
   private readonly MAX_POLL_DELAY_MS = 15_000; // Cap at 15 seconds
+  // [v0.4.19d] Idempotency guard: rawText hash → savedAt timestamp
+  private recentSaveHashes = new Map<string, number>();
 
   constructor(
     private client: OpenRouterClient,
@@ -336,39 +356,88 @@ export class NarrativeWorker {
   }
 
   private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
+    const models = this.getRetryModels();
+
+    for (const { model, maxAttempts, label } of models) {
+      console.log(`[NarrativeWorker] Phase "${label}": trying model=${model}, maxAttempts=${maxAttempts}`);
+
+      const result = await this.narrativizeWithModel(item, model, maxAttempts, label);
+      if (result) return result;
+
+      if (model !== models[models.length - 1].model) {
+        console.warn(
+          `[NarrativeWorker] Phase "${label}" exhausted for [${item.id}]. Falling back to next model...`
+        );
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * [v0.4.19d] Determine retry model sequence.
+   * - If primary model is "openrouter/free" (default), single phase with MAX_RETRIES.
+   * - If primary model is custom, two phases: primary (MAX_RETRIES) + fallback (FALLBACK_RETRIES).
+   */
+  private getRetryModels(): Array<{ model: string; maxAttempts: number; label: string }> {
+    const primary = this.config.openrouterModel ?? "openrouter/free";
+    const fallback = "openrouter/free";
+
+    if (primary === fallback) {
+      // Default: openrouter/free only → single phase
+      return [{ model: primary, maxAttempts: MAX_RETRIES, label: "primary" }];
+    }
+
+    // Custom model: primary (12 attempts) + fallback (3 attempts)
+    return [
+      { model: primary, maxAttempts: MAX_RETRIES, label: "primary" },
+      { model: fallback, maxAttempts: FALLBACK_RETRIES, label: "fallback" },
+    ];
+  }
+
+  /**
+   * [v0.4.19d] Attempt narrative generation with a specific model for a fixed number of attempts.
+   */
+  private async narrativizeWithModel(
+    item: CacheItem,
+    model: string,
+    maxAttempts: number,
+    label: string,
+  ): Promise<NarrativeResult | null> {
     const systemPrompt = this.resolveSystemPrompt();
-    // Respect narrativePreviousEpisodeRef config — when explicitly false, skip injecting previous episode
-    // Use !== false so that undefined (unset) defaults to including previous episode
     const previous = this.config.narrativePreviousEpisodeRef !== false
       ? this.lastNarrativeByAgent.get(item.agentId)
       : undefined;
     const conversationText = item.rawText;
     const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const rawText = await this.client.chatCompletion({ systemPrompt, userMessage });
+        const rawText = await this.client.chatCompletion(
+          { systemPrompt, userMessage },
+          { modelOverride: model },
+        );
         const text = sanitizeNarrativeOutput(rawText);
         const tokens = estimateTokens(text);
 
         // [v0.4.11] Quality gate 1: Token count & Compression ratio
         if (!checkCompressionRatio(tokens, item.estimatedTokens)) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: compression ratio too low ` +
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: compression ratio too low ` +
             `(${tokens}/${item.estimatedTokens} = ${(tokens / item.estimatedTokens * 100).toFixed(2)}% < ${MIN_COMPRESSION_RATIO * 100}%). ` +
             `Retrying for [${item.id}]...`
           );
-          await this.sleep(500); // [v0.4.12] Brief pause before retry — free models tend to produce similar output without pause
+          await this.sleep(500);
           continue;
         }
 
         // [v0.4.11] Quality gate 2: Verbatim echo detection
         if (!checkEchoDetection(text, conversationText)) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: verbatim echo detected for [${item.id}]. ` +
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: verbatim echo detected for [${item.id}]. ` +
             `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
           );
-          await this.sleep(500); // [v0.4.12] Brief pause before retry
+          await this.sleep(500);
           continue;
         }
 
@@ -376,7 +445,7 @@ export class NarrativeWorker {
         const formatCheck = checkNarrativeFormat(text);
         if (!formatCheck.pass) {
           console.warn(
-            `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES}: ${formatCheck.reason} for [${item.id}]. Retrying...`
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
           );
           await this.sleep(500);
           continue;
@@ -385,12 +454,13 @@ export class NarrativeWorker {
         return {
           text,
           tokens,
-          model: this.config.openrouterModel ?? "openrouter/free",
+          model,
         };
       } catch (err) {
-        const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        const errorClass = err instanceof OpenRouterError ? err.openRouterErrorClass : "unknown";
         console.warn(
-          `[NarrativeWorker] Attempt ${attempt + 1}/${MAX_RETRIES} failed for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
+          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
         );
         await this.sleep(delayMs);
       }
@@ -399,7 +469,46 @@ export class NarrativeWorker {
     return null;
   }
 
+  /**
+   * [v0.4.19d] Fast hash for rawText deduplication.
+   * Uses first 500 chars + length — collision probability < 10^-9 for dedup purposes.
+   */
+  private hashRawText(rawText: string): string {
+    const prefix = rawText.slice(0, 500);
+    let hash = 0;
+    for (let i = 0; i < prefix.length; i++) {
+      hash = ((hash << 5) - hash + prefix.charCodeAt(i)) | 0;
+    }
+    return `${hash}_${rawText.length}`;
+  }
+
+  /** [v0.4.19d] Prune expired entries from the save hash map. */
+  private pruneSaveHashes(): void {
+    const now = Date.now();
+    for (const [key, ts] of this.recentSaveHashes) {
+      if (now - ts > SAVE_HASH_TTL_MS) {
+        this.recentSaveHashes.delete(key);
+      }
+    }
+  }
+
   private async saveNarrative(result: NarrativeResult, item: CacheItem): Promise<void> {
+    // [v0.4.19d] Idempotency guard: skip duplicate saves within TTL window
+    const rawHash = this.hashRawText(item.rawText);
+    const now = Date.now();
+
+    this.pruneSaveHashes();
+    if (this.recentSaveHashes.has(rawHash)) {
+      const savedAt = this.recentSaveHashes.get(rawHash)!;
+      const ageMin = ((now - savedAt) / 60000).toFixed(1);
+      console.warn(
+        `[NarrativeWorker] Duplicate save detected for [${item.id}] (rawText hash=${rawHash}, ` +
+        `previously saved ${ageMin}min ago). Skipping batchIngest, acknowledging only.`
+      );
+      await this.rpcClient.cacheAck(item.id, "narrative-worker");
+      return;
+    }
+
     try {
       const tags = ["narrative", item.source === "live-turn" ? "auto-segmented" : "cold-start-import"];
 
@@ -418,9 +527,11 @@ export class NarrativeWorker {
         item.agentWs,
         item.agentId,
       );
+      // Record hash to prevent duplicate saves within TTL
+      this.recentSaveHashes.set(rawHash, now);
       // Only update continuity state for successfully narrativized content
       // (fallback summaries no longer reach this path — they are re-queued via cacheRetry)
-      this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${Date.now()}`, body: result.text });
+      this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${now}`, body: result.text });
     } catch (err) {
       console.error("[NarrativeWorker] Failed to save narrative episode:", err);
       throw err;
@@ -447,4 +558,3 @@ export class NarrativeWorker {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
-

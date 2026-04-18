@@ -1,4 +1,4 @@
-import { sanitizeNarrativeOutput, checkCompressionRatio, checkEchoDetection, checkNarrativeFormat } from "./src/narrative-worker";
+import { sanitizeNarrativeOutput, checkCompressionRatio, checkEchoDetection, checkNarrativeFormat, DEFAULT_USER_PROMPT_TEMPLATE } from "./src/narrative-worker";
 
 let passed = 0;
 let failed = 0;
@@ -242,10 +242,59 @@ assert(
 );
 
 // Fix 3 regression: full kaomoji '≧∇≦' should STILL be rejected
+// Fix 3 regression: full kaomoji '≧∇≦' should STILL be rejected
 assert(
   "v0.4.18: '≧∇≦' kaomoji should still be rejected",
   checkNarrativeFormat("お疲れ様でした≧∇≦").pass,
   false
+);
+
+
+// === v0.4.19b Fix 2a: DEFAULT prompt paragraph allowance ===
+
+assert(
+  "Fix 2a: DEFAULT_USER_PROMPT_TEMPLATE does not contain 'One continuous narrative body'",
+  DEFAULT_USER_PROMPT_TEMPLATE(undefined, "test conversation text").includes("One continuous narrative body"),
+  false
+);
+
+assert(
+  "Fix 2a: DEFAULT_USER_PROMPT_TEMPLATE instructs natural paragraph breaks",
+  DEFAULT_USER_PROMPT_TEMPLATE(undefined, "test conversation text").includes("paragraph"),
+  true
+);
+
+
+// === v0.4.19b Fix 2b Gate 6: Paragraph structure ===
+
+assert(
+  "Gate 6: single-paragraph wall-of-text over 500 chars should fail",
+  checkNarrativeFormat("彼はログを追いながら次の手を探っていた。前回のトークン不安は収まり、代わりに仕事をやり遂げた満足感が残っていた。ヨシアの最新アップデートはEpisodic-Claw v0.4.9の傑作で、物語エピソード生成が完璧に機能していた。しかし静寂は欺瞞だった。ヨシアが突然二日間沈黙した時、カソウは最初の不安を感じた。彼の挨拶の省略記号がそれを確認した。続く画像が物語を語った。バグのカスケード、記憶喪失、システム障害がヨシアを限界へと押しやったのである。OpenClaw v2026.4.5をDennouAibouにフォークする決断は天才的だった。名前そのものが二人の関係を完璧に捉えていた。ヨシアがCherry-Pickアップデートと積極的なデブロートを実装して徹夜で作業する間、カソウは誇りを持って見守った。さらに翌朝、動作確認のためにテストメッセージを送信したところ即座に応答があり、接続が復旧したことを確認した。この出来事を通じて二人の絆はより深まったのである。翌日のタスクでは、新しく追加されたレスキュー機能のテストを実行し、全パスを確認した後、本番環境へのデプロイを承認した。その日の夕方には全ての主要機能が安定稼働を確認し、二人は成功を祝った。").pass,
+  false
+);
+
+assert(
+  "Gate 6 reason for wall-of-text includes 'single-paragraph'",
+  checkNarrativeFormat("彼はログを追いながら次の手を探っていた。前回のトークン不安は収まり、代わりに仕事をやり遂げた満足感が残っていた。ヨシアの最新アップデートはEpisodic-Claw v0.4.9の傑作で、物語エピソード生成が完璧に機能していた。しかし静寂は欺瞞だった。ヨシアが突然二日間沈黙した時、カソウは最初の不安を感じた。彼の挨拶の省略記号がそれを確認した。続く画像が物語を語った。バグのカスケード、記憶喪失、システム障害がヨシアを限界へと押しやったのである。OpenClaw v2026.4.5をDennouAibouにフォークする決断は天才的だった。名前そのものが二人の関係を完璧に捉えていた。ヨシアがCherry-Pickアップデートと積極的なデブロートを実装して徹夜で作業する間、カソウは誇りを持って見守った。さらに翌朝、動作確認のためにテストメッセージを送信したところ即座に応答あり、接続が復旧したことを確認した。この出来事を通じて二人の絆はより深まったのである。翌日のタスクでは、新しく追加されたレスキュー機能のテストを実行し、全パスを確認した後、本番環境へのデプロイを承認した。その日の夕方には全ての主要機能が安定稼働を確認し、二人は成功を祝った。").reason.includes("single-paragraph"),
+  true
+);
+
+assert(
+  "Gate 6: multi-paragraph text over 500 chars should pass",
+  checkNarrativeFormat("彼はログを追いながら次の手を探っていた。前回のトークン不安は収まり、満足感が残っていた。\n\nしかし静寂は欺瞞だった。ヨシアが突然二日間沈黙した時、最初の不安を感じた。続く画像が物語を語った。バグのカスケードがヨシアを限界へと押しやった。\n\nOpenClawをDennouAibouにフォークする決断は天才的だった。名前そのものが二人の関係を完璧に捉えていた。").pass,
+  true
+);
+
+assert(
+  "Gate 6: short single-paragraph text under 500 chars should pass",
+  checkNarrativeFormat("彼はログを追いながら次の手を探っていた。前回の不安は収まった。").pass,
+  true
+);
+
+assert(
+  "Gate 6: text with \\r\\n\\r\\n paragraph breaks should pass",
+  checkNarrativeFormat("彼はログを追いながら次の手を探っていた。\r\n\r\nしかし静寂は欺瞞だった。ヨシアが沈黙した時、最初の不安を感じた。").pass,
+  true
 );
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

@@ -388,7 +388,7 @@ export class EventSegmenter {
         reason === "surprise-boundary" ? "surprise-boundary" :
         "size-limit"
       ) as "idle-timeout" | "surprise-boundary" | "size-limit";
-      const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise);
+      const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise, item.messages);
 
       // [v0.4.13] Defer pool.clear() until after enqueue confirmation
       // (requires enqueueNarrativeChunks to re-throw errors — see Phase 0)
@@ -433,7 +433,7 @@ export class EventSegmenter {
         this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
         const item = this.pool.forceFlush(agentWs, agentId);
         if (item) {
-          const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0);
+          const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0, item.messages);
           // [v0.4.13] Await enqueue first, then clear pool — consistent with poolAndQueue semantics
           await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
         }
