@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.20] - 2026-04-22
+
+### Fixed
+- **Lexical index empty-ID crash prevention (CRITICAL)**: Bleve rejects document ID `""`, causing a 3-error chain (`bleve batch error` → `batch commit error` → `batchKeys out-of-sync`) that corrupted the lexical queue and silently dropped all subsequent index updates. All entry points now guard against empty IDs:
+  - `enqueueSysLexq()`: skips empty `recordID` with Warn log (prevents Bleve batch corruption at the source)
+  - `Add()` / `BatchAdd()`: rejects records with empty ID with explicit error return (prevents empty-ID records from entering the store)
+  - `RebuildLexicalIndex()`: skips records with empty ID with Warn log (prevents rebuild-time Bleve errors)
+  - `lexicalWorker`: skips tasks with empty `document ID` (consumes queue keys + continues, preventing orphaned queue entries)
+- **`Delete()` / `deleteLocked()` empty-ID guard**: `Delete("")` and `deleteLocked("")` would construct invalid PebbleDB keys (prefix-only keys like `"ep:"`, `"s2i:"`) and execute `batch.Delete()` on them. Both functions now return `nil` immediately for empty ID, preventing invalid key operations.
+- **`CleanOrphans()` empty-ID skip**: `CleanOrphans()` could append `rec.ID == ""` to the delete list, then call `Delete("")`. Now skips records with empty/whitespace-only ID with Warn log, preventing the delete at the source.
+- **Watcher start timeout increased (5s → 15s) + 1 retry**: The Go sidecar's `handleWatcherStart` runs as a goroutine that may not complete within the old 5s timeout, causing every `gateway_start` to time out and fall back to synchronous `rebuildIndex`. Increased to 15s with 1 retry attempt, and the "already active" benign response on retry is handled correctly.
+- **Rebuild fallback non-blocking (async fire-and-forget)**: When watcher start fails after all retries, the `rebuildIndex` fallback now runs in a `void (async () => { ... })()` IIFE instead of `await`, so `gateway_start` is not blocked on rebuild completion. This eliminates the 20-60s gateway startup delay observed in production logs.
+- **Degraded workspace early-return (regression fix)**: The async fallback created a regression where `before_prompt_build` would re-enter `ensureWatcher()` for degraded workspaces on every turn, spawning infinite async rebuild RPCs. Added `if (watcherDegradedWorkspaces.has(agentWs)) return;` early return to prevent the infinite-rebuild loop.
+
+### Changed
+- `Delete()` empty-ID guard uses `id == ""` (API-sourced IDs are already trimmed by callers)
+- `CleanOrphans()` empty-ID guard uses `strings.TrimSpace(rec.ID) == ""` (DB-sourced data may contain whitespace-padded IDs) — the difference is documented inline to prevent future "simplification"
+- Watcher start constants extracted to named `WATCHER_START_TIMEOUT_MS` (15,000) and `WATCHER_START_MAX_RETRIES` (1) for maintainability
+
 ## [0.4.19] - 2026-04-19
 
 ### Fixed

@@ -674,29 +674,62 @@ const episodicClawPlugin = {
         return debouncer;
       };
 
+      // [v0.4.20] Watcher start constants — increased from 5s to 15s + 1 retry
+      const WATCHER_START_TIMEOUT_MS = 15_000;  // was 5_000
+      const WATCHER_START_MAX_RETRIES = 1;
+
       const ensureWatcher = async (agentWs: string): Promise<void> => {
         if (!agentWs) return;
         if (_singleton!.watcherWorkspaces.has(agentWs)) return;
+        // [v0.4.20] Early return for already-degraded workspaces — prevents repeated
+        // async rebuild RPCs on every before_prompt_build call when watcher is down.
+        if (_singleton!.watcherDegradedWorkspaces.has(agentWs)) return;
         _singleton!.watcherWorkspaces.add(agentWs);
         try {
           await fs.promises.mkdir(agentWs, { recursive: true });
         } catch {}
-        try {
-          await Promise.race([
-            rpcClient.startWatcher(agentWs),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Watcher Start Timeout")), 5000))
-          ]);
-        } catch (err) {
+
+        // [v0.4.20] Retry loop: 15s timeout × (1 + maxRetries) attempts
+        // Note: handleWatcherStart runs as a goroutine on the Go side. If the first
+        // attempt times out on the TS side but eventually completes on the Go side,
+        // the watcher IS running. The retry's startWatcher RPC will then receive
+        // "Watcher already active on path" — a benign success response.
+        let watcherStarted = false;
+        for (let attempt = 0; attempt <= WATCHER_START_MAX_RETRIES; attempt++) {
+          try {
+            await Promise.race([
+              rpcClient.startWatcher(agentWs),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Watcher Start Timeout")), WATCHER_START_TIMEOUT_MS)
+              ),
+            ]);
+            watcherStarted = true;
+            break;
+          } catch (err) {
+            if (attempt < WATCHER_START_MAX_RETRIES) {
+              console.warn(`[Episodic Memory] Watcher start attempt ${attempt + 1} failed, retrying...`, err);
+            } else {
+              console.warn(`[Episodic Memory] Watcher start failed after ${attempt + 1} attempts.`, err);
+            }
+          }
+        }
+
+        if (!watcherStarted) {
+          // [v0.4.20] Non-blocking fallback: do not block gateway_start on rebuild
           _singleton!.watcherWorkspaces.delete(agentWs);
           _singleton!.watcherDegradedWorkspaces.add(agentWs);
-          console.warn("[Episodic Memory] Failed to start watcher; falling back to rebuildIndex.", err);
-          try {
-            await rpcClient.rebuildIndex(agentWs, agentWs);
-            console.log(`[Episodic Memory] Rebuild fallback completed for ${agentWs}.`);
-            invalidateRecallCacheForWorkspace(agentWs);
-          } catch (rebuildErr) {
-            console.error("[Episodic Memory] Rebuild fallback failed.", rebuildErr);
-          }
+          console.warn("[Episodic Memory] Failed to start watcher; scheduling async rebuild fallback.");
+
+          void (async () => {
+            try {
+              await rpcClient.rebuildIndex(agentWs, agentWs);
+              console.log(`[Episodic Memory] Async rebuild fallback completed for ${agentWs}.`);
+              invalidateRecallCacheForWorkspace(agentWs);
+            } catch (rebuildErr) {
+              console.error("[Episodic Memory] Async rebuild fallback failed.", rebuildErr);
+              console.warn("[Episodic Memory] One or more watcher workspaces are degraded; rebuild fallback is active.");
+            }
+          })();
         }
       };
 

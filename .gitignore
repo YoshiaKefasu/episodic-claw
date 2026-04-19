@@ -19,6 +19,9 @@ episodes/
 
 # Temporary / runtime files
 openclaw-global.tmp.json
+tmp/
+*.tgz
+RELEASE_NOTES_*.md
 *.tmp.json
 
 # npm pack output

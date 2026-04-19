@@ -289,9 +289,17 @@ func (s *Store) CleanOrphans() {
 	for iter.First(); iter.Valid(); iter.Next() {
 		var rec EpisodeRecord
 		if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil && rec.SourcePath != "" {
+			// [v0.4.20b] Skip records with empty ID — cannot form valid Pebble delete keys.
+			// Note: TrimSpace is used here (not plain =="") because DB-sourced data may contain
+			// whitespace-padded IDs. Delete()/deleteLocked() use plain =="" because API-sourced
+			// IDs are already trimmed by the caller.
+			if strings.TrimSpace(rec.ID) == "" {
+				logger.Warn(logger.CatStore, "CleanOrphans: skipping record with empty ID (SourcePath=%s)", rec.SourcePath)
+				continue
+			}
 			if _, statErr := os.Stat(rec.SourcePath); os.IsNotExist(statErr) {
 				// Ghost record found
-				toDelete = append(toDelete, string(rec.ID))
+				toDelete = append(toDelete, rec.ID)
 			} else {
 				// File exists, let's make sure its p2i index is there (migration)
 				toMigrate = append(toMigrate, rec)
@@ -335,6 +343,11 @@ func (s *Store) CleanOrphans() {
 
 // enqueueSysLexq writes a lexical queue task directly into PebbleDB to guarantee processing.
 func (s *Store) enqueueSysLexq(batch *pebble.Batch, action string, recordID string) {
+	// [v0.4.20] Guard: skip empty record IDs — Bleve rejects document ID ""
+	if recordID == "" {
+		logger.Warn(logger.CatLexical, "enqueueSysLexq: skipped empty recordID for action=%s", action)
+		return
+	}
 	key := []byte(fmt.Sprintf("sys_lexq:%d:%s", time.Now().UnixNano(), recordID))
 	val := []byte(action)
 	if batch != nil {
@@ -361,6 +374,10 @@ func (s *Store) getNextID(batch *pebble.Batch) (uint32, error) {
 }
 
 func (s *Store) Add(ctx context.Context, rec EpisodeRecord) error {
+	// [v0.4.20] Guard: reject records with empty ID
+	if rec.ID == "" {
+		return fmt.Errorf("episode record ID must not be empty")
+	}
 	// Initialize / Update Phase 2.1 Stage 1 score before hitting DB
 	CalculateImportanceStage1(&rec)
 
@@ -438,6 +455,12 @@ func (s *Store) Add(ctx context.Context, rec EpisodeRecord) error {
 func (s *Store) BatchAdd(ctx context.Context, records []EpisodeRecord) error {
 	if len(records) == 0 {
 		return nil
+	}
+	// [v0.4.20] Guard: reject batch with any empty ID
+	for i, rec := range records {
+		if rec.ID == "" {
+			return fmt.Errorf("episode record ID must not be empty (index %d)", i)
+		}
 	}
 
 	for i := range records {
@@ -684,6 +707,10 @@ func (s *Store) ListByTopic(topic string) ([]EpisodeRecord, error) {
 
 // Delete completely removes the episode ID and its mappings from Pebble atomically.
 func (s *Store) Delete(id string) error {
+	// [v0.4.20b] Guard: skip deletion for empty ID
+	if id == "" {
+		return nil
+	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	return s.deleteLocked(id)
@@ -765,6 +792,11 @@ func (s *Store) DeleteByPaths(paths []string) error {
 }
 
 func (s *Store) deleteLocked(id string) error {
+	// [v0.4.20b] Guard: skip deletion for empty ID — cannot form valid Pebble keys
+	if id == "" {
+		logger.Warn(logger.CatStore, "deleteLocked: skipped deletion for empty ID")
+		return nil
+	}
 	epKey := append(append([]byte(nil), prefixEp...), []byte(id)...)
 	s2iKey := append(append([]byte(nil), prefixS2I...), []byte(id)...)
 	var oldRec *EpisodeRecord
@@ -1842,6 +1874,11 @@ func (s *Store) RebuildLexicalIndex() (int, error) {
 	for iter.First(); iter.Valid(); iter.Next() {
 		var rec EpisodeRecord
 		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		// [v0.4.20] Skip records with empty ID — cannot be indexed by Bleve
+		if rec.ID == "" {
+			logger.Warn(logger.CatStore, "RebuildLexicalIndex: skipping record with empty ID (SourcePath=%s)", rec.SourcePath)
 			continue
 		}
 		if rec.SourcePath == "" {

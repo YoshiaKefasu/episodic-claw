@@ -129,6 +129,12 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 				batchKeys = append(batchKeys, task.key)
 				action := task.action
 
+				// [v0.4.20] Skip tasks with empty ID — Bleve rejects document ID ""
+				if task.id == "" {
+					logger.Warn(logger.CatLexical, "Skipping lexical task with empty document ID (action=%s, key=%s)", action, string(task.key))
+					continue
+				}
+
 				if action == "ADD" || action == "UPDATE" {
 					epKey := append(append([]byte(nil), prefixEp...), []byte(task.id)...)
 					val, closer, err := s.db.Get(epKey)

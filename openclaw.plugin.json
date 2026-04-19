@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.19",
+  "version": "0.4.20",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
