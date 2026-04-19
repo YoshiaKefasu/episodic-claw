@@ -320,6 +320,10 @@ const PluginConfigSchema = Type.Object(
     dedupWindow: Type.Optional(Type.Integer({
       description: "Duplicate-message dedup window size (default 5). Increase to 10+ in high-fallback environments."
     })),
+    warmStartSkipMinMessages: Type.Optional(Type.Integer({
+      minimum: 0,
+      description: "Warm-start cursor bootstrap threshold. Messages >= this on first before_prompt_build trigger cursor sync. Default: 50. Set 0 to disable."
+    })),
     maxBufferChars: Type.Optional(Type.Integer({
       minimum: 500,
       description: "Advanced: character threshold that forces the segmenter to flush regardless of surprise/time-gap boundaries. Default: 7200. Acts as a live flush guard to prevent unbounded buffer growth."
@@ -892,6 +896,12 @@ const episodicClawPlugin = {
         const { agentId, agentWs } = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
         if (!agentWs) return;
         const state = getAgentState(agentId);
+
+        // [v0.4.21] Compaction 後の再物語化防止: segmenter に skip フラグを設定
+        // before_compaction で forceFlush が lastProcessedLength = 0 にリセットするが、
+        // compaction 後の processTurn が全メッセージを再処理してしまうのを防ぐ
+        state.segmenter.afterCompaction();
+
         console.log("[Episodic Memory] after_compaction: checking for anchor...");
         try {
           const anchorText = await state.anchorStore.read(agentWs);
@@ -924,6 +934,30 @@ const episodicClawPlugin = {
         await prepareWorkspaces(resolution);
         const state = getAgentState(agentId);
         state.lastAgentWs = agentWs;
+
+        // ── [v0.4.21b] Cursor restoration from state DB ──
+        // 初回 before_prompt_build 時に永続化された cursor を復元（再起動後の再物語化防止）。
+        // restoreCursor はDB値を返すだけで内部状態は変更しない — bootstrapCursor で設定。
+        if (state.lastRecallTurnMessageCount === -1) {
+          const restoredCursor = await state.segmenter.restoreCursor(agentWs, agentId).catch(() => 0);
+          if (restoredCursor > 0) {
+            // Cursor restored from DB — always bootstrap (clamped to current message count)
+            const clamped = Math.min(restoredCursor, msgs.length); // safety clamp
+            // [v0.4.21d] Use "warm-start" reason so bootstrapCursor skips same-value write-back
+            // (changed from "manual" — manual implies user-explicit operation, not DB restore)
+            state.segmenter.bootstrapCursor(clamped, "warm-start", agentWs, agentId);
+          }
+        }
+
+        // ── [v0.4.21b] Warm-start 初回取り込みガード（セーフネット） ──
+        // cursor 復元が空の場合のフォールバック。
+        // 初回 before_prompt_build かつ大量メッセージ時は、再起動復帰とみなして cursor を同期。
+        // 閾値は pluginConfig の warmStartSkipMinMessages から読み取り（デフォルト50）。
+        // 0 に設定するとガードを無効化。通常の短い新規会話は従来挙動のまま。
+        const WARM_START_SKIP_MIN_MESSAGES = cfg.warmStartSkipMinMessages ?? 50;
+        if (WARM_START_SKIP_MIN_MESSAGES > 0 && state.lastRecallTurnMessageCount === -1 && state.segmenter.currentCursor === 0 && msgs.length >= WARM_START_SKIP_MIN_MESSAGES) {
+          state.segmenter.bootstrapCursor(msgs.length, "warm-start", agentWs, agentId);
+        }
 
         // ── セグメンテーション（fire-and-forget）──
         state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {

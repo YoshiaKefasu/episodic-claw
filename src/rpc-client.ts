@@ -10,6 +10,7 @@ import * as https from "https";
 import type { CacheQueueItem } from "./narrative-queue";
 
 import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult } from "./types";
+import { agentWsHash } from "./utils";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
 const SOCKET_ADDR_FILE = path.join(os.tmpdir(), "episodic-claw-socket.addr");
@@ -583,6 +584,78 @@ export class EpisodicCoreClient {
 
   async setMeta(key: string, value: string, agentWs: string): Promise<boolean> {
     return this.request<boolean>("ai.setMeta", { key, value, agentWs });
+  }
+
+  // --- [v0.4.21b] Persistent state DB RPC methods ---
+
+  /** Get a value from the persistent state DB. Returns empty string if key not found. */
+  async stateGet(key: string, agentWs?: string, agentId?: string): Promise<string> {
+    return this.request<string>("state.get", { key, agentWs: agentWs ?? "", agentId: agentId ?? "" });
+  }
+
+  /** Set a value in the persistent state DB. */
+  async stateSet(key: string, value: string, agentWs?: string, agentId?: string): Promise<boolean> {
+    return this.request<boolean>("state.set", { key, value, agentWs: agentWs ?? "", agentId: agentId ?? "" });
+  }
+
+  // --- [v0.4.21b] High-level state helpers for cursor & save-hash persistence ---
+
+  /** Get the persisted segmenter cursor for a given agent+workspace. */
+  async getSegmenterCursor(agentWs: string, agentId: string): Promise<{ lastProcessedLength: number }> {
+    const key = `agent:${agentId}:ws:${agentWsHash(agentWs)}:segmenter-cursor`;
+    const raw = await this.stateGet(key, agentWs, agentId).catch((err) => {
+      // [v0.4.21f] Distinguish DB errors from not-found for observability.
+      // Behavior is unchanged (return empty string), but now errors are logged
+      // instead of silently swallowed.
+      const msg = err instanceof Error
+        ? (err.message || err.stack)
+        : String(err);
+      if (msg && msg !== "undefined") {
+        console.warn(`[episodic-claw] stateGet failed for key "${key}": ${msg}. Falling back to empty state.`);
+      }
+      return "";
+    });
+    if (!raw) return { lastProcessedLength: 0 };
+    try {
+      const parsed = JSON.parse(raw);
+      return { lastProcessedLength: Number(parsed?.lastProcessedLength) || 0 };
+    } catch {
+      return { lastProcessedLength: 0 };
+    }
+  }
+
+  /** Persist the segmenter cursor for a given agent+workspace. */
+  async setSegmenterCursor(agentWs: string, agentId: string, cursor: { lastProcessedLength: number }): Promise<void> {
+    const key = `agent:${agentId}:ws:${agentWsHash(agentWs)}:segmenter-cursor`;
+    await this.stateSet(key, JSON.stringify(cursor), agentWs, agentId)
+      .catch((err) => console.warn("[Episodic Memory] Failed to persist segmenter cursor:", err));
+  }
+
+  /** Get the persisted narrative save hashes for a given agent+workspace. */
+  async getNarrativeSaveHashes(agentWs: string, agentId: string): Promise<Array<{ key: string; timestamp: number }>> {
+    const key = `agent:${agentId}:ws:${agentWsHash(agentWs)}:narrative-save-hashes`;
+    const raw = await this.stateGet(key, agentWs, agentId).catch((err) => {
+      const msg = err instanceof Error
+        ? (err.message || err.stack)
+        : String(err);
+      if (msg && msg !== "undefined") {
+        console.warn(`[episodic-claw] stateGet failed for key "${key}": ${msg}. Falling back to empty state.`);
+      }
+      return "";
+    });
+    if (!raw) return [];
+    try {
+      return JSON.parse(raw) as Array<{ key: string; timestamp: number }>;
+    } catch {
+      return [];
+    }
+  }
+
+  /** Persist the narrative save hashes for a given agent+workspace. */
+  async setNarrativeSaveHashes(agentWs: string, agentId: string, hashes: Array<{ key: string; timestamp: number }>): Promise<void> {
+    const key = `agent:${agentId}:ws:${agentWsHash(agentWs)}:narrative-save-hashes`;
+    await this.stateSet(key, JSON.stringify(hashes), agentWs, agentId)
+      .catch((err) => console.warn("[Episodic Memory] Failed to persist narrative save hashes:", err));
   }
 
   async batchIngest(items: BatchIngestItem[], agentWs: string, savedBy: string = ""): Promise<string[]> {

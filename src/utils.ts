@@ -19,3 +19,34 @@ export function estimateTokens(text: string): number {
     }
     return Math.ceil(count);
 }
+
+/** [v0.4.21e] Canonicalize agentWs path for stable state key construction.
+ *  Platform-aware: lowercases on case-insensitive filesystems (win32) only.
+ *  On Linux/macOS, case is preserved to avoid false identity collision
+ *  on case-sensitive filesystems (common on Linux, possible on macOS).
+ *  Normalizes path separators (\→/) and strips trailing slashes on all platforms.
+ *  Returns DJB2 hash (base36) of the normalized path.
+ *
+ *  DESIGN NOTE (Option A): False identity collision (different dirs → same hash)
+ *  is worse than false split (same dir → different hashes). Split only causes
+ *  extra dedup misses; collision causes data corruption across workspaces.
+ */
+export function agentWsHash(agentWs: string): string {
+  // Order: normalize separators → strip trailing slash → lowercase (win32 only)
+  // is equivalent to the old order (normalize → lowercase → strip) because
+  // lowercasing '/' is still '/' and stripping after lowercasing is same as before.
+  let normalized = agentWs.replace(/\\/g, '/').replace(/\/+$/, '');
+  // Case normalization only on Windows (case-insensitive by default)
+  // NOTE: macOS default (APFS/HFS+) is also case-insensitive, but we don't
+  // lowercase there to avoid false collision on case-sensitive macOS volumes.
+  // This is an accepted false-split: same workspace with different case on
+  // macOS gets separate entries, which is less harmful than false collision.
+  if (process.platform === 'win32') {
+    normalized = normalized.toLowerCase();
+  }
+  let hash = 5381;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = ((hash << 5) + hash + normalized.charCodeAt(i)) & 0x7FFFFFFF;
+  }
+  return hash.toString(36);
+}

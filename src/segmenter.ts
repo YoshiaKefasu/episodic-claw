@@ -48,6 +48,12 @@ export class EventSegmenter {
   // Narrative architecture (v0.4.0)
   private pool: NarrativePool | null;
   private narrativeWorker: NarrativeWorker | null;
+  // [v0.4.21] Compaction skip flag: after_compaction 後の初回 processTurn で
+  // compacted メッセージを「既処理」として cursor を進める（再物語化防止）
+  private pendingCompactionSkip = false;
+  // [v0.4.21c] Debounced cursor persistence for normal turns
+  private cursorPersistCounter = 0;
+  private readonly CURSOR_PERSIST_INTERVAL = 3; // persist every 3rd turn that advances cursor
 
   constructor(
     rpc: EpisodicCoreClient,
@@ -146,6 +152,9 @@ export class EventSegmenter {
 
     // Restore cursor — messages up to savedLastProcessedLength are already processed
     this.lastProcessedLength = savedLastProcessedLength;
+    // [v0.4.21f] Persist cursor after idle flush restoration — the restored value
+    // may differ from the DB value if normal turns had advanced the cursor since last persist.
+    this.persistCursor(agentWs, agentId);
     this.buffer = [];
     return true;
   }
@@ -179,6 +188,18 @@ export class EventSegmenter {
   async processTurn(currentMessages: Message[], agentWs: string, agentId: string = ""): Promise<boolean> {
     if (currentMessages.length === 0) {
       console.log("[Episodic Memory] processTurn: empty message list, skipping.");
+      return false;
+    }
+
+    // [v0.4.21] Compaction skip: after_compaction 後の初回 processTurn で、
+    // compacted メッセージを「既処理」として cursor を進める（再物語化防止）
+    if (this.pendingCompactionSkip) {
+      this.pendingCompactionSkip = false;
+      this.lastProcessedLength = currentMessages.length;
+      this.buffer = [];
+      console.log(JSON.stringify({ source: "episodic-claw", event: "compaction-skip", cursor: currentMessages.length, messageCount: currentMessages.length, reason: "afterCompaction" }));
+      // [v0.4.21b] Persist cursor AFTER advancement so it survives restart
+      this.persistCursor(agentWs, agentId);
       return false;
     }
 
@@ -238,6 +259,7 @@ export class EventSegmenter {
     if (dedupedMessages.length === 0) {
       console.log(`[Episodic Memory] All ${newMessages.length} new message(s) were duplicates or empty, skipping.`);
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       return false;
     }
 
@@ -245,6 +267,7 @@ export class EventSegmenter {
       // First turn, just absorb
       this.buffer.push(...dedupedMessages);
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       // Schedule idle flush for the new buffer
       this.scheduleIdleFlush(agentWs, agentId);
       return false;
@@ -270,6 +293,7 @@ export class EventSegmenter {
       // 画像・tool_use など text なしメッセージの場合も位置を進める（スタック防止）
       console.log(`[Episodic Memory] processTurn: no text content in new messages (image-only or tool_use-only, ${dedupedMessages.length} message(s) filtered out)`);
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       return false;
     }
 
@@ -282,6 +306,7 @@ export class EventSegmenter {
       await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap");
       this.buffer = [...dedupedMessages];
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       // Reschedule idle flush for the new buffer after time-gap boundary
       this.scheduleIdleFlush(agentWs, agentId);
       return true;
@@ -341,12 +366,14 @@ export class EventSegmenter {
         this.scheduleIdleFlush(agentWs, agentId);
       }
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       return true;
     } catch (err) {
       console.error("[Episodic Memory] Error in segmenter processTurn:", err);
       // Fallback: absorb deduped messages only（Fix D-1 を catch でも維持）
       this.buffer.push(...dedupedMessages);
       this.lastProcessedLength = currentMessages.length;
+      this.maybePersistCursor(agentWs, agentId);
       // Reschedule idle flush on error recovery
       this.scheduleIdleFlush(agentWs, agentId);
     }
@@ -416,6 +443,94 @@ export class EventSegmenter {
     const rawPath = path.join(agentWs, `${timestamp}.raw.md`);
     await fs.promises.writeFile(rawPath, item.rawText, "utf8");
     console.log(`[Episodic Memory] Raw log saved: ${rawPath}`);
+  }
+
+  /**
+   * [v0.4.21] Compaction 後の再物語化防止。
+   * after_compaction handler から呼び出し、次回 processTurn で
+   * compacted メッセージを全て「既処理」として扱うようフラグを設定する。
+   *
+   * forceFlush() は lastProcessedLength = 0 にリセットするが、
+   * compaction 後の processTurn は 0 から全メッセージを再処理してしまう。
+   * このメソッドは compaction 特有の「メッセージ短縮」を「既処理」として扱い、
+   * 真のコンテキストリセット（セッション全消去）との区別を可能にする。
+   */
+  afterCompaction(): void {
+    this.pendingCompactionSkip = true;
+    this.buffer = [];
+    this.turnSeq = 0;
+    this.clearIdleFlushTimer();
+    // NOTE: cursor persistence happens in processTurn when pendingCompactionSkip fires,
+    // because the actual cursor advancement happens there (not here).
+    console.log(JSON.stringify({ source: "episodic-claw", event: "after-compaction", pendingSkip: true, bufferCleared: true }));
+  }
+
+  /**
+   * [v0.4.21] Warm-start 初回取り込みガード（再起動経路）。
+   * cursor を明示的に現在のメッセージ長に同期し、
+   * 再起動直後に巨大な既存メッセージ列を「新規」と誤認するのを防ぐ。
+   *
+   * @param currentMessagesLength 現在のメッセージリスト長
+   * @param reason 呼び出し元の識別（ログ用）
+   */
+  bootstrapCursor(currentMessagesLength: number, reason: "warm-start" | "manual", agentWs: string = "", agentId: string = ""): void {
+    const next = Math.max(0, currentMessagesLength);
+    const changed = this.lastProcessedLength !== next;
+    this.lastProcessedLength = next;
+    this.buffer = [];
+    this.turnSeq = 0;
+    this.clearIdleFlushTimer();
+    console.log(JSON.stringify({ source: "episodic-claw", event: "bootstrap-cursor", cursor: this.lastProcessedLength, reason }));
+    // [v0.4.21d] Only persist when value changed or user-explicit manual operation.
+    // This avoids unnecessary DB writes (pebble.Sync) when restoreCursor returns the same
+    // value that is already in memory — common on restart when cursor hasn't advanced.
+    if (changed || reason === "manual") {
+      this.persistCursor(agentWs, agentId);
+    }
+  }
+
+  // ─── [v0.4.21b] Cursor persistence ──────────────────────────────────────
+
+  /**
+   * [v0.4.21c] Debounced cursor persistence for normal turns.
+   * Writes every CURSOR_PERSIST_INTERVAL advances to reduce DB I/O.
+   * In-memory cursor is always up-to-date; DB is a restart-recovery backup.
+   * Max staleness: CURSOR_PERSIST_INTERVAL - 1 turns (acceptable on crash).
+   */
+  private maybePersistCursor(agentWs: string, agentId: string): void {
+    if (!agentWs || !agentId) return;
+    this.cursorPersistCounter++;
+    if (this.cursorPersistCounter % this.CURSOR_PERSIST_INTERVAL !== 0) return;
+    this.persistCursor(agentWs, agentId);
+  }
+
+  /**
+   * Persist the current cursor position to the state DB so it survives restarts.
+   * Fire-and-forget — errors are logged but not propagated.
+   */
+  private persistCursor(agentWs: string, agentId: string): void {
+    if (!agentWs || !agentId) return; // skip if caller didn't provide identity
+    this.rpc.setSegmenterCursor(agentWs, agentId, { lastProcessedLength: this.lastProcessedLength })
+      .catch((err) => console.warn("[Episodic Memory] Failed to persist segmenter cursor:", err));
+  }
+
+  /**
+   * [v0.4.21b] Restore cursor from the state DB (called on agent initialization).
+   * Returns the restored lastProcessedLength, or 0 if no persisted cursor found.
+   */
+  async restoreCursor(agentWs: string, agentId: string): Promise<number> {
+    const saved = await this.rpc.getSegmenterCursor(agentWs, agentId).catch(() => ({ lastProcessedLength: 0 }));
+    // NOTE: Does NOT set this.lastProcessedLength internally — caller decides
+    // via bootstrapCursor() which also clears buffer/timer and persists.
+    return saved.lastProcessedLength;
+  }
+
+  /**
+   * [v0.4.21b] Expose current cursor position for external guard checks.
+   * Used by before_prompt_build to determine if warm-start fallback is needed.
+   */
+  get currentCursor(): number {
+    return this.lastProcessedLength;
   }
 
   /**

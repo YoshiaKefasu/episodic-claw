@@ -78,6 +78,8 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     // reach anchor-injection evaluation. A budget-truncated early return does not spend it.
     anchorInjectionAssembles: Math.max(1, rawConfig?.anchorInjectionAssembles ?? 1),
     dedupWindow: rawConfig?.dedupWindow ?? 5,
+    // [v0.4.21b] Warm-start cursor bootstrap threshold (default 50, 0 to disable)
+    warmStartSkipMinMessages: Math.max(0, rawConfig?.warmStartSkipMinMessages ?? 50),
     maxBufferChars: Math.max(500, rawConfig?.maxBufferChars ?? 7200),
     maxCharsPerChunk: Math.max(500, rawConfig?.maxCharsPerChunk ?? 9000),
     segmentationLambda: rawConfig?.segmentationLambda ?? 2.0,

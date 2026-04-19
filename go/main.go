@@ -23,6 +23,7 @@ import (
 	"episodic-core/internal/ai"
 	"episodic-core/internal/cache"
 	"episodic-core/internal/logger"
+	"episodic-core/internal/state"
 	"episodic-core/internal/vector"
 	"episodic-core/watcher"
 	"sync"
@@ -60,6 +61,16 @@ var (
 	legacyEpisodeCleanupPending   = make(map[string]bool)
 	legacyEpisodeQuarantineBypass = make(map[string]bool)
 
+	// [v0.4.21b] Duplicate-skip counters for observability
+	batchIngestSameRequestSkips atomic.Uint64 // same-batch slug dedup
+	batchIngestDbDuplicateSkips  atomic.Uint64 // existing DB slug dedup (batch path)
+	ingestDbDuplicateSkips       atomic.Uint64 // existing DB slug dedup (single-item path)
+	unindexedSaves               atomic.Uint64 // [v0.4.21e] Episodes saved to disk but not indexed (vstore nil)
+
+	// [v0.4.21b] Global state store for persistent control state (cursor, save hashes)
+	globalStateStore *state.Store
+	stateStoreMu      sync.Mutex
+
 	// Wakeup channel for instantaneous healing
 	healWorkerWakeup = make(chan struct{}, 1)
 )
@@ -80,6 +91,37 @@ func triggerHealing() {
 	select {
 	case healWorkerWakeup <- struct{}{}:
 	default:
+	}
+}
+
+// [v0.4.21b] getGlobalStateStore lazily opens the global state DB.
+// State DB is stored at ~/.openclaw/episodic-claw/state.db, physically
+// separated from vector.db (memory) and cache.db (queue) for clean responsibility.
+func getGlobalStateStore() (*state.Store, error) {
+	stateStoreMu.Lock()
+	defer stateStoreMu.Unlock()
+	if globalStateStore != nil {
+		return globalStateStore, nil
+	}
+	s, err := state.OpenGlobal()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open global state DB: %w", err)
+	}
+	globalStateStore = s
+	EmitLog("[StateDB] Opened global state DB at: %s", s.Path())
+	return s, nil
+}
+
+// [v0.4.21c] closeGlobalStateStore closes the global state DB and releases file locks.
+// Called on sidecar shutdown (watchdog EOF path) for clean termination.
+func closeGlobalStateStore() {
+	stateStoreMu.Lock()
+	defer stateStoreMu.Unlock()
+	if globalStateStore != nil {
+		if err := globalStateStore.Close(); err != nil {
+			EmitLog("state.db: close error: %v", err)
+		}
+		globalStateStore = nil
 	}
 }
 
@@ -1529,6 +1571,35 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	slug := fmt.Sprintf("episode-%x", hash)
 	EmitLog("Quality Guard (Ingest): using MD5 safe-queue slug: %s", slug)
 
+	// [v0.4.21b] Duplicate guard: skip if a record with this slug already exists in the DB.
+	// This mirrors the handleBatchIngest duplicate guard (v0.4.21) for the single-item path.
+	vstore, storeErr := getStore(params.AgentWs)
+	if storeErr != nil {
+		// [v0.4.21c] Best-effort: dedup guard skipped, file save continues
+		EmitLog("ai.ingest: Store init failed (best-effort mode, dedup skipped): %v", storeErr)
+		// vstore is nil — duplicate guard and vector store ops will be skipped below
+	}
+
+	// [v0.4.21c] Duplicate guard: only when vstore is available
+	if vstore != nil {
+		existingRec, getErr := vstore.Get(slug)
+		if getErr == nil {
+			ingestDbDuplicateSkips.Add(1)
+			EmitLog("Ingest: duplicate slug already exists in DB, skipping: %s (total_skips=%d)", slug, ingestDbDuplicateSkips.Load())
+			// [v0.4.21c] Return existing record's path instead of empty string
+			existingPath := ""
+			if existingRec != nil {
+				existingPath = existingRec.SourcePath
+			}
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": existingPath, "slug": slug}, ID: req.ID})
+			return
+		} else {
+			if !strings.Contains(getErr.Error(), "not found") {
+				EmitLog("Ingest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", slug, getErr)
+			}
+		}
+	}
+
 	// Build the path: notes/YYYY-MM for manual ep-save, YYYY/MM/DD for auto segments
 	now := time.Now()
 	isManualSave := false
@@ -1619,9 +1690,9 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 		return
 	}
 
-	// Save to Vector Store
-	vstore, err := getStore(params.AgentWs)
-	if err == nil {
+	// Save to Vector Store (vstore already obtained during duplicate guard check above)
+	// [v0.4.21c] Only attempt vector store ops when vstore is available (best-effort)
+	if vstore != nil {
 		// Only add to vector store if embedding was successful
 		if embedErr == nil && emb != nil {
 			vstore.Add(ctx, vector.EpisodeRecord{
@@ -1642,8 +1713,16 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 			triggerHealing() // Wake up background worker to heal
 		}
 
-		// Update last_activity for Sleep Timer
+		// Update last_activity for Sleep Timer (vstore is non-nil here — already guarded by outer if)
 		vstore.SetMeta("last_activity", []byte(fmt.Sprintf("%d", now.Unix())))
+	}
+
+	// [v0.4.21c] When vstore is nil (init failed), triggerHealing is skipped because
+	// there is nothing to heal — the episode file is still saved to disk.
+	// [v0.4.21e] Track unindexed saves for operational observability
+	if vstore == nil {
+		unindexedSaves.Add(1)
+		EmitLog("Ingest: Episode saved to disk but NOT indexed (vstore unavailable). unindexed_total=%d. Run rebuild when store recovers.", unindexedSaves.Load())
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": filePath, "slug": slug}, ID: req.ID})
@@ -1725,10 +1804,11 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 		MaxRetries: 2,
 		BaseDelay:  1 * time.Second,
 	}
-	vstore, err := getStore(params.AgentWs)
-	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: fmt.Sprintf("failed to get store: %v", err)}, ID: req.ID})
-		return
+	vstore, storeErr := getStore(params.AgentWs)
+	if storeErr != nil {
+		// [v0.4.21d] Best-effort: dedup guard skipped, file saves continue
+		EmitLog("ai.batchIngest: Store init failed (best-effort mode, dedup skipped): %v. Episodes will be saved but NOT indexed until store recovers.", storeErr)
+		// vstore is nil — duplicate guard and vector store ops will be skipped below
 	}
 
 	// We now use global gemmaLimiter and embedLimiter across all handlers
@@ -1738,6 +1818,11 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 5)
+
+	// [v0.4.21] Duplicate guard: track slugs within this batch request to prevent
+	// same-content items from being processed multiple times in a single RPC call.
+	var seenSlugs = make(map[string]struct{})
+	var seenMu sync.Mutex
 
 	for _, item := range params.Items {
 		wg.Add(1)
@@ -1758,6 +1843,35 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			hash := md5.Sum([]byte(it.Summary))
 			slug := fmt.Sprintf("episode-%x", hash)
 			EmitLog("Quality Guard (BatchIngest): using MD5 safe-queue slug: %s", slug)
+
+			// [v0.4.21] Duplicate guard 1: skip duplicate slugs within the same batch request
+			seenMu.Lock()
+			if _, exists := seenSlugs[slug]; exists {
+				seenMu.Unlock()
+				batchIngestSameRequestSkips.Add(1)
+				EmitLog("BatchIngest: duplicate slug in same request, skipping: %s (total_skips=%d)", slug, batchIngestSameRequestSkips.Load())
+				return
+			}
+			seenSlugs[slug] = struct{}{}
+			seenMu.Unlock()
+
+			// [v0.4.21] Duplicate guard 2: skip if a record with this slug already exists in the DB
+			// [v0.4.21d] Only when vstore is available (best-effort: dedup skipped if store init failed)
+			if vstore != nil {
+				if _, getErr := vstore.Get(slug); getErr == nil {
+					batchIngestDbDuplicateSkips.Add(1)
+					EmitLog("BatchIngest: duplicate slug already exists in DB, skipping: %s (total_skips=%d)", slug, batchIngestDbDuplicateSkips.Load())
+					mu.Lock()
+					slugs = append(slugs, slug) // still report the slug so the caller doesn't retry
+					mu.Unlock()
+					return
+				} else {
+					// Log non-"not found" errors for DB health observability.
+					if !strings.Contains(getErr.Error(), "not found") {
+						EmitLog("BatchIngest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", slug, getErr)
+					}
+				}
+			}
 
 			// embedLimiter is handled internally by RetryEmbedder now.
 			embedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -1829,6 +1943,9 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			} else if vstore != nil {
 				EmitLog("BatchIngest: VectorDB missing %s due to embedding failure. Triggering healing.", slug)
 				triggerHealing() // Wake up the background worker
+			} else {
+				// [v0.4.21e] vstore is nil (store init failed) — episode saved to disk but not indexed
+				unindexedSaves.Add(1)
 			}
 
 			mu.Lock()
@@ -1838,7 +1955,10 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	}
 
 	wg.Wait()
-
+	// [v0.4.21e] Summary log for unindexed episodes when vstore was unavailable
+	if vstore == nil && len(slugs) > 0 {
+		EmitLog("BatchIngest: %d episodes saved but NOT indexed (vstore unavailable). unindexed_total=%d. Run rebuild when store recovers.", len(slugs), unindexedSaves.Load())
+	}
 	if vstore != nil && len(successRecords) > 0 {
 		if err := vstore.BatchAdd(ctx, successRecords); err != nil {
 			EmitLog("BatchIngest: vstore.BatchAdd failed: %v", err)
@@ -2463,6 +2583,72 @@ func handleSetWatermark(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: true, ID: req.ID})
 }
 
+func handleStateGet(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		AgentId string `json:"agentId"`
+		Key     string `json:"key"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.Key == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'key'"}, ID: req.ID})
+		return
+	}
+
+	stateStore, err := getGlobalStateStore()
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	val, getErr := stateStore.Get(params.Key)
+	if getErr != nil {
+		// [v0.4.21c] Distinguish real DB errors from not-found.
+		// store.Get() returns ("", nil) for not-found, so getErr != nil means actual failure.
+		EmitLog("state.get: failed to read key %s: %v", params.Key, getErr)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: fmt.Sprintf("state.get read error: %v", getErr)}, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: val, ID: req.ID})
+}
+
+func handleStateSet(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		AgentId string `json:"agentId"`
+		Key     string `json:"key"`
+		Value   string `json:"value"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if params.Key == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'key'"}, ID: req.ID})
+		return
+	}
+
+	stateStore, err := getGlobalStateStore()
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	if setErr := stateStore.Set(params.Key, params.Value); setErr != nil {
+		EmitLog("state.set: failed to write key %s: %v", params.Key, setErr)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: setErr.Error()}, ID: req.ID})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: true, ID: req.ID})
+}
+
 func handleSetMeta(conn net.Conn, req RPCRequest) {
 	var params struct {
 		AgentWs string `json:"agentWs"`
@@ -2524,6 +2710,8 @@ func startWatchdog() {
 		buf := make([]byte, 1)
 		_, err := os.Stdin.Read(buf)
 		EmitLog("Stdin closed (parent death detected): %v. Terminating.", err)
+		// [v0.4.21c] Close state DB before exit to release file locks
+		closeGlobalStateStore()
 		os.Exit(0)
 	}()
 }
@@ -2971,6 +3159,10 @@ func handleConnection(conn net.Conn) {
 			go handleSetWatermark(conn, req)
 		case "ai.setMeta":
 			go handleSetMeta(conn, req)
+		case "state.get":
+			go handleStateGet(conn, req)
+		case "state.set":
+			go handleStateSet(conn, req)
 		case "ai.triggerBackgroundIndex":
 			go handleTriggerBackgroundIndex(conn, req)
 		case "migration.rollbackLegacyNestedEpisodeTree":

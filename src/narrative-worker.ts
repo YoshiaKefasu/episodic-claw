@@ -4,7 +4,7 @@
  * and Ack/Retries the cache job. Per-agent continuity state is maintained.
  */
 
-import { estimateTokens } from "./utils";
+import { estimateTokens, agentWsHash } from "./utils";
 import { OpenRouterClient, OpenRouterError } from "./openrouter-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
@@ -146,12 +146,22 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     }
   }
 
-  // Gate 2: English planning phrase in first 100 chars (CoT leakage)
+  // Gate 2: CoT / Planning phrase detection (English + Japanese)
   const cotPatterns = [
+    // --- English (existing) ---
     /\bOkay\b.*\b(let me|I need|I should|I'll|first)\b/i,
     /\bLet me\b.*\b(parse|understand|analyze|start|think)\b/i,
     /\bFirst,?\s+I\s+(need|should|will|must)\b/i,
     /\bI need to\b.*\b(parse|understand|focus|ensure)\b/i,
+
+    // --- [v0.4.21b] Japanese CoT patterns ---
+    /では[、。].*(整理|分析|まとめ|考察|見)/,
+    /まず[、。].*(理解|確認|分析|見|整理)/,
+    /この会話[では].*(注目|重要|焦点|注視)/,
+    /要約すると[、。]/,
+    /順に[、。].*(見|確認|整理|追う)/,
+    /お伝えします[、。]/,
+    /^.*を(整理|分析|まとめ|考察)(?:しましょう|して)(?:[、。]|$)/,
   ];
   for (const pat of cotPatterns) {
     if (pat.test(firstChars)) {
@@ -166,12 +176,18 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
   // — which does NOT start the line with the phrase. Only assistant-mode outputs
   // start the output with these phrases (e.g. "ありがとうございます！まとめました。").
   const assistantPhrases = [
+    // --- Existing ---
     "ありがとうございます",
     "以下の通りです",
     "まとめました",
     "今後の展望",
     "要点をまとめ",
     "お手伝いします",
+    // --- [v0.4.21b] Additional ---
+    "承知いたしました",
+    "かしこまりました",
+    "それではまとめ",
+    "確認いたします",
   ];
   for (const phrase of assistantPhrases) {
     if (firstLine.trimStart().startsWith(phrase)) {
@@ -226,8 +242,13 @@ export class NarrativeWorker {
   private consecutiveEmptyPolls = 0;
   private nextPollDelayMs = POLL_INTERVAL_MS;
   private readonly MAX_POLL_DELAY_MS = 15_000; // Cap at 15 seconds
-  // [v0.4.19d] Idempotency guard: rawText hash → savedAt timestamp
+  // [v0.4.19d] Idempotency guard: scoped rawText hash → savedAt timestamp
+  // [v0.4.21c] Key format changed to `agentWs:agentId:rawHash` for agent/workspace isolation
   private recentSaveHashes = new Map<string, number>();
+  // [v0.4.21b] Debounce counter for save hash persistence (avoid DB write on every save)
+  // [v0.4.21d] Per-agent isolation: each agent has its own counter for predictable debounce timing
+  private saveHashPersistCounters = new Map<string, number>();
+  private readonly SAVE_HASH_PERSIST_INTERVAL = 5; // persist every 5th save
 
   constructor(
     private client: OpenRouterClient,
@@ -283,12 +304,15 @@ export class NarrativeWorker {
       try {
         const result = await this.rpcClient.cacheGetLatestNarrative(agentWs, agentId);
         if (result?.found && result.body) {
-          this.lastNarrativeByAgent.set(agentId, { episodeId: result.episodeId, body: result.body });
+          // [v0.4.21f] Workspace-isolated key prevents cross-workspace continuity bleed
+          this.lastNarrativeByAgent.set(`${agentWsHash(agentWs)}:${agentId}`, { episodeId: result.episodeId, body: result.body });
           console.log(`[NarrativeWorker] Loaded continuity for agent ${agentId}: ${result.episodeId}`);
         }
       } catch (err) {
         // No continuity available yet
       }
+      // [v0.4.21b] Restore save hashes from state DB so dedup persists across restarts
+      await this.loadSaveHashes(agentWs, agentId);
     }
   }
 
@@ -405,8 +429,9 @@ export class NarrativeWorker {
     label: string,
   ): Promise<NarrativeResult | null> {
     const systemPrompt = this.resolveSystemPrompt();
+    // [v0.4.21f] Workspace-isolated key prevents cross-workspace continuity bleed
     const previous = this.config.narrativePreviousEpisodeRef !== false
-      ? this.lastNarrativeByAgent.get(item.agentId)
+      ? this.lastNarrativeByAgent.get(`${agentWsHash(item.agentWs)}:${item.agentId}`)
       : undefined;
     const conversationText = item.rawText;
     const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
@@ -492,20 +517,72 @@ export class NarrativeWorker {
     }
   }
 
+  // ─── [v0.4.21b] Save hash persistence ─────────────────────────────────
+
+  /** [v0.4.21b] Persist recentSaveHashes to state DB so they survive restarts.
+   *  [v0.4.21c] Only persists entries for the calling agent (scoped key filtering).
+   *  Debounced: only writes every SAVE_HASH_PERSIST_INTERVAL saves to reduce DB I/O.
+   *  In-memory map is the primary guard; DB is a restart-recovery backup.
+   */
+  private persistSaveHashes(agentWs: string, agentId: string): void {
+    if (!agentWs || !agentId) return;
+    // [v0.4.21e] Per-agent counter with hash identity: isolate debounce timing across agents
+    const agentKey = `${agentWsHash(agentWs)}:${agentId}`;
+    const count = (this.saveHashPersistCounters.get(agentKey) ?? 0) + 1;
+    this.saveHashPersistCounters.set(agentKey, count);
+    if (count % this.SAVE_HASH_PERSIST_INTERVAL !== 0) return;
+    // [v0.4.21e] Filter to only this agent's entries (scoped key uses hash identity)
+    const prefix = `${agentWsHash(agentWs)}:${agentId}:`;
+    const entries = Array.from(this.recentSaveHashes.entries())
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([key, timestamp]) => ({ key: key.slice(prefix.length), timestamp })); // DB stores rawHash only
+    this.rpcClient.setNarrativeSaveHashes(agentWs, agentId, entries)
+      .catch((err) => console.warn("[NarrativeWorker] Failed to persist save hashes:", err));
+  }
+
+  /** [v0.4.21b] Load persisted save hashes from state DB into memory.
+   *  [v0.4.21c] Restored entries are scoped with agentWs:agentId: prefix
+   *  to maintain agent/workspace isolation in the in-memory Map.
+   */
+  private async loadSaveHashes(agentWs: string, agentId: string): Promise<void> {
+    if (!agentWs || !agentId) return;
+    try {
+      const loaded = await this.rpcClient.getNarrativeSaveHashes(agentWs, agentId);
+      if (loaded.length > 0) {
+        const now = Date.now();
+        const prefix = `${agentWsHash(agentWs)}:${agentId}:`;
+        let restoredCount = 0;
+        for (const h of loaded) {
+          // Only restore entries that haven't expired
+          if (now - h.timestamp <= SAVE_HASH_TTL_MS) {
+            // [v0.4.21c] Add scoped prefix so in-memory Map is agent-isolated
+            this.recentSaveHashes.set(`${prefix}${h.key}`, h.timestamp);
+            restoredCount++;
+          }
+        }
+        console.log(`[NarrativeWorker] Restored ${restoredCount} save hashes from state DB for agent ${agentId}`);
+      }
+    } catch (err) {
+      console.warn("[NarrativeWorker] Failed to load save hashes from state DB:", err);
+    }
+  }
+
   private async saveNarrative(result: NarrativeResult, item: CacheItem): Promise<void> {
     // [v0.4.19d] Idempotency guard: skip duplicate saves within TTL window
+    // [v0.4.21c] Scoped key: agentWs:agentId:rawHash to prevent cross-agent dedup
     const rawHash = this.hashRawText(item.rawText);
+    const scopedKey = `${agentWsHash(item.agentWs)}:${item.agentId}:${rawHash}`;
     const now = Date.now();
 
     this.pruneSaveHashes();
-    if (this.recentSaveHashes.has(rawHash)) {
-      const savedAt = this.recentSaveHashes.get(rawHash)!;
+    if (this.recentSaveHashes.has(scopedKey)) {
+      const savedAt = this.recentSaveHashes.get(scopedKey)!;
       const ageMin = ((now - savedAt) / 60000).toFixed(1);
       console.warn(
-        `[NarrativeWorker] Duplicate save detected for [${item.id}] (rawText hash=${rawHash}, ` +
-        `previously saved ${ageMin}min ago). Skipping batchIngest, acknowledging only.`
+        `[NarrativeWorker] Duplicate save detected for [${item.id}] (scopedHash=${scopedKey}, ` +
+        `previously saved ${ageMin}min ago). Skipping batchIngest.`
       );
-      await this.rpcClient.cacheAck(item.id, "narrative-worker");
+      // [v0.4.21c] Ack is handled by caller (processNextFromCache) — removed from here to prevent double-ack
       return;
     }
 
@@ -527,11 +604,14 @@ export class NarrativeWorker {
         item.agentWs,
         item.agentId,
       );
-      // Record hash to prevent duplicate saves within TTL
-      this.recentSaveHashes.set(rawHash, now);
+      // Record hash to prevent duplicate saves within TTL (scoped per agent/workspace)
+      this.recentSaveHashes.set(scopedKey, now);
+      // [v0.4.21b] Persist save hashes to state DB so they survive restarts
+      this.persistSaveHashes(item.agentWs, item.agentId);
       // Only update continuity state for successfully narrativized content
       // (fallback summaries no longer reach this path — they are re-queued via cacheRetry)
-      this.lastNarrativeByAgent.set(item.agentId, { episodeId: `narrative-${now}`, body: result.text });
+      // [v0.4.21f] Workspace-isolated key prevents cross-workspace continuity bleed
+      this.lastNarrativeByAgent.set(`${agentWsHash(item.agentWs)}:${item.agentId}`, { episodeId: `narrative-${now}`, body: result.text });
     } catch (err) {
       console.error("[NarrativeWorker] Failed to save narrative episode:", err);
       throw err;

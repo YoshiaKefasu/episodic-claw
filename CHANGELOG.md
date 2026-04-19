@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.21] - 2026-04-20
+
+### Fixed
+- **Compaction/restart re-narrativization hardening**: Closed residual cursor and persistence gaps across compaction, warm-start, and restart paths so already-processed turns are not re-ingested after recovery.
+- **State persistence reliability**: Introduced a dedicated global `state.db` for control state (cursor/save-hashes), keeping memory/vector/cache stores separated and reducing cross-store coupling.
+- **Batch ingest best-effort parity**: `handleBatchIngest` now mirrors single-ingest best-effort behavior under store initialization failures, preserving disk saves while safely skipping unavailable vector operations.
+- **Workspace identity unification**: Unified identity handling with `agentWsHash` across DB and in-memory paths; fixed cross-workspace continuity bleed by scoping `lastNarrativeByAgent` with workspace-aware keys.
+- **Cross-platform path normalization safety**: Restricted case-folding in `agentWsHash` to Windows-only to avoid false identity collisions on case-sensitive filesystems.
+- **Duplicate/ack and guard correctness**: Removed duplicate ack paths, tightened duplicate guards, and aligned duplicate response metadata (`existingRec.SourcePath`) for consistent caller behavior.
+- **State error observability**: Added defensive TS-side logging for `state.get` failure paths (while preserving empty-state fallback behavior) and improved unindexed-save observability in best-effort ingest modes.
+
+### Changed
+- **Cursor persistence behavior**: Idle-flush cursor restoration now persists immediately to prevent restart rollback to stale DB cursor values.
+- **Release/plan documentation alignment**: Consolidated v0.4.21a-f fix set into one release line with explicit risk notes for one-time key-transition behavior.
+
 ## [0.4.20] - 2026-04-22
 
 ### Fixed

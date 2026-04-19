@@ -60,6 +60,11 @@ export interface EpisodicPluginConfig {
   /** processTurn() dedup フィルタのウィンドウサイズ（デフォルト 5）。
    *  フォールバック回数が多い環境では大きくする（例: 10）。 */
   dedupWindow?: number;
+  /** [v0.4.21b] Warm-start 初回取り込みガードの閾値。
+   *  初回 before_prompt_build 時のメッセージ数がこれ以上なら再起動復帰とみなし cursor を同期。
+   *  0 に設定すると warm-start ガードを無効化。
+   *  デフォルト: 50 */
+  warmStartSkipMinMessages?: number;
   /** buffer サイズ上限 flush トリガー（文字数、デフォルト 7200）。
    *  Advanced: live flush guard for the segmenter. Forces flush regardless of surprise/time-gap.
    *  この値を超えると Surprise に関わらず強制 flush される。500 未満は非推奨。 */
