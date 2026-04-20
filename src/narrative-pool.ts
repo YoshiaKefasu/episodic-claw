@@ -1,6 +1,6 @@
 /**
- * NarrativePool — Buffers conversation messages and flushes when size limit is reached.
- * KISS: Simple char-count tracking, returns PoolFlushItem when flush is needed.
+ * NarrativePool — Passive accumulator for conversation messages.
+ * Flush triggers are decided by segmenter (surprise / 64K / idle / time-gap / force-flush).
  */
 
 import { extractText } from "./segmenter";
@@ -17,8 +17,9 @@ export class NarrativePool {
   }
 
   /**
-   * Add messages to the pool. Returns a PoolFlushItem if maxPoolChars is exceeded.
-   * The caller is responsible for clearing the buffer after receiving the item.
+   * Add messages to the pool (passive accumulator — always returns null).
+   * Flush triggers are decided by segmenter only:
+   * surprise / 64K hard cap (HARD_TOKEN_CAP) / idle / time-gap / force-flush.
    */
   add(messages: Message[], surprise: number, agentWs: string, agentId: string): PoolFlushItem | null {
     // Add messages to buffer
@@ -28,11 +29,8 @@ export class NarrativePool {
       this.charCount += text.length;
     }
 
-    // Check if flush is needed
-    if (this.charCount >= this.maxPoolChars) {
-      return this.buildFlushItem("size-limit", surprise, agentWs, agentId);
-    }
-
+    // [v0.4.22c] maxPoolChars check removed — pool no longer auto-flushes by size.
+    // Flush is triggered by segmenter boundaries only (surprise/64K/idle/time-gap/force-flush).
     return null;
   }
 

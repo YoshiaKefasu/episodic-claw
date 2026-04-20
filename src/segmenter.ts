@@ -3,7 +3,8 @@ import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
 import { NarrativePool } from "./narrative-pool";
 import { NarrativeWorker } from "./narrative-worker";
-import { splitIntoChunks, enqueueNarrativeChunks } from "./narrative-queue";
+import { splitIntoChunks, enqueueNarrativeChunks, HARD_TOKEN_CAP } from "./narrative-queue";
+import { estimateTokens } from "./utils";
 import * as fs from "fs";
 import * as path from "path";
 import type { PoolFlushItem } from "./types";
@@ -32,8 +33,32 @@ export class EventSegmenter {
   private lastProcessedLength = 0; // Track length to process only new messages
   private turnSeq = 0;
   private dedupWindow: number;
-  private maxBufferChars: number;
+  // [v0.4.22c] maxBufferChars removed — replaced by HARD_TOKEN_CAP (64K token hard cap)
+  // [v0.4.22c-audit] Running token count — updated incrementally to avoid O(N) re-scan
+  private bufferTokenCount = 0;
   private maxCharsPerChunk: number;
+
+  /**
+   * [v0.4.22c-audit] Add tokens for messages being pushed to buffer.
+   * Call alongside every this.buffer.push(...msgs) or this.buffer = [...msgs].
+   */
+  private addBufferTokens(messages: Message[]): void {
+    for (const m of messages) {
+      const text = extractText(m.content);
+      if (text) this.bufferTokenCount += estimateTokens(text);
+    }
+  }
+
+  /** [v0.4.22c-audit] Reset token count — call alongside every this.buffer = [] */
+  private resetBufferTokens(): void {
+    this.bufferTokenCount = 0;
+  }
+
+  /** [v0.4.22c-audit] Recompute token count from current buffer — call alongside this.buffer = [...msgs] */
+  private recomputeBufferTokens(): void {
+    this.bufferTokenCount = 0;
+    this.addBufferTokens(this.buffer);
+  }
   private segmentationLambda: number;
   private segmentationWarmupCount: number;
   private segmentationMinRawSurprise: number;
@@ -54,11 +79,324 @@ export class EventSegmenter {
   // [v0.4.21c] Debounced cursor persistence for normal turns
   private cursorPersistCounter = 0;
   private readonly CURSOR_PERSIST_INTERVAL = 3; // persist every 3rd turn that advances cursor
+  // [v0.4.22b] WAL flush ID counter — monotonic within a process lifetime
+  private walFlushIdCounter = 0;
+  // [v0.4.22b-fix] WAL constants — centralized for maintainability
+  private readonly WAL_MAX_BYTES = 5 * 1024 * 1024; // 5MB safety guard per file
+  // [v0.4.22c-audit] Strict durability mode: set EPISODIC_WAL_STRICT=1 to flush every line
+  private readonly WAL_FLUSH_INTERVAL_LINES = process.env.EPISODIC_WAL_STRICT ? 1 : 10;
+
+  // ─── [v0.4.22b] WAL (Write-Ahead Log) for buffer durability ──────────────
+  // Active:  {agentWs}/.episodic-wal.{agentId}.active.jsonl
+  // Staged:  {agentWs}/.episodic-wal.{agentId}.flush-{flushId}.jsonl
+  // MF-1: rotate方式 — activeを直接clearせず、stagedにrenameしてから新activeを作る
+  // MF-3: agentId別 — 複数agentが同一workspaceでもWAL混線しない
+
+  // [v0.4.22b-fix] WAL write buffer — accumulate lines in memory and flush
+  // periodically or on rotate/forceFlush to reduce sync I/O frequency
+  private walWriteBuffer: string = "";
+  private walBufferedPath: string = "";
+  private walBufferedLineCount = 0;
+
+  private getWalActivePath(agentWs: string, agentId: string): string {
+    // [v0.4.22c-audit] Sanitize agentId to prevent path traversal
+    const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return path.join(agentWs, `.episodic-wal.${safeId}.active.jsonl`);
+  }
+
+  private getWalStagedPath(agentWs: string, agentId: string, flushId: number): string {
+    // [v0.4.22c-audit] Sanitize agentId to prevent path traversal
+    const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return path.join(agentWs, `.episodic-wal.${safeId}.flush-${flushId}.jsonl`);
+  }
+
+  /**
+   * Append a single message to the active WAL file.
+   * [v0.4.22b-fix] Buffered: accumulates in memory and flushes every
+   * WAL_FLUSH_INTERVAL_LINES to reduce sync I/O frequency.
+   * Forces immediate flush on rotate/forceFlush for durability.
+   * Errors are logged but do not block processing (best-effort durability).
+   */
+  private walAppend(agentWs: string, agentId: string, msg: Message): void {
+    if (!agentWs || !agentId) return;
+    try {
+      const line = JSON.stringify(msg);
+      const activePath = this.getWalActivePath(agentWs, agentId);
+
+      // Track which file the buffer targets — reset if path changed (rare: agent switch)
+      if (this.walBufferedPath !== activePath) {
+        this.walFlushWriteBuffer(); // flush any stale buffer first
+        this.walBufferedPath = activePath;
+      }
+
+      this.walWriteBuffer += line + "\n";
+      this.walBufferedLineCount++;
+
+      // Flush when threshold reached
+      if (this.walBufferedLineCount >= this.WAL_FLUSH_INTERVAL_LINES) {
+        this.walFlushWriteBuffer();
+      }
+
+      if (process.env.DEBUG_EPISODIC_WAL) {
+        console.log(JSON.stringify({
+          source: "episodic-claw", event: "wal-append",
+          agentId, path: activePath, bufferedLines: this.walBufferedLineCount, lineLen: line.length,
+        }));
+      }
+    } catch (err) {
+      // Best-effort: WAL failure must not block conversation processing
+      console.warn("[Episodic Memory] WAL append failed (non-fatal):", err);
+    }
+  }
+
+  /**
+   * Flush the in-memory WAL write buffer to disk synchronously.
+   * Called when line threshold is reached, before rotate, or before forceFlush.
+   */
+  private walFlushWriteBuffer(): void {
+    if (this.walWriteBuffer.length === 0) return;
+    try {
+      fs.appendFileSync(this.walBufferedPath, this.walWriteBuffer, "utf8");
+    } catch (err) {
+      console.warn("[Episodic Memory] WAL buffer flush failed (non-fatal):", err);
+    }
+    this.walWriteBuffer = "";
+    this.walBufferedLineCount = 0;
+  }
+
+  /**
+   * Rotate the active WAL to a staged file for flush processing.
+   * MF-1: active→stagedにrename → 新しい空activeを作成
+   * After this, new messages go to the fresh active file while
+   * the staged file awaits enqueue confirmation.
+   * Returns the flushId used for tracking, or -1 on failure.
+   */
+  private walRotateForFlush(agentWs: string, agentId: string): number {
+    const flushId = ++this.walFlushIdCounter;
+    const activePath = this.getWalActivePath(agentWs, agentId);
+    const stagedPath = this.getWalStagedPath(agentWs, agentId, flushId);
+
+    try {
+      // [v0.4.22b-fix] Flush write buffer before rotate so no data is left in memory
+      this.walFlushWriteBuffer();
+
+      // No active WAL → nothing to rotate
+      if (!fs.existsSync(activePath)) return flushId;
+
+      // [v0.4.22b-fix] Non-atomic rotation mitigation:
+      // Create the NEW empty active FIRST, then rename old active→staged.
+      // On crash between these two steps: both new-active (empty) and old-active exist.
+      // walRestore will read old-active (if still present) as active, recovering data.
+      // This is safer than rename-first → create-second which loses data on crash between them.
+      const tempNewActive = activePath + ".new";
+      fs.writeFileSync(tempNewActive, "", "utf8");
+
+      // Rename current active → staged
+      fs.renameSync(activePath, stagedPath);
+
+      // Move new active into place (same filesystem → atomic on most OS)
+      fs.renameSync(tempNewActive, activePath);
+
+      if (process.env.DEBUG_EPISODIC_WAL) {
+        console.log(JSON.stringify({
+          source: "episodic-claw", event: "wal-rotate",
+          agentId, flushId, from: activePath, to: stagedPath, activeRecreated: true,
+        }));
+      }
+      return flushId;
+    } catch (err) {
+      console.error("[Episodic Memory] WAL rotate failed:", err);
+      // Cleanup temp file if it exists
+      try {
+        const tempNewActive = activePath + ".new";
+        if (fs.existsSync(tempNewActive)) fs.unlinkSync(tempNewActive);
+      } catch { /* non-fatal */ }
+      return -1;
+    }
+  }
+
+  /**
+   * Delete a staged WAL file after successful enqueue.
+   * Only called when we are certain the data is safely in the cache DB.
+   */
+  private walDeleteStaged(agentWs: string, agentId: string, flushId: number): void {
+    if (flushId < 0) return;
+    const stagedPath = this.getWalStagedPath(agentWs, agentId, flushId);
+    try {
+      if (fs.existsSync(stagedPath)) {
+        fs.unlinkSync(stagedPath);
+        if (process.env.DEBUG_EPISODIC_WAL) {
+          console.log(JSON.stringify({
+            source: "episodic-claw", event: "wal-delete-staged",
+            agentId, flushId, deleted: true,
+          }));
+        }
+      }
+    } catch (err) {
+      console.warn("[Episodic Memory] WAL staged delete failed (non-fatal):", err);
+    }
+  }
+
+  /**
+   * Restore messages from WAL files on warm-start.
+   * Read order: staged files (oldest first) → active file.
+   * MF-5: Size guard + line-by-line parse with corrupt line skip.
+   * Returns restored messages or empty array.
+   */
+  walRestore(agentWs: string, agentId: string): Message[] {
+    if (!agentWs || !agentId) return [];
+    const restored: Message[] = [];
+    let skippedCorruptLines = 0;
+    let stagedMessageCount = 0;
+    let activeMessageCount = 0;
+
+    const parseWalFile = (filePath: string, targetCounter: { count: number }): void => {
+      try {
+        if (!fs.existsSync(filePath)) return;
+        const stat = fs.statSync(filePath);
+        if (stat.size > this.WAL_MAX_BYTES) {
+          console.warn(`[Episodic Memory] WAL file too large (${stat.size} bytes), skipping: ${filePath}`);
+          return;
+        }
+        const content = fs.readFileSync(filePath, "utf8");
+        const lines = content.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const msg = JSON.parse(trimmed) as Message;
+            if (msg.role && msg.content !== undefined) {
+              restored.push(msg);
+              targetCounter.count++;
+            } else {
+              skippedCorruptLines++;
+            }
+          } catch {
+            skippedCorruptLines++;
+          }
+        }
+      } catch (err) {
+        console.warn(`[Episodic Memory] WAL restore read error for ${filePath}:`, err);
+      }
+    };
+
+    // Read staged files first (sorted by flushId for correct order)
+    const stagedCounter = { count: 0 };
+    try {
+      const walDir = agentWs;
+      const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const stagedPattern = `.episodic-wal.${safeId}.flush-`;
+      if (fs.existsSync(walDir)) {
+        const entries = fs.readdirSync(walDir);
+        const stagedFiles = entries
+          .filter(e => e.startsWith(stagedPattern) && e.endsWith(".jsonl"))
+          .sort(); // flush-1, flush-2, ... (numeric sort works for single-process monotonic IDs)
+        for (const sf of stagedFiles) {
+          parseWalFile(path.join(walDir, sf), stagedCounter);
+        }
+      }
+    } catch (err) {
+      console.warn("[Episodic Memory] WAL staged scan error:", err);
+    }
+    stagedMessageCount = stagedCounter.count;
+
+    // Then active file
+    const activeCounter = { count: 0 };
+    parseWalFile(this.getWalActivePath(agentWs, agentId), activeCounter);
+    activeMessageCount = activeCounter.count;
+
+    if (restored.length > 0 || skippedCorruptLines > 0) {
+      console.log(JSON.stringify({
+        source: "episodic-claw", event: "wal-restore",
+        agentId, stagedMessageCount, activeMessageCount, skippedCorruptLines,
+        totalRestored: restored.length,
+      }));
+    }
+
+    // [v0.4.22c] Buffer-empty check removed — walRestore is called before processTurn
+    // populates the buffer, so this condition fires on every warm-start (false positive).
+    // Integrity is verified downstream in injectWalRestoredMessages instead.
+
+    return restored;
+  }
+
+  /**
+   * [v0.4.22b] Clear all WAL files (active + staged) for a given agent.
+   * Used by afterCompaction — compaction means conversation is fully reconstructed,
+   * so old WAL data is no longer needed.
+   */
+  private walClearAll(agentWs: string, agentId: string): void {
+    try {
+      // [v0.4.22b-fix] Flush write buffer before clearing files
+      this.walFlushWriteBuffer();
+
+      const activePath = this.getWalActivePath(agentWs, agentId);
+      if (fs.existsSync(activePath)) fs.unlinkSync(activePath);
+
+      const walDir = agentWs;
+      const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const stagedPattern = `.episodic-wal.${safeId}.flush-`;
+      if (fs.existsSync(walDir)) {
+        const entries = fs.readdirSync(walDir);
+        const stagedFiles = entries.filter(e => e.startsWith(stagedPattern) && e.endsWith(".jsonl"));
+        for (const sf of stagedFiles) {
+          fs.unlinkSync(path.join(walDir, sf));
+        }
+      }
+    } catch (err) {
+      console.warn("[Episodic Memory] WAL clear error (non-fatal):", err);
+    }
+  }
+
+  /**
+   * [v0.4.22b] Inject WAL-restored messages into the buffer and schedule idle flush.
+   * Called after bootstrapCursor on warm-start when WAL has un-flushed messages.
+   * These messages will be flushed by the idle timer or the next processTurn boundary.
+   *
+   * [v0.4.22b-fix] Duplicate injection guard:
+   * - Staged WAL files mean flush was incomplete → always inject
+   * - Active-only WAL: cursor may already cover these messages (debounce lag).
+   *   Only inject if active WAL has content (indicating un-flushed buffer data).
+   */
+  injectWalRestoredMessages(messages: Message[], agentWs: string, agentId: string): void {
+    if (messages.length === 0) return;
+    // Filter excluded roles (same as processTurn)
+    const filtered = messages.filter(m => !EXCLUDED_ROLES.has(m.role));
+    if (filtered.length === 0) return;
+
+    // [v0.4.22b-fix] Duplicate guard: check if there are staged WAL files
+    // Staged = confirmed incomplete flush → must inject
+    // Active-only = may be cursor-debounce lag → inject but warn
+    let hasStaged = false;
+    try {
+      const walDir = agentWs;
+      const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const stagedPattern = `.episodic-wal.${safeId}.flush-`;
+      if (fs.existsSync(walDir)) {
+        const entries = fs.readdirSync(walDir);
+        hasStaged = entries.some(e => e.startsWith(stagedPattern) && e.endsWith(".jsonl"));
+      }
+    } catch { /* non-fatal */ }
+
+    this.buffer.push(...filtered);
+    this.addBufferTokens(filtered);
+    this.scheduleIdleFlush(agentWs, agentId);
+
+    if (!hasStaged) {
+      // Active-only WAL: cursor may cover these already, but inject defensively
+      console.warn(`[Episodic Memory] WAL inject: active-only WAL for ${agentId} (${filtered.length} msgs). Possible cursor-debounce overlap — dedup in processTurn will handle.`);
+    }
+
+    console.log(JSON.stringify({
+      source: "episodic-claw", event: "wal-inject-restored",
+      agentId, injectedCount: filtered.length, bufferLength: this.buffer.length, hasStaged,
+    }));
+  }
 
   constructor(
     rpc: EpisodicCoreClient,
     dedupWindow = 5,
-    maxBufferChars = 7200,
+    // [v0.4.22c] maxBufferChars removed — replaced by HARD_TOKEN_CAP
     maxCharsPerChunk = 9000,
     tuning?: {
       lambda?: number;
@@ -74,7 +412,7 @@ export class EventSegmenter {
   ) {
     this.rpc = rpc;
     this.dedupWindow = dedupWindow;
-    this.maxBufferChars = maxBufferChars;
+    // [v0.4.22c] maxBufferChars assignment removed
     this.maxCharsPerChunk = maxCharsPerChunk;
     this.segmentationLambda = Math.max(0, tuning?.lambda ?? 2.0);
     this.segmentationWarmupCount = Math.max(0, tuning?.warmupCount ?? 10);  // Phase 3: was 20
@@ -148,7 +486,9 @@ export class EventSegmenter {
     const savedLastProcessedLength = this.lastProcessedLength;
 
     console.log(`[Episodic Memory] Idle timeout (${this.segmentationTimeGapMinutes}min). Auto-finalizing buffer (${textContent.length} text messages)...`);
-    await this.handleSegmentBoundary(agentWs, agentId, 0, "idle-timeout");
+    // [v0.4.22c] BUG-1: WAL rotate before idle boundary processing
+    const idleFlushId = this.walRotateForFlush(agentWs, agentId);
+    await this.handleSegmentBoundary(agentWs, agentId, 0, "idle-timeout", idleFlushId);
 
     // Restore cursor — messages up to savedLastProcessedLength are already processed
     this.lastProcessedLength = savedLastProcessedLength;
@@ -156,6 +496,9 @@ export class EventSegmenter {
     // may differ from the DB value if normal turns had advanced the cursor since last persist.
     this.persistCursor(agentWs, agentId);
     this.buffer = [];
+    this.resetBufferTokens();
+    // [v0.4.22c] WAL: ensure write buffer is flushed after idle boundary
+    this.walFlushWriteBuffer();
     return true;
   }
 
@@ -197,6 +540,7 @@ export class EventSegmenter {
       this.pendingCompactionSkip = false;
       this.lastProcessedLength = currentMessages.length;
       this.buffer = [];
+      this.resetBufferTokens();
       console.log(JSON.stringify({ source: "episodic-claw", event: "compaction-skip", cursor: currentMessages.length, messageCount: currentMessages.length, reason: "afterCompaction" }));
       // [v0.4.21b] Persist cursor AFTER advancement so it survives restart
       this.persistCursor(agentWs, agentId);
@@ -213,10 +557,20 @@ export class EventSegmenter {
       this.clearIdleFlushTimer(); // Clear timer on context reset
       this.lastProcessedLength = 0;
       this.buffer = []; // forceFlush 失敗時も確実にクリア
+      this.resetBufferTokens();
+      // [v0.4.22c] BUG-3: clear all WAL files on context reset — new session must start clean
+      this.walClearAll(agentWs, agentId);
     }
 
     const newMessages = currentMessages.slice(this.lastProcessedLength);
     if (newMessages.length === 0) {
+      // [v0.4.22] Fix A: buffer非空かつtimer未セットならidle flushタイマーをセット
+      // warm-start後等でnewMessages=0でもbufferに未処理分がある場合、
+      // タイマーが未セットなら15分後にflushされないバグを防ぐ。
+      // ガード: !this.idleFlushTimer — 既存タイマーがある場合は延長しない（多重before_prompt_build呼び出し対策）
+      if (this.buffer.length > 0 && !this.idleFlushTimer) {
+        this.scheduleIdleFlush(agentWs, agentId);
+      }
       console.log(`[Episodic Memory] processTurn: no new messages (lastProcessedLength=${this.lastProcessedLength}, current=${currentMessages.length})`);
       return false;
     }
@@ -266,6 +620,8 @@ export class EventSegmenter {
     if (this.buffer.length === 0) {
       // First turn, just absorb
       this.buffer.push(...dedupedMessages);
+      this.addBufferTokens(dedupedMessages);
+      for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
       this.lastProcessedLength = currentMessages.length;
       this.maybePersistCursor(agentWs, agentId);
       // Schedule idle flush for the new buffer
@@ -298,13 +654,19 @@ export class EventSegmenter {
     }
 
     // 定期的なチャンク分割（Surprise判定を待たずにバッファが大きすぎる場合は強制分割）
-    const estimatedChars = this.buffer.reduce((acc, m) => acc + extractText(m.content).length, 0);
+    // [v0.4.22c-audit] Running token count — incrementally updated, no O(N) re-scan
+    const sizeLimitExceeded = this.bufferTokenCount >= HARD_TOKEN_CAP;
 
     // Phase 3: Time gap boundary check
     if (this.isTimeGapBoundary(dedupedMessages)) {
       console.log(`[Episodic Memory] Time gap boundary detected (${this.segmentationTimeGapMinutes}min threshold). Forcing segment...`);
-      await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap");
+      // [v0.4.22b] WAL: rotate before boundary processing
+      const timeGapFlushId = this.walRotateForFlush(agentWs, agentId);
+      await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap", timeGapFlushId);
       this.buffer = [...dedupedMessages];
+      this.recomputeBufferTokens();
+      // [v0.4.22b] WAL: persist new-context messages
+      for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
       this.lastProcessedLength = currentMessages.length;
       this.maybePersistCursor(agentWs, agentId);
       // Reschedule idle flush for the new buffer after time-gap boundary
@@ -313,7 +675,6 @@ export class EventSegmenter {
     }
 
     try {
-      const sizeLimitExceeded = estimatedChars > this.maxBufferChars;
       this.turnSeq += 1;
 
       const score = await this.rpc.segmentScore({
@@ -350,18 +711,25 @@ export class EventSegmenter {
         const reason = sizeLimitExceeded ? "size-limit" : "surprise-boundary";
         console.log(`[Episodic Memory] ${reason} exceeded. Finalizing previous episode...`);
 
+        // [v0.4.22b] WAL: rotate active→staged before boundary processing
+        const boundaryFlushId = this.walRotateForFlush(agentWs, agentId);
+
         // Mode branching: pool+queue (v0.4.0) vs legacy chunkAndIngest (v0.3.x)
-        this.handleSegmentBoundary(agentWs, agentId, surprise, reason).catch(err => {
+        this.handleSegmentBoundary(agentWs, agentId, surprise, reason, boundaryFlushId).catch(err => {
           console.error("[Episodic Memory] Error in segment boundary handling:", err);
         });
 
         // Clear buffer and start fresh with the new context
         this.buffer = [...dedupedMessages];
+        this.recomputeBufferTokens();
+        for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
         // Reschedule idle flush for the new buffer after boundary
         this.scheduleIdleFlush(agentWs, agentId);
       } else {
         // Just append to buffer / update buffer
         this.buffer.push(...dedupedMessages);
+        this.addBufferTokens(dedupedMessages);
+        for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
         // Reschedule idle flush for the updated buffer
         this.scheduleIdleFlush(agentWs, agentId);
       }
@@ -372,6 +740,8 @@ export class EventSegmenter {
       console.error("[Episodic Memory] Error in segmenter processTurn:", err);
       // Fallback: absorb deduped messages only（Fix D-1 を catch でも維持）
       this.buffer.push(...dedupedMessages);
+      this.addBufferTokens(dedupedMessages);
+      for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
       this.lastProcessedLength = currentMessages.length;
       this.maybePersistCursor(agentWs, agentId);
       // Reschedule idle flush on error recovery
@@ -385,9 +755,9 @@ export class EventSegmenter {
    * Mode branching: pool+queue (v0.4.0 narrative) vs legacy chunkAndIngest (v0.3.x).
    * Fire-and-forget — never awaited by processTurn.
    */
-  private async handleSegmentBoundary(agentWs: string, agentId: string, surprise: number, reason: string): Promise<void> {
+  private async handleSegmentBoundary(agentWs: string, agentId: string, surprise: number, reason: string, walFlushId: number = -1): Promise<void> {
     if (this.pool && this.narrativeWorker) {
-      return this.poolAndQueue(agentWs, agentId, surprise, reason);
+      return this.poolAndQueue(agentWs, agentId, surprise, reason, walFlushId);
     }
     // Legacy path (v0.3.x) — no narrative architecture
     return this.chunkAndIngest(this.buffer, agentWs, reason, agentId, surprise);
@@ -398,12 +768,13 @@ export class EventSegmenter {
    * and enqueue to the Go cache DB for sequential narrativization.
    * Fire-and-forget — never awaited by processTurn.
    */
-  private async poolAndQueue(agentWs: string, agentId: string, surprise: number, reason: string): Promise<void> {
+  private async poolAndQueue(agentWs: string, agentId: string, surprise: number, reason: string, walFlushId: number = -1): Promise<void> {
     if (!this.pool || !this.narrativeWorker) return;
 
     const item = this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
     // Clear segmenter buffer and idle flush timer; data is now in the pool.
     this.buffer = [];
+    this.resetBufferTokens();
     this.lastProcessedLength = 0;
     this.clearIdleFlushTimer();
 
@@ -425,6 +796,16 @@ export class EventSegmenter {
         .then(() => {
           // Enqueue succeeded — safe to clear pool
           this.pool!.clear();
+          // [v0.4.22b] WAL: delete staged file only after confirmed enqueue
+          if (walFlushId >= 0) {
+            this.walDeleteStaged(agentWs, agentId, walFlushId);
+          }
+          if (process.env.DEBUG_EPISODIC_WAL) {
+            console.log(JSON.stringify({
+              source: "episodic-claw", event: "wal-enqueue-result",
+              agentId, flushId: walFlushId, success: true, enqueuedChunks: chunks.length,
+            }));
+          }
         })
         .catch(err => {
           console.error("[Episodic Memory] Cache enqueue failed:", err);
@@ -455,13 +836,16 @@ export class EventSegmenter {
    * このメソッドは compaction 特有の「メッセージ短縮」を「既処理」として扱い、
    * 真のコンテキストリセット（セッション全消去）との区別を可能にする。
    */
-  afterCompaction(): void {
+  afterCompaction(agentWs: string = "", agentId: string = ""): void {
     this.pendingCompactionSkip = true;
     this.buffer = [];
+    this.resetBufferTokens();
     this.turnSeq = 0;
     this.clearIdleFlushTimer();
-    // NOTE: cursor persistence happens in processTurn when pendingCompactionSkip fires,
-    // because the actual cursor advancement happens there (not here).
+    // [v0.4.22d] WAL: compaction後は会話が再構成済みのためWALも明示クリア
+    if (agentWs && agentId) {
+      this.walClearAll(agentWs, agentId);
+    }
     console.log(JSON.stringify({ source: "episodic-claw", event: "after-compaction", pendingSkip: true, bufferCleared: true }));
   }
 
@@ -478,6 +862,7 @@ export class EventSegmenter {
     const changed = this.lastProcessedLength !== next;
     this.lastProcessedLength = next;
     this.buffer = [];
+    this.resetBufferTokens();
     this.turnSeq = 0;
     this.clearIdleFlushTimer();
     console.log(JSON.stringify({ source: "episodic-claw", event: "bootstrap-cursor", cursor: this.lastProcessedLength, reason }));
@@ -539,9 +924,14 @@ export class EventSegmenter {
    */
   async forceFlush(agentWs: string, agentId: string = ""): Promise<void> {
     if (this.buffer.length === 0) return;
+    // [v0.4.22b] Save cursor before flush — restore after to prevent B-1 cursor regression
+    const savedCursor = this.lastProcessedLength;
     try {
       console.log(`[Episodic Memory] Force flushing segmenter buffer (${this.buffer.length} messages)...`);
       this.clearIdleFlushTimer(); // Clear timer on force flush
+
+      // [v0.4.22b] WAL: rotate active→staged for this flush
+      const forceFlushId = this.walRotateForFlush(agentWs, agentId);
 
       if (this.pool && this.narrativeWorker) {
         // Pool mode (v0.4.2): add to pool, split, and enqueue to cache DB
@@ -551,6 +941,10 @@ export class EventSegmenter {
           const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0, item.messages);
           // [v0.4.13] Await enqueue first, then clear pool — consistent with poolAndQueue semantics
           await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
+          // [v0.4.22b] WAL: delete staged after confirmed enqueue
+          if (forceFlushId >= 0) {
+            this.walDeleteStaged(agentWs, agentId, forceFlushId);
+          }
         }
         // [AUDIT NOTE] this.pool.clear() runs AFTER await enqueueNarrativeChunks() (fixed in v0.4.13).
         // If enqueue throws, pool data is preserved — the outer try/catch skips this line.
@@ -558,15 +952,31 @@ export class EventSegmenter {
         // [v0.4.13] Clear pool AFTER successful enqueue (data preserved on failure)
         this.pool.clear();
         this.buffer = [];
-        this.lastProcessedLength = 0;
+        this.resetBufferTokens();
+        // [v0.4.22b-fix] Restore savedCursor on success too — persisting 0 causes
+        // full reprocessing on restart. savedCursor reflects the true processed position.
+        this.lastProcessedLength = savedCursor;
+        this.persistCursor(agentWs, agentId);
         return;
       }
 
       // Legacy path (v0.3.x)
       await this.chunkAndIngest(this.buffer, agentWs, "force-flush", agentId);
+      // [v0.4.22b] WAL: delete staged after confirmed enqueue (legacy path)
+      if (forceFlushId >= 0) {
+        this.walDeleteStaged(agentWs, agentId, forceFlushId);
+      }
       this.buffer = [];
+      this.resetBufferTokens();
+      this.lastProcessedLength = savedCursor;
+      this.persistCursor(agentWs, agentId);
     } catch (err) {
       console.error("[Episodic Memory] Error in segmenter forceFlush:", err);
+      // [v0.4.22c] BUG-2: WAL flush write buffer on failure too — data in memory must reach disk
+      this.walFlushWriteBuffer();
+      // [v0.4.22b] On failure: restore cursor so B-1 restart doesn't reprocess everything
+      this.lastProcessedLength = savedCursor;
+      this.persistCursor(agentWs, agentId);
     }
   }
 

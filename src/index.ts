@@ -326,7 +326,7 @@ const PluginConfigSchema = Type.Object(
     })),
     maxBufferChars: Type.Optional(Type.Integer({
       minimum: 500,
-      description: "Advanced: character threshold that forces the segmenter to flush regardless of surprise/time-gap boundaries. Default: 7200. Acts as a live flush guard to prevent unbounded buffer growth."
+      description: "Deprecated (v0.4.22c): No longer used. 64K token hard cap (HARD_TOKEN_CAP) replaces this. Retained for backward compatibility only."
     })),
     maxCharsPerChunk: Type.Optional(Type.Integer({
       minimum: 500,
@@ -413,7 +413,7 @@ const PluginConfigSchema = Type.Object(
     })),
     maxPoolChars: Type.Optional(Type.Integer({
       minimum: 1000,
-      description: "Advanced: maximum characters accumulated in the narrative pool before triggering a flush to the cache queue. Default: 15000. Acts as a pool flush guard to prevent context overflow."
+      description: "Deprecated (v0.4.22c): No longer used. Pool is a passive accumulator; boundary is decided by segmenter (surprise / 64K hard cap / idle / time-gap / force-flush). Retained for backward compatibility only."
     })),
     narrativePreviousEpisodeRef: Type.Optional(Type.Boolean({
       description: "Pass the full previous episode to the LLM for context continuity. Default: true."
@@ -591,7 +591,7 @@ const episodicClawPlugin = {
         const segmenter = new EventSegmenter(
           rpcClient,
           cfg.dedupWindow,
-          cfg.maxBufferChars,
+          // [v0.4.22c] cfg.maxBufferChars removed — replaced by HARD_TOKEN_CAP
           cfg.maxCharsPerChunk,
           {
             lambda: cfg.segmentationLambda,
@@ -833,6 +833,24 @@ const episodicClawPlugin = {
       api.on("gateway_stop", async (event?: any, _ctx?: any) => {
         console.log("[Episodic Memory] Stopping plugin...", event?.reason ? `(reason: ${event.reason})` : "");
 
+        // [v0.4.22] Fix B-1: gateway停止時に全agentのバッファをflush
+        // SIGTERM等でプロセスが終了する場合、segmenterバッファ内の
+        // 未物語化メッセージが消失するのを防ぐ
+        if (_singleton?.agentStates) {
+          const flushPromises: Promise<void>[] = [];
+          for (const [agentId, state] of _singleton.agentStates) {
+            if (state.segmenter && state.lastAgentWs) {
+              console.log(`[Episodic Memory] gateway_stop: flushing buffer for ${agentId}...`);
+              flushPromises.push(
+                state.segmenter.forceFlush(state.lastAgentWs, agentId)
+                  .catch(err => console.error(`[Episodic Memory] gateway_stop: flush error for ${agentId}:`, err))
+              );
+            }
+          }
+          await Promise.all(flushPromises);
+          console.log("[Episodic Memory] gateway_stop: all buffers flushed.");
+        }
+
         // Narrative architecture (v0.4.0) — graceful stop of narrative worker
         if (_singleton!.narrativeWorker) {
           console.log("[Episodic Memory] Stopping narrative worker...");
@@ -900,7 +918,7 @@ const episodicClawPlugin = {
         // [v0.4.21] Compaction 後の再物語化防止: segmenter に skip フラグを設定
         // before_compaction で forceFlush が lastProcessedLength = 0 にリセットするが、
         // compaction 後の processTurn が全メッセージを再処理してしまうのを防ぐ
-        state.segmenter.afterCompaction();
+        state.segmenter.afterCompaction(agentWs, agentId);
 
         console.log("[Episodic Memory] after_compaction: checking for anchor...");
         try {
@@ -946,6 +964,12 @@ const episodicClawPlugin = {
             // [v0.4.21d] Use "warm-start" reason so bootstrapCursor skips same-value write-back
             // (changed from "manual" — manual implies user-explicit operation, not DB restore)
             state.segmenter.bootstrapCursor(clamped, "warm-start", agentWs, agentId);
+            // [v0.4.22b] WAL: restore un-flushed messages from WAL after cursor bootstrap
+            const walMessages = state.segmenter.walRestore(agentWs, agentId);
+            if (walMessages.length > 0) {
+              console.log(`[Episodic Memory] WAL restored ${walMessages.length} messages for ${agentId}. Injecting into buffer for idle flush.`);
+              state.segmenter.injectWalRestoredMessages(walMessages, agentWs, agentId);
+            }
           }
         }
 

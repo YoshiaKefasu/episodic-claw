@@ -521,6 +521,43 @@ export class EpisodicRetriever {
       .filter(m => m.role === "user")
       .slice(-recentMessageCount);
 
+    // [v0.4.22] Fix C: recall window 観測ログ
+    // 選定された末尾N件 user message のフィンガープリントを出力し、
+    // 「最新ユーザー発話がwindowに入っていたか」「分類除外で落ちたか」を判別可能にする
+    // パフォーマンス配慮: SHA1は使わず、length+isDominantのみで軽量に。
+    // DEBUG_EPISODIC_RECALL_FINGERPRINT 環境変数がセットされている時のみ出力。
+    if (process.env.DEBUG_EPISODIC_RECALL_FINGERPRINT) {
+      const lastMsg = currentMessages.at(-1);
+      const lastRole = lastMsg?.role ?? "none";
+      const allUserMsgs = currentMessages.filter(m => m.role === "user");
+      const latestUserMsg = allUserMsgs.at(-1);
+      const latestUserInWindow = recentMessages.includes(latestUserMsg!);
+      const fingerprints = recentMessages.map((m, i) => {
+        const rawText = extractText(m.content);
+        const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
+        const { isDominant, cleanedText } = classifyAndStripAttachment(text);
+        return { idx: i, rawLen: rawText.length, cleanedLen: cleanedText.length, isDominant };
+      });
+      let latestUserDroppedByClassifier = false;
+      if (latestUserInWindow && latestUserMsg) {
+        const rawText = extractText(latestUserMsg.content);
+        const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
+        const { isDominant, cleanedText } = classifyAndStripAttachment(text);
+        latestUserDroppedByClassifier = isDominant && cleanedText.length < 3;
+      }
+      console.log(JSON.stringify({
+        source: "episodic-claw",
+        event: "recall-window-fingerprint",
+        currentMsgCount: currentMessages.length,
+        userMsgCount: allUserMsgs.length,
+        windowSize: recentMessageCount,
+        lastRole,
+        latestUserInWindow,
+        latestUserDroppedByClassifier,
+        fingerprints,
+      }));
+    }
+
     // Count eligible vs skipped messages for observability
     let eligibleCount = 0;
     let skippedCount = 0;

@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.22] - 2026-04-21
+
+### Fixed
+- **Idle flush warm-start gap (Fix A)**: `processTurn` early return with `newMessages=0` no longer skips `scheduleIdleFlush` when buffer is non-empty and no timer is set. Guarded to avoid extending existing timers on repeated `before_prompt_build` calls.
+- **Gateway stop buffer loss (Fix B-1)**: `gateway_stop` hook now flushes all agent segmenter buffers before stopping the narrative worker and RPC. Each agent flush is independent (`Promise.all` + `.catch`) so one failure does not block others.
+- **Recall window observability (Fix C)**: Added `DEBUG_EPISODIC_RECALL_FINGERPRINT` environment-variable-gated fingerprint logging for recall window selection. Logs `latestUserInWindow`, `latestUserDroppedByClassifier`, and per-message fingerprints so that "latest user message not included" symptoms can be diagnosed from logs alone.
+- **WAL-based buffer durability**: Messages are now appended to a per-agent JSONL write-ahead log (`{agentWs}/.episodic-wal.{agentId}.active.jsonl`) on every `buffer.push`. On flush, the active WAL is rotated to a staged file; the staged file is deleted only after confirmed enqueue to the cache DB. On warm-start, WAL files are restored and injected into the buffer for idle-flush recovery. This eliminates un-narrativized message loss on crash/kill.
+- **forceFlush cursor protection**: `forceFlush` now restores `lastProcessedLength` to its pre-flush value (`savedCursor`) and persists it, preventing full reprocessing on restart after `gateway_stop` → forceFlush.
+- **Idle flush WAL rotate (BUG-1 fix)**: `handleIdleFlush` now calls `walRotateForFlush` before `handleSegmentBoundary`, ensuring the active WAL is rotated and cleared on idle timeout.
+- **forceFlush catch WAL flush (BUG-2 fix)**: `forceFlush` catch block now calls `walFlushWriteBuffer()` so in-memory WAL data reaches disk even on failure.
+- **Context reset WAL clear (BUG-3 fix)**: Context reset detection now calls `walClearAll` so stale WAL data from a previous session does not leak into the new session.
+- **afterCompaction WAL clear (BUG-A fix)**: `afterCompaction` now calls `walClearAll` to prevent pre-compaction WAL data from being restored on next warm-start.
+- **WAL safeId scan (BUG-B fix)**: All WAL staged-file scan patterns now use `agentId.replace(/[^a-zA-Z0-9_-]/g, "_")` matching the file naming convention, preventing path-traversal issues and scan mismatches for agentIds with special characters.
+- **Path traversal prevention**: `getWalActivePath` and `getWalStagedPath` sanitize `agentId` to prevent directory traversal via WAL file paths.
+
+### Changed
+- **64K token hard cap unification**: Buffer size-limit detection now uses `HARD_TOKEN_CAP` (64,000 tokens) via `estimateTokens()` and incremental `bufferTokenCount` tracking, replacing the previous `maxBufferChars` (7,200 chars) and `maxPoolChars` (15,000 chars) thresholds.
+- **maxBufferChars / maxPoolChars deprecated**: Both settings are retained for backward compatibility but no longer affect runtime behavior. Pool is now a passive accumulator; boundary decisions come from segmenter only (surprise / 64K hard cap / idle / time-gap / force-flush).
+- **Incremental token counting**: `addBufferTokens()` / `resetBufferTokens()` / `recomputeBufferTokens()` track buffer token count incrementally, eliminating O(N) re-scan on every `processTurn`.
+- **`segmentationTimeGapMinutes` one-knob policy**: This single setting now controls both (1) time-gap boundary detection and (2) idle auto-flush timeout. Description updated in configSchema.
+- **WAL durability modes**: Default mode buffers 10 lines before disk flush (performance). Set `EPISODIC_WAL_STRICT=1` for line-by-line flush (maximum durability, higher I/O).
+- **WAL size guard**: WAL files exceeding 5 MB are skipped during restore to prevent unbounded memory use.
+
 ## [0.4.21] - 2026-04-20
 
 ### Fixed

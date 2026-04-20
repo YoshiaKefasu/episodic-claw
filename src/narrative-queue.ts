@@ -10,7 +10,8 @@ import type { Message } from "./segmenter";
 import { extractText } from "./segmenter";
 
 const SOFT_TOKEN_TARGET = 48_000;
-const HARD_TOKEN_CAP = 64_000;
+// [v0.4.22b] Exported for 64K boundary unification in segmenter.ts
+export const HARD_TOKEN_CAP = 64_000;
 
 export interface CacheQueueItem {
   id: string;
@@ -156,7 +157,7 @@ export function splitIntoChunks(
         console.log(
           `[Episodic Cache] Chunk split at non-conversation boundary ` +
           `(chunkIndex=${chunkIndex}, lastRole=${lastRoleInChunk}). ` +
-          `Consider reducing maxPoolChars for smaller chunks.`
+          `Consider reducing HARD_TOKEN_CAP or segmentationWarmupCount for smaller chunks.`
         );
       }
       pushChunk(currentLines, chunkIndex);

@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.21",
+  "version": "0.4.22",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -48,7 +48,7 @@
       "maxBufferChars": {
         "type": "integer",
         "minimum": 500,
-        "description": "Advanced: character threshold that forces the segmenter to flush regardless of surprise/time-gap boundaries. Default: 7200. Acts as a live flush guard to prevent unbounded buffer growth. ⚠️ Too high risks data loss on crash; too low causes I/O spam."
+        "description": "Deprecated (v0.4.22c): No longer used. 64K token hard cap replaces this. Retained for backward compatibility only. Default: 7200."
       },
       "maxCharsPerChunk": {
         "type": "integer",
@@ -223,7 +223,7 @@
         "type": "integer",
         "minimum": 1000,
         "default": 15000,
-        "description": "Advanced: maximum characters accumulated in the narrative pool before triggering a flush to the cache queue. Default: 15000. Acts as a pool flush guard to prevent context overflow. ⚠️ Too high risks model input limits; too low causes episode fragmentation."
+        "description": "Deprecated (v0.4.22c): No longer used. Pool is a passive accumulator; boundary is decided by segmenter only. Retained for backward compatibility only. Default: 15000."
       },
       "narrativePreviousEpisodeRef": {
         "type": "boolean",
@@ -234,7 +234,7 @@
         "type": "number",
         "minimum": 1,
         "default": 15,
-        "description": "Time gap threshold (minutes) between user messages that triggers an automatic segment boundary. Default: 15.\n⚠️ [Blast Radius] If too short: Excessive segmentation breaks conversation flow. If too long: Long pauses don't create natural episode boundaries."
+        "description": "Time gap threshold (minutes) that controls both (1) automatic segment boundary detection when a time gap is detected between user messages, and (2) idle auto-flush timeout — the delay before an unfinished buffer is automatically finalized when no new messages arrive. Default: 15. One-knob policy: changing this value affects both behaviors equally.\n⚠️ [Blast Radius] If too short: Excessive segmentation breaks conversation flow. If too long: Long pauses don't create natural episode boundaries."
       }
     }
   },
