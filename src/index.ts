@@ -87,6 +87,85 @@ function normalizeTopics(rawTopics: unknown): string[] {
   return topics;
 }
 
+type PromptAnchorNormalizationResult = {
+  latestUserAnchor: string;
+  anchorRawPreview: string;
+  anchorNormalizedPreview: string;
+  anchorAcceptedReason: string;
+  anchorRejectedReason: string;
+};
+
+function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult {
+  if (typeof prompt !== "string") {
+    return {
+      latestUserAnchor: "",
+      anchorRawPreview: "",
+      anchorNormalizedPreview: "",
+      anchorAcceptedReason: "",
+      anchorRejectedReason: "missing_or_non_string_prompt",
+    };
+  }
+
+  const raw = prompt.replace(/\r\n?/g, "\n").trim();
+  const anchorRawPreview = raw.substring(0, 80).replace(/\n/g, "\\n");
+
+  // Prefer the last explicit `user:` block when prompt contains role-labeled transcript.
+  const roleBlockRegex = /(?:^|\n)\s*(user|assistant|system|tool(?:_use|_result)?)\s*:\s*([\s\S]*?)(?=\n\s*(?:user|assistant|system|tool(?:_use|_result)?)\s*:|$)/gi;
+  let candidate = "";
+  let roleMatched = false;
+  for (const match of raw.matchAll(roleBlockRegex)) {
+    roleMatched = true;
+    if ((match[1] || "").toLowerCase() === "user") {
+      candidate = (match[2] || "").trim();
+    }
+  }
+  if (!candidate) {
+    candidate = raw;
+  }
+
+  const normalized = candidate
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/\[\[reply_to_current\]\]/g, " ")
+    .replace(/^\s*(system|assistant|tool(?:_use|_result)?)\s*:\s*/gim, " ")
+    .replace(/<\|[^>]+\|>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const anchorNormalizedPreview = normalized.substring(0, 80).replace(/\n/g, "\\n");
+  if (!normalized) {
+    return {
+      latestUserAnchor: "",
+      anchorRawPreview,
+      anchorNormalizedPreview,
+      anchorAcceptedReason: "",
+      anchorRejectedReason: roleMatched ? "user_block_empty_after_normalization" : "empty_after_normalization",
+    };
+  }
+  if (normalized.length < 3) {
+    return {
+      latestUserAnchor: "",
+      anchorRawPreview,
+      anchorNormalizedPreview,
+      anchorAcceptedReason: "",
+      anchorRejectedReason: "too_short",
+    };
+  }
+
+  return {
+    latestUserAnchor: normalized,
+    anchorRawPreview,
+    anchorNormalizedPreview,
+    anchorAcceptedReason: roleMatched ? "last_user_block" : "raw_prompt_fallback",
+    anchorRejectedReason: "",
+  };
+}
+
+function deriveLatestUserAnchorFromMessages(messages: Message[]): string {
+  const latestUser = [...messages].reverse().find((m) => m.role === "user");
+  if (!latestUser) return "";
+  return normalizePromptAnchor(extractText(latestUser.content)).latestUserAnchor;
+}
+
 type WorkspaceResolution = {
   agentId: string;
   agentWs: string;
@@ -945,6 +1024,8 @@ const episodicClawPlugin = {
       // 戻り値: { prependSystemContext?: string }
       api.on("before_prompt_build", async (event: any, ctx: any) => {
         const msgs = ((event && event.messages) || []) as Message[];
+        const anchorNormalization = normalizePromptAnchor(event?.prompt);
+        const latestUserAnchor = anchorNormalization.latestUserAnchor;
         const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
         const { agentId, agentWs } = resolution;
         if (!agentWs) return {};
@@ -965,6 +1046,10 @@ const episodicClawPlugin = {
             msgCount,
             last3Roles,
             lastUserPreview,
+            anchorRawPreview: anchorNormalization.anchorRawPreview,
+            anchorNormalizedPreview: anchorNormalization.anchorNormalizedPreview,
+            anchorAcceptedReason: anchorNormalization.anchorAcceptedReason,
+            anchorRejectedReason: anchorNormalization.anchorRejectedReason,
           }));
         }
 
@@ -1076,7 +1161,7 @@ const episodicClawPlugin = {
         }
 
         try {
-          const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
+          const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens, { latestUserAnchor });
 
           // Mark this turn's message count so assemble() can skip duplicate recall
           state.lastRecallTurnMessageCount = msgs.length;
@@ -1251,7 +1336,9 @@ const episodicClawPlugin = {
           }
 
           try {
-            const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens);
+            const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens, {
+              latestUserAnchor: deriveLatestUserAnchorFromMessages(msgs),
+            });
             const prependSystemContext = [anchorPrependText, recallOutcome.text]
               .map((part) => part.trim())
               .filter((part) => part.length > 0)

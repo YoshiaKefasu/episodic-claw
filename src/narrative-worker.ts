@@ -6,6 +6,7 @@
 
 import { estimateTokens, agentWsHash } from "./utils";
 import { OpenRouterClient, OpenRouterError } from "./openrouter-client";
+import { GeminiDirectClient, GeminiDirectError } from "./gemini-direct-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 
@@ -42,6 +43,10 @@ Write narrative text only.`;
 
 const MAX_RETRIES = 12;
 const FALLBACK_RETRIES = 3;
+const FALLBACK_HEAD_RETRIES = 1;
+const FALLBACK_GEMINI_RETRIES = 2;
+const FALLBACK_TAIL_RETRIES = 2;
+const GEMINI_DIRECT_MODEL = "gemini-3.1-flash-lite-preview";
 const RETRY_BASE_DELAY_MS = 3000;
 const MAX_RETRY_DELAY_MS = 600_000; // 10min cap
 const SAVE_HASH_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -60,6 +65,16 @@ const MAX_ECHO_SCAN_CHARS = 5000; // Only scan first 5000 chars of input (echoes
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 type CacheItem = CacheQueueItem;
+
+type RetryProvider = "openrouter" | "gemini-direct";
+
+type RetryPhase = {
+  provider: RetryProvider;
+  model: string;
+  maxAttempts: number;
+  label: string;
+  handoffReason?: "fallback_2_of_3";
+};
 
 /**
  * Sanitize OpenRouter LLM output to remove OpenClaw agent response format tags
@@ -249,6 +264,9 @@ export class NarrativeWorker {
   // [v0.4.21d] Per-agent isolation: each agent has its own counter for predictable debounce timing
   private saveHashPersistCounters = new Map<string, number>();
   private readonly SAVE_HASH_PERSIST_INTERVAL = 5; // persist every 5th save
+  private geminiClient: GeminiDirectClient | null = null;
+  private geminiClientKey = "";
+  private geminiMissingKeyWarned = false;
 
   constructor(
     private client: OpenRouterClient,
@@ -380,17 +398,31 @@ export class NarrativeWorker {
   }
 
   private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
-    const models = this.getRetryModels();
+    const phases = this.getRetryPhases();
 
-    for (const { model, maxAttempts, label } of models) {
-      console.log(`[NarrativeWorker] Phase "${label}": trying model=${model}, maxAttempts=${maxAttempts}`);
+    for (let phaseIndex = 0; phaseIndex < phases.length; phaseIndex++) {
+      const phase = phases[phaseIndex];
+      if (phase.handoffReason) {
+        console.log(JSON.stringify({
+          source: "episodic-claw",
+          event: "narrative-phase-handoff",
+          phaseHandoffReason: phase.handoffReason,
+          provider: phase.provider,
+          geminiModel: phase.provider === "gemini-direct" ? phase.model : "",
+          itemId: item.id,
+        }));
+      }
 
-      const result = await this.narrativizeWithModel(item, model, maxAttempts, label);
+      console.log(`[NarrativeWorker] Phase "${phase.label}": trying provider=${phase.provider} model=${phase.model}, maxAttempts=${phase.maxAttempts}`);
+
+      const result = phase.provider === "gemini-direct"
+        ? await this.narrativizeWithGeminiModel(item, phase.model, phase.maxAttempts, phase.label)
+        : await this.narrativizeWithModel(item, phase.model, phase.maxAttempts, phase.label);
       if (result) return result;
 
-      if (model !== models[models.length - 1].model) {
+      if (phaseIndex < phases.length - 1) {
         console.warn(
-          `[NarrativeWorker] Phase "${label}" exhausted for [${item.id}]. Falling back to next model...`
+          `[NarrativeWorker] Phase "${phase.label}" exhausted for [${item.id}]. Falling back to next model...`
         );
       }
     }
@@ -403,20 +435,96 @@ export class NarrativeWorker {
    * - If primary model is "openrouter/free" (default), single phase with MAX_RETRIES.
    * - If primary model is custom, two phases: primary (MAX_RETRIES) + fallback (FALLBACK_RETRIES).
    */
-  private getRetryModels(): Array<{ model: string; maxAttempts: number; label: string }> {
+  private getRetryPhases(): RetryPhase[] {
     const primary = this.config.openrouterModel ?? "openrouter/free";
     const fallback = "openrouter/free";
 
     if (primary === fallback) {
       // Default: openrouter/free only → single phase
-      return [{ model: primary, maxAttempts: MAX_RETRIES, label: "primary" }];
+      return [{ provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary" }];
     }
 
-    // Custom model: primary (12 attempts) + fallback (3 attempts)
-    return [
-      { model: primary, maxAttempts: MAX_RETRIES, label: "primary" },
-      { model: fallback, maxAttempts: FALLBACK_RETRIES, label: "fallback" },
+    const phases: RetryPhase[] = [
+      { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary" },
+      { provider: "openrouter", model: fallback, maxAttempts: FALLBACK_HEAD_RETRIES, label: "fallback-openrouter-head" },
     ];
+
+    const hasGeminiApiKey = !!process.env.GEMINI_API_KEY;
+    if (hasGeminiApiKey) {
+      phases.push({
+        provider: "gemini-direct",
+        model: GEMINI_DIRECT_MODEL,
+        maxAttempts: FALLBACK_GEMINI_RETRIES,
+        label: "fallback-gemini-direct",
+        handoffReason: "fallback_2_of_3",
+      });
+      phases.push({ provider: "openrouter", model: fallback, maxAttempts: FALLBACK_TAIL_RETRIES, label: "fallback-openrouter-tail" });
+      return phases;
+    }
+
+    if (!this.geminiMissingKeyWarned) {
+      this.geminiMissingKeyWarned = true;
+      console.warn("[NarrativeWorker] GEMINI_API_KEY missing. Gemini direct handoff disabled; using OpenRouter fallback only.");
+    }
+    phases.push({ provider: "openrouter", model: fallback, maxAttempts: FALLBACK_RETRIES - FALLBACK_HEAD_RETRIES, label: "fallback" });
+    return phases;
+  }
+
+  private getGeminiClient(): GeminiDirectClient | null {
+    const apiKey = process.env.GEMINI_API_KEY?.trim() || "";
+    if (!apiKey) return null;
+
+    if (this.geminiClient && this.geminiClientKey === apiKey) {
+      return this.geminiClient;
+    }
+
+    this.geminiClient = new GeminiDirectClient(apiKey, 30_000);
+    this.geminiClientKey = apiKey;
+    return this.geminiClient;
+  }
+
+  private async applyQualityGates(
+    text: string,
+    item: CacheItem,
+    label: string,
+    attempt: number,
+    maxAttempts: number,
+    conversationText: string,
+  ): Promise<boolean> {
+    const tokens = estimateTokens(text);
+
+    // [v0.4.11] Quality gate 1: Token count & Compression ratio
+    if (!checkCompressionRatio(tokens, item.estimatedTokens)) {
+      console.warn(
+        `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: compression ratio too low ` +
+        `(${tokens}/${item.estimatedTokens} = ${(tokens / item.estimatedTokens * 100).toFixed(2)}% < ${MIN_COMPRESSION_RATIO * 100}%). ` +
+        `Retrying for [${item.id}]...`
+      );
+      await this.sleep(500);
+      return false;
+    }
+
+    // [v0.4.11] Quality gate 2: Verbatim echo detection
+    if (!checkEchoDetection(text, conversationText)) {
+      console.warn(
+        `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: verbatim echo detected for [${item.id}]. ` +
+        `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
+      );
+      await this.sleep(500);
+      return false;
+    }
+
+    // [v0.4.17] Quality gate 3: Narrative format check
+    const formatCheck = checkNarrativeFormat(text);
+    if (!formatCheck.pass) {
+      console.warn(
+        `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
+      );
+      await this.sleep(500);
+      return false;
+    }
+
+    return true;
   }
 
   /**
@@ -443,47 +551,63 @@ export class NarrativeWorker {
           { modelOverride: model },
         );
         const text = sanitizeNarrativeOutput(rawText);
-        const tokens = estimateTokens(text);
-
-        // [v0.4.11] Quality gate 1: Token count & Compression ratio
-        if (!checkCompressionRatio(tokens, item.estimatedTokens)) {
-          console.warn(
-            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: compression ratio too low ` +
-            `(${tokens}/${item.estimatedTokens} = ${(tokens / item.estimatedTokens * 100).toFixed(2)}% < ${MIN_COMPRESSION_RATIO * 100}%). ` +
-            `Retrying for [${item.id}]...`
-          );
-          await this.sleep(500);
-          continue;
-        }
-
-        // [v0.4.11] Quality gate 2: Verbatim echo detection
-        if (!checkEchoDetection(text, conversationText)) {
-          console.warn(
-            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: verbatim echo detected for [${item.id}]. ` +
-            `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
-          );
-          await this.sleep(500);
-          continue;
-        }
-
-        // [v0.4.17] Quality gate 3: Narrative format check
-        const formatCheck = checkNarrativeFormat(text);
-        if (!formatCheck.pass) {
-          console.warn(
-            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
-          );
-          await this.sleep(500);
-          continue;
-        }
+        const pass = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText);
+        if (!pass) continue;
 
         return {
           text,
-          tokens,
+          tokens: estimateTokens(text),
           model,
         };
       } catch (err) {
         const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
         const errorClass = err instanceof OpenRouterError ? err.openRouterErrorClass : "unknown";
+        console.warn(
+          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
+        );
+        await this.sleep(delayMs);
+      }
+    }
+
+    return null;
+  }
+
+  private async narrativizeWithGeminiModel(
+    item: CacheItem,
+    model: string,
+    maxAttempts: number,
+    label: string,
+  ): Promise<NarrativeResult | null> {
+    const geminiClient = this.getGeminiClient();
+    if (!geminiClient) {
+      return null;
+    }
+
+    const systemPrompt = this.resolveSystemPrompt();
+    const previous = this.config.narrativePreviousEpisodeRef !== false
+      ? this.lastNarrativeByAgent.get(`${agentWsHash(item.agentWs)}:${item.agentId}`)
+      : undefined;
+    const conversationText = item.rawText;
+    const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const rawText = await geminiClient.generateNarrative(
+          { systemPrompt, userMessage },
+          { modelOverride: model },
+        );
+        const text = sanitizeNarrativeOutput(rawText);
+        const pass = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText);
+        if (!pass) continue;
+
+        return {
+          text,
+          tokens: estimateTokens(text),
+          model,
+        };
+      } catch (err) {
+        const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        const errorClass = err instanceof GeminiDirectError ? err.geminiErrorClass : "unknown";
         console.warn(
           `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
         );

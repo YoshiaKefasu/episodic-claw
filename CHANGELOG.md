@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.25] - 2026-04-21
+
+### Fixed
+- **Latest-user anchor query guarantee (v0.4.25)**: `recallQueryRecentMessageCount` now anchors from the just-landed latest user message via `latestUserAnchor` propagation (`before_prompt_build` + `assemble`). `buildRecentUserWindow()` performs anchor-aware window composition with normalized dedupe, preventing newest-user dropout when message tail order is assistant-biased.
+- **Narrative fallback provider handoff (v0.4.25b)**: Narrative retry phases are provider-aware. After `primary(12)` exhaustion, the flow now splits fallback into deterministic phases and inserts Gemini direct handoff at fallback `2/3` timing when `GEMINI_API_KEY` exists:
+  - `fallback-openrouter-head(1)` → `fallback-gemini-direct(2)` → `fallback-openrouter-tail(2)`
+  - If `GEMINI_API_KEY` is missing, behavior stays backward-compatible with OpenRouter-only fallback.
+- **Gemini direct client hardening**: Added `GeminiDirectClient` + typed `GeminiDirectError` classes with no internal retry loop (worker owns retries), timeout/network/http classification, and API key transmission via `x-goog-api-key` header (no query-string key leakage).
+
+### Changed
+- Added handoff observability for narrative retries (`event: narrative-phase-handoff`, `phaseHandoffReason=fallback_2_of_3`, provider/model metadata).
+- Unified narrative quality gates across OpenRouter and Gemini direct via shared `applyQualityGates()` path.
+- Expanded runtime/source smoke coverage in `test_phase4_5.ts` for latest-user anchor window and retriever observability markers.
+
 ## [0.4.24] - 2026-04-21
 
 ### Fixed

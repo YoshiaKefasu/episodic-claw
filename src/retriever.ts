@@ -541,6 +541,55 @@ function buildRecallQueryDebug(
   return { recentMessageCount, eligibleRecentMessages: eligibleCount, skippedImageLikeMessages: skippedCount, dominantScript, finalQuery };
 }
 
+type RetrieveRelevantContextOptions = {
+  latestUserAnchor?: string;
+};
+
+function normalizeWindowComparable(text: string): string {
+  return text.replace(/\r\n?/g, "\n").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function buildRecentUserWindow(
+  currentMessages: Message[],
+  recentMessageCount: number,
+  latestUserAnchor?: string
+): {
+  recentMessages: Message[];
+  windowAnchorInjected: boolean;
+  anchorPreview: string;
+  windowLatestPreview: string;
+  windowLatestMatchesAnchor: boolean;
+} {
+  const allUserMessages = currentMessages.filter((m) => m.role === "user");
+  const anchor = (latestUserAnchor || "").trim();
+  const anchorPreview = anchor.substring(0, 80).replace(/\n/g, "\\n");
+  const normalizedAnchor = normalizeWindowComparable(anchor);
+  const anchorEligible = normalizedAnchor.length >= 3;
+
+  let candidateUsers = allUserMessages;
+  let windowAnchorInjected = false;
+  if (anchorEligible) {
+    const tailUser = allUserMessages.at(-1);
+    const tailNormalized = tailUser ? normalizeWindowComparable(extractText(tailUser.content)) : "";
+    const alreadyAtTail = tailNormalized === normalizedAnchor;
+    if (!alreadyAtTail) {
+      candidateUsers = [...allUserMessages, { role: "user", content: anchor } as Message];
+      windowAnchorInjected = true;
+    }
+  }
+
+  const recentMessages = candidateUsers.slice(-recentMessageCount);
+  const latestInWindow = recentMessages.at(-1);
+  const windowLatestPreview = latestInWindow
+    ? extractText(latestInWindow.content).substring(0, 80).replace(/\n/g, "\\n")
+    : "";
+  const windowLatestMatchesAnchor = anchorEligible && !!latestInWindow
+    ? normalizeWindowComparable(extractText(latestInWindow.content)) === normalizedAnchor
+    : false;
+
+  return { recentMessages, windowAnchorInjected, anchorPreview, windowLatestPreview, windowLatestMatchesAnchor };
+}
+
 export class EpisodicRetriever {
   constructor(
     private rpcClient: EpisodicCoreClient,
@@ -555,7 +604,8 @@ export class EpisodicRetriever {
     currentMessages: Message[], 
     agentWs: string, 
     k: number = 5,
-    maxTokens: number = 4096
+    maxTokens: number = 4096,
+    opts?: RetrieveRelevantContextOptions
   ): Promise<RecallInjectionOutcome> {
     if (currentMessages.length === 0) {
       return { text: "", episodeIds: [], reason: "no_messages", queryHash: "", injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics: emptyRecallDiagnostics() };
@@ -567,9 +617,13 @@ export class EpisodicRetriever {
 
     // Build the query from the recent N user messages (whitelist — only user intent matters for recall)
     const recentMessageCount = this.config?.recallQueryRecentMessageCount ?? 4;
-    const recentMessages = currentMessages
-      .filter(m => m.role === "user")
-      .slice(-recentMessageCount);
+    const {
+      recentMessages,
+      windowAnchorInjected,
+      anchorPreview,
+      windowLatestPreview,
+      windowLatestMatchesAnchor,
+    } = buildRecentUserWindow(currentMessages, recentMessageCount, opts?.latestUserAnchor);
 
     // [v0.4.22] Fix C: recall window 観測ログ
     // [v0.4.23] Fix 1: preview + per-message queryKeywords 追加で根本原因特定を可能に
@@ -621,6 +675,10 @@ export class EpisodicRetriever {
         latestUserInWindow,
         latestUserDroppedByClassifier,
         latestUserPreview,
+        windowAnchorInjected,
+        anchorPreview,
+        windowLatestPreview,
+        windowLatestMatchesAnchor,
         fingerprints,
       }));
     }

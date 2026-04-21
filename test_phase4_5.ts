@@ -59,6 +59,7 @@ function loadCompactorCtor(): typeof import("./src/compactor.ts").Compactor {
     "narrative-pool.js",
     "narrative-queue.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
     "types.js",
@@ -81,6 +82,7 @@ function loadCompactorModule(): typeof import("./src/compactor.ts") {
     "narrative-pool.js",
     "narrative-queue.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
     "types.js",
@@ -118,6 +120,7 @@ async function runAnchorInjectionSmoke(): Promise<void> {
     "reasoning-tags.js",
     "openrouter-client.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "narrative-pool.js",
     "narrative-queue.js",
     "rpc-client.js",
@@ -347,6 +350,7 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
     "reasoning-tags.js",
     "openrouter-client.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "narrative-pool.js",
     "narrative-queue.js",
     "rpc-client.js",
@@ -497,6 +501,38 @@ async function tokenizeCjk(text, lang) {
     "injected",
     "autoInjectGuardMinScore should allow operators to lower the degraded fallback inject threshold"
   );
+
+  // v0.4.25: latestUserAnchor should become window latest when event.messages tail is assistant
+  let capturedQuery = "";
+  const anchorAwareClient = {
+    async recall(query: string) {
+      capturedQuery = query;
+      return [{
+        Record: { id: "anchor-aware", title: "Anchor Aware", timestamp: "2026-04-04T00:00:00Z" },
+        Body: "Anchor aware recall result",
+        matchedBy: "semantic",
+        Score: 0.95,
+      }];
+    },
+    async recallFeedback() {
+      return "ok";
+    },
+  };
+  const anchorAwareRetriever = new EpisodicRetriever(anchorAwareClient as any, {
+    recallQueryRecentMessageCount: 2,
+  } as any);
+  const anchorAwareOutcome = await anchorAwareRetriever.retrieveRelevantContext(
+    [
+      { role: "user", content: "昨日の漢字練習メモ" } as any,
+      { role: "assistant", content: "了解、続けよう" } as any,
+    ],
+    "/tmp/episodes",
+    5,
+    2048,
+    { latestUserAnchor: "最新 手書き 習慣" }
+  );
+  assert.equal(anchorAwareOutcome.reason, "injected", "anchor-aware recall should still inject when recall returns results");
+  assert.match(capturedQuery, /最新|手書き|習慣/, "latestUserAnchor keywords should be reflected in final recall query");
 }
 
 async function runCompactionModelSmoke(): Promise<void> {
@@ -637,6 +673,7 @@ async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
     "reasoning-tags.js",
     "openrouter-client.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "narrative-pool.js",
     "narrative-queue.js",
     "summary-escalation.js",
@@ -781,6 +818,7 @@ async function runGatewayStartSmoke(): Promise<void> {
     "reasoning-tags.js",
     "openrouter-client.js",
     "narrative-worker.js",
+    "gemini-direct-client.js",
     "narrative-pool.js",
     "narrative-queue.js",
     "rpc-client.js",
@@ -2518,6 +2556,16 @@ async function runRetrieverSourceSmoke(): Promise<void> {
     "RecallInjectionOutcome should include recallQueryDebug field"
   );
 
+  // 8.1 Verify v0.4.25 anchor-aware window path exists
+  assert.ok(
+    retrieverSource.includes("buildRecentUserWindow") && retrieverSource.includes("latestUserAnchor"),
+    "retriever should implement buildRecentUserWindow with latestUserAnchor support"
+  );
+  assert.ok(
+    retrieverSource.includes("windowAnchorInjected") && retrieverSource.includes("windowLatestMatchesAnchor"),
+    "retriever should emit anchor-aware observability fields"
+  );
+
   // 9. Verify buildRecallQueryDebug helper exists
   assert.ok(
     retrieverSource.includes("buildRecallQueryDebug"),
@@ -2529,6 +2577,14 @@ async function runRetrieverSourceSmoke(): Promise<void> {
   assert.ok(
     indexSource.includes("eligibleRecentMessages") && indexSource.includes("skippedImageLikeMessages") && indexSource.includes("dominantScript"),
     "index.ts should log eligible/skipped/dominantScript observability fields"
+  );
+  assert.ok(
+    indexSource.includes("normalizePromptAnchor") && indexSource.includes("latestUserAnchor"),
+    "index.ts should normalize event.prompt and pass latestUserAnchor to retriever"
+  );
+  assert.ok(
+    indexSource.includes("deriveLatestUserAnchorFromMessages") && indexSource.includes("retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens, {"),
+    "index.ts should pass retriever opts in both before_prompt_build and assemble paths"
   );
 
   console.log("  retriever source smoke: attachment markers, script-aware extraction, observability all present");
