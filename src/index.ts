@@ -949,6 +949,25 @@ const episodicClawPlugin = {
         const { agentId, agentWs } = resolution;
         if (!agentWs) return {};
 
+        // [v0.4.23 Fix 1] before_prompt_build timing observability
+        // DEBUG_EPISODIC_RECALL_FINGERPRINT 時のみ、受信メッセージの末尾状況を出力
+        if (process.env.DEBUG_EPISODIC_RECALL_FINGERPRINT) {
+          const msgCount = msgs.length;
+          const last3Roles = msgs.slice(-3).map((m: Message) => m.role);
+          const lastUserMsg = [...msgs].reverse().find((m: Message) => m.role === "user");
+          const lastUserPreview = lastUserMsg
+            ? extractText(lastUserMsg.content).substring(0, 80).replace(/\n/g, "\\n")
+            : "(none)";
+          console.log(JSON.stringify({
+            source: "episodic-claw",
+            event: "before-prompt-build-arrival",
+            agentId,
+            msgCount,
+            last3Roles,
+            lastUserPreview,
+          }));
+        }
+
         await prepareWorkspaces(resolution);
         const state = getAgentState(agentId);
         state.lastAgentWs = agentWs;

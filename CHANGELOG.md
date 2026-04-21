@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.23] - 2026-04-21
+
+### Added
+- **Recall window diagnostic observability (Fix 1)**: `recall-window-fingerprint` event now includes `preview` (first 80 chars of each message), `latestUserPreview` (first 80 chars of the latest user message), `last3Roles` (last 3 message roles for timing diagnosis), and `perMsgKeywords` (per-message keyword preview, top 6 each). This enables pinpointing whether "latest user message not in recall query" is caused by (A) window selection, (B) query rewrite bias, or (C) `before_prompt_build` timing.
+- **`before_prompt_build` arrival observability**: New `before-prompt-build-arrival` event logs `msgCount`, `last3Roles`, and `latestUserPreview` at the moment OpenClaw calls the hook, allowing timing diagnosis of when the latest user message becomes visible to the recall pipeline.
+
+### Changed
+- **Fingerprint event schema extended**: `DEBUG_EPISODIC_RECALL_FINGERPRINT` env var now produces richer output. Existing fields (`rawLen`, `cleanedLen`, `isDominant`) unchanged; new fields appended only. No behavior change when env var is unset.
+
 ## [0.4.22] - 2026-04-21
 
 ### Fixed

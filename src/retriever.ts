@@ -522,9 +522,10 @@ export class EpisodicRetriever {
       .slice(-recentMessageCount);
 
     // [v0.4.22] Fix C: recall window 観測ログ
+    // [v0.4.23] Fix 1: preview + per-message queryKeywords 追加で根本原因特定を可能に
     // 選定された末尾N件 user message のフィンガープリントを出力し、
     // 「最新ユーザー発話がwindowに入っていたか」「分類除外で落ちたか」を判別可能にする
-    // パフォーマンス配慮: SHA1は使わず、length+isDominantのみで軽量に。
+    // パフォーマンス配慮: SHA1は使わず、length+isDominant+preview(80chars)のみで軽量に。
     // DEBUG_EPISODIC_RECALL_FINGERPRINT 環境変数がセットされている時のみ出力。
     if (process.env.DEBUG_EPISODIC_RECALL_FINGERPRINT) {
       const lastMsg = currentMessages.at(-1);
@@ -532,19 +533,33 @@ export class EpisodicRetriever {
       const allUserMsgs = currentMessages.filter(m => m.role === "user");
       const latestUserMsg = allUserMsgs.at(-1);
       const latestUserInWindow = recentMessages.includes(latestUserMsg!);
+      // Per-messagekeyword extraction for diagnosing query rewrite bias
+      const perMessageKeywords: Array<{ idx: number; keywords: string[] }> = [];
+      for (const m of recentMessages) {
+        const mText = stripReasoningTagsFromText(extractText(m.content), { mode: "strict", trim: "both" });
+        const { cleanedText } = classifyAndStripAttachment(mText);
+        // Extract keywords from each message independently (not joined)
+        const mKeywords = await extractPolyglotKeywords(cleanedText || mText, this.config);
+        perMessageKeywords.push({ idx: perMessageKeywords.length, keywords: mKeywords.slice(0, 6) });
+      }
       const fingerprints = recentMessages.map((m, i) => {
         const rawText = extractText(m.content);
         const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
         const { isDominant, cleanedText } = classifyAndStripAttachment(text);
-        return { idx: i, rawLen: rawText.length, cleanedLen: cleanedText.length, isDominant };
+        const preview = rawText.substring(0, 80).replace(/\n/g, "\\n");
+        return { idx: i, rawLen: rawText.length, cleanedLen: cleanedText.length, isDominant, preview, perMsgKeywords: perMessageKeywords[i]?.keywords ?? [] };
       });
       let latestUserDroppedByClassifier = false;
+      let latestUserPreview = "";
       if (latestUserInWindow && latestUserMsg) {
         const rawText = extractText(latestUserMsg.content);
         const text = stripReasoningTagsFromText(rawText, { mode: "strict", trim: "both" });
         const { isDominant, cleanedText } = classifyAndStripAttachment(text);
         latestUserDroppedByClassifier = isDominant && cleanedText.length < 3;
+        latestUserPreview = rawText.substring(0, 80).replace(/\n/g, "\\n");
       }
+      // last 3 roles for timing diagnosis
+      const last3Roles = currentMessages.slice(-3).map(m => m.role);
       console.log(JSON.stringify({
         source: "episodic-claw",
         event: "recall-window-fingerprint",
@@ -552,8 +567,10 @@ export class EpisodicRetriever {
         userMsgCount: allUserMsgs.length,
         windowSize: recentMessageCount,
         lastRole,
+        last3Roles,
         latestUserInWindow,
         latestUserDroppedByClassifier,
+        latestUserPreview,
         fingerprints,
       }));
     }
