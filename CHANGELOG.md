@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.24] - 2026-04-21
+
+### Fixed
+- **Recall query latest-message keyword drop (v0.4.24)**: `instantDeterministicRewrite()` now uses message-aware keyword extraction instead of joined-text extraction. Latest-message keywords are reserved first (`LATEST_RESERVE=4`) and assembled with dedupe under a bounded total (`MAX_TOTAL=12`), preventing older long messages from monopolizing keyword slots.
+- **Idle-timeout narrativization blackhole (v0.4.24a)**: `poolAndQueue()` no longer depends on `NarrativePool.add()` return value (which is passive/null). It now performs explicit `add -> forceFlush` on boundary, so idle/time-gap/surprise/size-limit boundaries enqueue reliably again.
+- **Pool-only drain safety in forceFlush**: `forceFlush()` now allows draining pool-retained data even when segmenter buffer is empty, closing the retry gap after enqueue failures.
+- **Boundary reason fidelity**: Added boundary reason normalization helper and extended `CacheQueueItem.reason` union with `"time-gap"` so reason typing and observability stay consistent end-to-end.
+
+### Changed
+- Added regression/source-smoke coverage for v0.4.24/v0.4.24a paths in `test_phase4_5.ts`.
+- Added config pipeline key/default coverage for `warmStartSkipMinMessages` in `test_config_pipeline.ts`.
+
 ## [0.4.23] - 2026-04-21
 
 ### Added

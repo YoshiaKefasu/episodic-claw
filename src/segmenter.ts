@@ -764,6 +764,36 @@ export class EventSegmenter {
   }
 
   /**
+   * Normalize boundary reason for cache queue item reason union.
+   * Keep observability fidelity for known reasons and degrade safely for unknown values.
+   */
+  private mapBoundaryReasonToCacheReason(
+    reason: string
+  ): "idle-timeout" | "surprise-boundary" | "size-limit" | "time-gap" {
+    switch (reason) {
+      case "idle-timeout":
+      case "surprise-boundary":
+      case "size-limit":
+      case "time-gap":
+        return reason;
+      default:
+        console.warn(`[Episodic Memory] Unknown boundary reason '${reason}', falling back to 'size-limit'.`);
+        return "size-limit";
+    }
+  }
+
+  /**
+   * Finalize segmenter local state after a boundary flush succeeds.
+   * Keeps cleanup logic consistent across poolAndQueue / forceFlush paths.
+   */
+  private finalizeAfterBoundary(savedCursor: number, agentWs: string, agentId: string): void {
+    this.buffer = [];
+    this.resetBufferTokens();
+    this.lastProcessedLength = savedCursor;
+    this.persistCursor(agentWs, agentId);
+  }
+
+  /**
    * Pool mode (v0.4.2): accumulate messages in NarrativePool, split into 64K chunks,
    * and enqueue to the Go cache DB for sequential narrativization.
    * Fire-and-forget — never awaited by processTurn.
@@ -771,7 +801,10 @@ export class EventSegmenter {
   private async poolAndQueue(agentWs: string, agentId: string, surprise: number, reason: string, walFlushId: number = -1): Promise<void> {
     if (!this.pool || !this.narrativeWorker) return;
 
-    const item = this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
+    // [v0.4.24a] NarrativePool is passive (add() always returns null).
+    // Boundary decisions are made by segmenter, so flush explicitly here.
+    this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);
+    const item = this.pool.forceFlush(agentWs, agentId, surprise);
     // Clear segmenter buffer and idle flush timer; data is now in the pool.
     this.buffer = [];
     this.resetBufferTokens();
@@ -781,11 +814,7 @@ export class EventSegmenter {
     if (item) {
       // Flush occurred: split and enqueue to cache DB
       // Preserve idle-timeout reason for observability — don't collapse it into size-limit
-      const cacheReason = (
-        reason === "idle-timeout" ? "idle-timeout" :
-        reason === "surprise-boundary" ? "surprise-boundary" :
-        "size-limit"
-      ) as "idle-timeout" | "surprise-boundary" | "size-limit";
+      const cacheReason = this.mapBoundaryReasonToCacheReason(reason);
       const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise, item.messages);
 
       // [v0.4.13] Defer pool.clear() until after enqueue confirmation
@@ -923,19 +952,27 @@ export class EventSegmenter {
    * Useful before compact() to ensure no context is lost.
    */
   async forceFlush(agentWs: string, agentId: string = ""): Promise<void> {
-    if (this.buffer.length === 0) return;
+    const hasBufferedMessages = this.buffer.length > 0;
+    const hasPool = !!this.pool;
+
+    // [v0.4.24a] Even when segmenter buffer is empty, pool may retain data
+    // from a prior enqueue failure. Allow pool-only drain.
+    if (!hasBufferedMessages && !hasPool) return;
+
     // [v0.4.22b] Save cursor before flush — restore after to prevent B-1 cursor regression
     const savedCursor = this.lastProcessedLength;
     try {
       console.log(`[Episodic Memory] Force flushing segmenter buffer (${this.buffer.length} messages)...`);
       this.clearIdleFlushTimer(); // Clear timer on force flush
 
-      // [v0.4.22b] WAL: rotate active→staged for this flush
-      const forceFlushId = this.walRotateForFlush(agentWs, agentId);
+      // [v0.4.22b] WAL: rotate active→staged only when segmenter buffer has data.
+      const forceFlushId = hasBufferedMessages ? this.walRotateForFlush(agentWs, agentId) : -1;
 
-      if (this.pool && this.narrativeWorker) {
-        // Pool mode (v0.4.2): add to pool, split, and enqueue to cache DB
-        this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
+      if (this.pool) {
+        // Pool mode (v0.4.2): add buffer contents (if any), then flush pool.
+        if (hasBufferedMessages) {
+          this.pool.add(this.buffer.slice(), 0, agentWs, agentId);
+        }
         const item = this.pool.forceFlush(agentWs, agentId);
         if (item) {
           const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0, item.messages);
@@ -951,12 +988,9 @@ export class EventSegmenter {
         // Pre-v0.4.13 had pool.clear() before the await, which was a data-loss risk on enqueue failure.
         // [v0.4.13] Clear pool AFTER successful enqueue (data preserved on failure)
         this.pool.clear();
-        this.buffer = [];
-        this.resetBufferTokens();
         // [v0.4.22b-fix] Restore savedCursor on success too — persisting 0 causes
         // full reprocessing on restart. savedCursor reflects the true processed position.
-        this.lastProcessedLength = savedCursor;
-        this.persistCursor(agentWs, agentId);
+        this.finalizeAfterBoundary(savedCursor, agentWs, agentId);
         return;
       }
 
@@ -966,10 +1000,7 @@ export class EventSegmenter {
       if (forceFlushId >= 0) {
         this.walDeleteStaged(agentWs, agentId, forceFlushId);
       }
-      this.buffer = [];
-      this.resetBufferTokens();
-      this.lastProcessedLength = savedCursor;
-      this.persistCursor(agentWs, agentId);
+      this.finalizeAfterBoundary(savedCursor, agentWs, agentId);
     } catch (err) {
       console.error("[Episodic Memory] Error in segmenter forceFlush:", err);
       // [v0.4.22c] BUG-2: WAL flush write buffer on failure too — data in memory must reach disk

@@ -1482,6 +1482,8 @@ async function runReleaseGateB(): Promise<void> {
 
   const mockRpc = {
     segmentScore: async () => ({ score: 0.1, isBoundary: false }),
+    setSegmenterCursor: async (_agentWs: string, _agentId: string, _cursor: any) => "ok",
+    getSegmenterCursor: async (_agentWs: string, _agentId: string) => ({ lastProcessedLength: 0 }),
     cacheEnqueueBatch: async (params: any) => {
       rpcCalls.push({ method: "cache.enqueueBatch", params });
       return { enqueued: params.items?.length || 0 };
@@ -1508,12 +1510,14 @@ async function runReleaseGateB(): Promise<void> {
   const segmenter = new EventSegmenter(
     mockRpc,
     5,  // dedupWindow
-    7200,  // maxBufferChars
     9000,  // maxCharsPerChunk
     { timeGapMinutes: 0.001 },  // ~60ms for fast test
     null,  // pool
     null   // narrativeWorker
   );
+
+  const gateBWs = path.join(tempDir, "ws");
+  fs.mkdirSync(gateBWs, { recursive: true });
 
   // 1. Feed a text message to start the buffer and trigger idle timer
   await segmenter.processTurn(
@@ -1521,18 +1525,29 @@ async function runReleaseGateB(): Promise<void> {
       { role: "user", content: "今日の天気は？" },
       { role: "assistant", content: "晴れです。" },
     ],
-    "/tmp/test-ws",
+    gateBWs,
     "main"
   );
 
-  // 2. Wait for the idle flush timer to fire (~60ms + margin)
+  // 2. Wait for idle timer to fire first, then async ingestion completion.
   const startTime = Date.now();
-  await new Promise(resolve => setTimeout(resolve, 500));
-  const elapsedMs = Date.now() - startTime;
+  const waitUntil = async (predicate: () => boolean, timeoutMs: number, intervalMs: number = 50): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    return predicate();
+  };
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const idleElapsedMs = Date.now() - startTime;
 
   // 3. Verify the timer fired within expected bounds
-  assert.ok(elapsedMs >= 100, `Idle flush test should wait at least 100ms (actual: ${elapsedMs}ms)`);
-  assert.ok(elapsedMs <= 2000, `Idle flush test should not take more than 2000ms (actual: ${elapsedMs}ms)`);
+  assert.ok(idleElapsedMs >= 100, `Idle flush test should wait at least 100ms (actual: ${idleElapsedMs}ms)`);
+  assert.ok(idleElapsedMs <= 2000, `Idle flush timer should fire within 2000ms (actual: ${idleElapsedMs}ms)`);
+
+  await waitUntil(() => batchIngestResolved, 2500, 50);
+  const elapsedMs = Date.now() - startTime;
 
   // 4. Verify idle-timeout reason was propagated to enqueue (if any enqueue occurred)
   const enqueueCalls = rpcCalls.filter(c => c.method === "cache.enqueueBatch");
@@ -1540,8 +1555,13 @@ async function runReleaseGateB(): Promise<void> {
     const firstEnqueue = enqueueCalls[0];
     const items = firstEnqueue.params.items || [];
     if (items.length > 0) {
-      assert.ok(items[0].reason === "idle-timeout" || items[0].reason === "surprise-boundary" || items[0].reason === "size-limit",
-        `Enqueue reason should be idle-timeout or segment boundary (got: ${items[0].reason})`);
+      assert.ok(
+        items[0].reason === "idle-timeout" ||
+        items[0].reason === "surprise-boundary" ||
+        items[0].reason === "size-limit" ||
+        items[0].reason === "time-gap",
+        `Enqueue reason should be idle-timeout/time-gap or segment boundary (got: ${items[0].reason})`
+      );
     }
   }
 
@@ -1595,7 +1615,8 @@ async function runReleaseGateB(): Promise<void> {
   // 8. Verify batchIngest was called (no timeout leak)
   const batchIngestCalls = rpcCalls.filter(c => c.method === "batchIngest" || (c.method === "request" && c.params?.method === "ai.batchIngest"));
   // If batchIngest was called, it means the timeout leak was stopped
-  assert.ok(batchIngestResolved, "batchIngest mock should be implemented and called to stop timeout leak");
+  assert.ok(batchIngestResolved, `batchIngest should be called (rpcCalls=${rpcCalls.map(c => c.method).join(",")})`);
+  assert.ok(batchIngestCalls.length > 0, "batchIngest call list should not be empty");
 
   // Cleanup
   try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -1973,22 +1994,59 @@ async function runIdleFlushRuntimeRegression(): Promise<void> {
   // ── Test 5: Verify idle-timeout reason is in narrative-queue.ts reason union ──
   const queueSource = fs.readFileSync(path.resolve("src", "narrative-queue.ts"), "utf8");
   assert.ok(queueSource.includes('"idle-timeout"'), "CacheQueueItem reason union should include idle-timeout");
+  assert.ok(queueSource.includes('"time-gap"'), "CacheQueueItem reason union should include time-gap");
 
   // ── Test 6: Verify idle-timeout is not collapsed in poolAndQueue ──
   const segmenterSource = fs.readFileSync(path.resolve("src", "segmenter.ts"), "utf8");
-  assert.ok(segmenterSource.includes('reason === "idle-timeout"'), "poolAndQueue should check for idle-timeout reason");
-  assert.ok(segmenterSource.includes('"idle-timeout"'), "segmenter should reference idle-timeout in poolAndQueue");
+  assert.ok(segmenterSource.includes("mapBoundaryReasonToCacheReason"), "segmenter should normalize boundary reason via helper");
+  assert.ok(segmenterSource.includes('case "idle-timeout"'), "reason helper should preserve idle-timeout");
+  assert.ok(segmenterSource.includes('case "time-gap"'), "reason helper should preserve time-gap");
+  assert.ok(segmenterSource.includes('case "surprise-boundary"'), "reason helper should preserve surprise-boundary");
+  assert.ok(segmenterSource.includes('case "size-limit"'), "reason helper should preserve size-limit");
+
+  // ── Test 6.1: v0.4.24a poolAndQueue should flush passive pool explicitly ──
+  const poolAndQueueIdx = segmenterSource.indexOf("private async poolAndQueue");
+  assert.ok(poolAndQueueIdx >= 0, "poolAndQueue should exist");
+  const poolAndQueueSection = segmenterSource.slice(poolAndQueueIdx, poolAndQueueIdx + 2200);
+  assert.ok(
+    poolAndQueueSection.includes("this.pool.add(this.buffer.slice(), surprise, agentWs, agentId);") &&
+    poolAndQueueSection.includes("const item = this.pool.forceFlush(agentWs, agentId"),
+    "poolAndQueue should add to passive pool then forceFlush explicitly"
+  );
+  assert.ok(
+    poolAndQueueSection.includes("mapBoundaryReasonToCacheReason") && poolAndQueueSection.includes("const cacheReason = this.mapBoundaryReasonToCacheReason(reason);"),
+    "poolAndQueue should normalize boundary reason via mapBoundaryReasonToCacheReason"
+  );
 
   // ── Test 7: Real-time idle flush delay check ──
   // Verify that the idle flush timer uses unref() (doesn't block process exit)
   assert.ok(segmenterSource.includes(".unref()"), "idle flush timer should use unref() to not block process exit");
 
   // ── Test 8: Cursor preservation in handleIdleFlush ──
-  const idleFlushIdx = segmenterSource.indexOf("handleIdleFlush");
-  assert.ok(idleFlushIdx >= 0, "handleIdleFlush should exist");
-  const idleFlushSection = segmenterSource.slice(idleFlushIdx, idleFlushIdx + 1500);
+  const idleFlushStart = segmenterSource.indexOf("private async handleIdleFlush");
+  assert.ok(idleFlushStart >= 0, "handleIdleFlush should exist");
+  const idleFlushEnd = segmenterSource.indexOf("private isTimeGapBoundary", idleFlushStart);
+  assert.ok(idleFlushEnd > idleFlushStart, "handleIdleFlush method end should be findable");
+  const idleFlushSection = segmenterSource.slice(idleFlushStart, idleFlushEnd);
   assert.ok(idleFlushSection.includes("savedLastProcessedLength"), "handleIdleFlush should save lastProcessedLength");
   assert.ok(idleFlushSection.includes("this.lastProcessedLength = savedLastProcessedLength"), "handleIdleFlush should restore lastProcessedLength");
+
+  // ── Test 9: v0.4.24a forceFlush should allow pool-only drain ──
+  const forceFlushIdx = segmenterSource.indexOf("async forceFlush(");
+  assert.ok(forceFlushIdx >= 0, "forceFlush should exist");
+  const forceFlushSection = segmenterSource.slice(forceFlushIdx, forceFlushIdx + 2600);
+  assert.ok(
+    forceFlushSection.includes("if (!hasBufferedMessages && !hasPool) return;"),
+    "forceFlush should not early-return when pool exists"
+  );
+  assert.ok(
+    forceFlushSection.includes("if (this.pool) {"),
+    "forceFlush should support pool drain path even without narrativeWorker"
+  );
+  assert.ok(
+    forceFlushSection.includes("const forceFlushId = hasBufferedMessages ? this.walRotateForFlush(agentWs, agentId) : -1;"),
+    "forceFlush should skip WAL rotate in pool-only drain path"
+  );
 
   console.log("  idle flush runtime regression: buffer flushing, tool_use exclusion, cursor preservation, reason propagation all verified at runtime");
 }
@@ -2438,6 +2496,20 @@ async function runRetrieverSourceSmoke(): Promise<void> {
   assert.ok(
     retrieverSource.includes("primaryCount") && retrieverSource.includes("secondaryCount"),
     "retriever should use primary/secondary script-aware keyword allocation"
+  );
+
+  // 7.1 Verify v0.4.24 message-aware latest-keyword reservation exists
+  assert.ok(
+    retrieverSource.includes("const LATEST_RESERVE = 4") && retrieverSource.includes("const MAX_TOTAL = 12"),
+    "retriever should reserve latest-message keyword slots with LATEST_RESERVE=4 and MAX_TOTAL=12"
+  );
+  assert.ok(
+    retrieverSource.includes("const reversed = [...perMessageKeywords].reverse()") && retrieverSource.includes("const latestKeywords = reversed[0] ?? []"),
+    "retriever should process per-message keywords in newest-first order"
+  );
+  assert.ok(
+    retrieverSource.includes("fallbackText = cleanedPerMessage.join(\"\\n\")") || retrieverSource.includes("const fallbackText = cleanedPerMessage.join(\"\\n\")"),
+    "retriever should keep a deterministic fallback text when keyword extraction yields none"
   );
 
   // 8. Verify recallQueryDebug is present in the outcome type

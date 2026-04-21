@@ -36,11 +36,13 @@ export class NarrativePool {
 
   /**
    * Force flush all buffered messages regardless of size.
+   * Optional surpriseOverride lets segmenter preserve boundary surprise
+   * when triggering immediate flush (e.g., surprise/time-gap boundary).
    * Returns null if buffer is empty.
    */
-  forceFlush(agentWs: string, agentId: string): PoolFlushItem | null {
+  forceFlush(agentWs: string, agentId: string, surpriseOverride: number = 0): PoolFlushItem | null {
     if (this.buffer.length === 0) return null;
-    return this.buildFlushItem("force-flush", 0, agentWs, agentId);
+    return this.buildFlushItem("force-flush", surpriseOverride, agentWs, agentId);
   }
 
   /** Current character count in the pool */

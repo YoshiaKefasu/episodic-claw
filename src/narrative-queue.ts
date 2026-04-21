@@ -21,7 +21,7 @@ export interface CacheQueueItem {
   parentIngestId: string;
   orderKey: string;
   surprise: number;
-  reason: "size-limit" | "surprise-boundary" | "cold-start-import" | "gap-archive" | "force-flush" | "idle-timeout";
+  reason: "size-limit" | "surprise-boundary" | "cold-start-import" | "gap-archive" | "force-flush" | "idle-timeout" | "time-gap";
   rawText: string;
   estimatedTokens: number;
   status: "queued" | "leased" | "dead-letter";

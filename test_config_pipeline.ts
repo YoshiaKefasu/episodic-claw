@@ -67,6 +67,7 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "autoInjectGuardMinScore",
     "anchorInjectionAssembles",
     "dedupWindow",
+    "warmStartSkipMinMessages",
     "maxBufferChars",
     "maxCharsPerChunk",
     "segmentationLambda",
@@ -118,6 +119,7 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "autoInjectGuardMinScore",
     "anchorInjectionAssembles",
     "dedupWindow",
+    "warmStartSkipMinMessages",
     "maxBufferChars",
     "maxCharsPerChunk",
     "segmentationLambda",
@@ -211,6 +213,7 @@ test("loadConfig({}) returns correct defaults for all fields", () => {
   assert.equal(cfg.autoInjectGuardMinScore, 0.86);
   assert.equal(cfg.anchorInjectionAssembles, 1);
   assert.equal(cfg.dedupWindow, 5);
+  assert.equal(cfg.warmStartSkipMinMessages, 50);
   assert.equal(cfg.maxBufferChars, 7200);
   assert.equal(cfg.maxCharsPerChunk, 9000);
   assert.equal(cfg.segmentationLambda, 2.0);

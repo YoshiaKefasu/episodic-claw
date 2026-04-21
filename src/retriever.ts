@@ -297,8 +297,8 @@ export async function instantDeterministicRewrite(messages: Message[], config?: 
     }
   }
 
-  // Phase 1: Aggressive Noise Removal (on eligible text only)
-  const cleaned = eligibleTexts
+  // Phase 1: Aggressive Noise Removal (per-message)
+  const cleanedPerMessage = eligibleTexts
     .map(text => text
       .replace(/\[\[reply_to_current\]\]/g, "")
       .replace(/^System:\s*\[.*?\]\s*/gm, "")
@@ -306,12 +306,62 @@ export async function instantDeterministicRewrite(messages: Message[], config?: 
       .replace(/\p{Extended_Pictographic}/gu, "")
       .replace(/\s+/g, " ")
       .trim())
-    .filter(Boolean)
-    .join("\n");
+    .filter(Boolean);
 
-  // Phase 2+3: Polyglot keyword extraction + assembly (async for kuromojin)
-  const keywords = await extractPolyglotKeywords(cleaned, config);
-  return keywords.length > 0 ? keywords.join(" ") : cleaned;
+  if (cleanedPerMessage.length === 0) {
+    return "";
+  }
+
+  // Phase 2: Message-aware keyword extraction
+  const perMessageKeywords: string[][] = [];
+  for (const cleanedText of cleanedPerMessage) {
+    const keywords = await extractPolyglotKeywords(cleanedText, config);
+    perMessageKeywords.push(keywords);
+  }
+
+  // Phase 3: latest-message reservation + dedupe assembly
+  const reversed = [...perMessageKeywords].reverse(); // newest-first
+  const LATEST_RESERVE = 4;
+  const MAX_TOTAL = 12;
+  const latestKeywords = reversed[0] ?? [];
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  // Slot 1: reserve seats for latest message keywords
+  for (const kw of latestKeywords) {
+    if (result.length >= LATEST_RESERVE) break;
+    const lower = kw.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      result.push(kw);
+    }
+  }
+
+  // Slot 2: fill remaining from older messages (newest -> oldest)
+  for (let i = 1; i < reversed.length && result.length < MAX_TOTAL; i++) {
+    for (const kw of reversed[i]) {
+      if (result.length >= MAX_TOTAL) break;
+      const lower = kw.toLowerCase();
+      if (!seen.has(lower)) {
+        seen.add(lower);
+        result.push(kw);
+      }
+    }
+  }
+
+  // Slot 3: backfill with latest leftovers if seats remain
+  for (const kw of latestKeywords) {
+    if (result.length >= MAX_TOTAL) break;
+    const lower = kw.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      result.push(kw);
+    }
+  }
+
+  const fallbackText = cleanedPerMessage.join("\n");
+  return result.length > 0 ? result.join(" ") : fallbackText;
 }
 
 /**
