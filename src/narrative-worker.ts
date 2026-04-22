@@ -23,6 +23,11 @@ const DEFAULT_SYSTEM_PROMPT = `Distill conversation logs into third-person past-
 export const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
   `HIGHEST PRIORITY. Violating any rule below makes the output invalid.
 
+Exam-style requirements (MUST satisfy ALL):
+1. Include at least 3 specific technical anchors from the log (file names, commands, error codes, version numbers, HTTP statuses) naturally woven into the narrative prose.
+2. Do NOT produce generic filler like "It is crucial", "Careful consideration", "自然な流れを心がけ" — every sentence must convey concrete information from the log.
+3. Output narrative prose only. No checklists, no self-evaluation, no meta-commentary.
+
 Output spec:
 Third-person past tense only. Write continuous narrative prose, not bullet points or headings. Use natural paragraph breaks. For longer narratives, separate the text into at least two paragraphs. Start from the very first character with the story.
 Greetings, prefaces, explanations, bullet points, numbered lists, headings, Markdown, emoji, signatures are FORBIDDEN.
@@ -58,12 +63,46 @@ const MIN_COMPRESSION_RATIO = 0.01; // Output must be >= 1% of input tokens
 const ECHO_SAMPLE_LENGTH = 80; // Characters to check for verbatim echo
 const MIN_ECHO_LENGTH = 20; // Minimum length to bother checking
 const MAX_ECHO_SCAN_CHARS = 5000; // Only scan first 5000 chars of input (echoes are near the beginning)
+
+// [v0.4.27b] Content quality gate constants
+const MIN_ANCHOR_COUNT_FOR_STRICT = 4; // Raw text must have >=4 anchors for strict coverage check
+const MIN_ANCHOR_HITS_REQUIRED = 3; // Narrative must include >=3 of the raw anchors (when strict)
+const CONTENT_GATE_REJECTS_BEFORE_FALLBACK = 3; // Consecutive content-gate rejects before forcing phase handoff
+
+// [v0.4.27b] Generic template / lazy narrative phrases — DRY single source of truth.
+// Used in applyQualityGates Gate 3b (body-scan, isContentGate=true).
+// NOT duplicated in checkNarrativeFormat Gate 3 (firstLine-only, isContentGate=false).
+const GENERIC_TEMPLATE_PHRASES = [
+  // JP generic template / lazy narrative phrases (from evidence: accurate-natural-flow.md, story-narrative-improvements.md)
+  "地の文を整え",
+  "自然な流れを心がけ",
+  "心がけました",
+  "不可欠です",
+  "精密な調整",
+  "バランスを取",
+  "丁寧にまとめ",
+  "適切に表現",
+  "正確に反映",
+  // EN generic academic phrases (from evidence: narrative-fact-balance-precision.md)
+  "It is crucial",
+  "It is essential",
+  "It is important",
+  "Proper adjustment",
+  "Careful consideration",
+];
 // [AUDIT NOTE] This is an intentional trade-off (v0.4.12 Phase E), NOT a bug:
 // - Echoes always appear near the beginning of input (model echoes the first ~200 tokens)
 // - Scanning beyond 5000 chars would catch tail echoes but at 85% more memory cost (192KB copy)
 // - False negatives (tail echoes) are low-impact: output is still a narrative, just with some verbatim at the end
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
+// [v0.4.27b] Structured quality gate result — enables content-gate-aware retry logic
+type QualityGateResult = {
+  pass: boolean;
+  reason: string;
+  isContentGate: boolean; // true if this is a content-quality gate (vs format/compression)
+};
+
 type CacheItem = CacheQueueItem;
 
 type RetryProvider = "openrouter" | "gemini-direct";
@@ -74,6 +113,10 @@ type RetryPhase = {
   maxAttempts: number;
   label: string;
   handoffReason?: "fallback_2_of_3";
+  /** [v0.4.27b] Enable content quality gates (anchor coverage) for this phase.
+   *  Should be true ONLY if a subsequent fallback phase exists — otherwise
+   *  content-gate rejects would cause item loss (regression vs. current behavior). */
+  contentGateEnabled?: boolean;
 };
 
 class EmptyRawTextError extends Error {
@@ -150,6 +193,84 @@ export function checkEchoDetection(output: string, input: string): boolean {
  * Detects assistant-mode outputs, CoT leakage, and prohibited formatting.
  * Returns { pass: boolean, reason: string }.
  */
+/**
+ * [v0.4.27b] Extract concrete "content anchors" from raw conversation text.
+ * Anchors are technical details that a quality narrative should preserve:
+ * file paths/extensions, HTTP status codes, error codes, numeric values,
+ * and identifiable technical tokens.
+ * Lightweight regex-based extraction — no NLP dependency.
+ */
+export function extractContentAnchors(rawText: string): string[] {
+  const anchors = new Set<string>();
+  const seen = new Set<string>(); // deduplicate (case-insensitive)
+
+  // File paths and extensions: /path/to/file.ext or file.ext
+  for (const m of rawText.matchAll(/(?:[\/\\][\w.\-]+){1,5}\.[a-zA-Z]{1,8}|\b[\w\-]+\.(?:ts|js|go|py|rs|json|yaml|yml|toml|md|txt|sql|sh|tsx|jsx|css|html|rb|java|c|cpp|h|hpp|proto|grpc|env|cfg|ini)\b/g)) {
+    const a = m[0].toLowerCase();
+    if (!seen.has(a) && m[0].length >= 4) {
+      seen.add(a);
+      anchors.add(m[0]);
+    }
+  }
+
+  // HTTP status codes: 200, 404, 500, etc.
+  for (const m of rawText.matchAll(/\b([45]\d{2}|200|201|204|301|302)\b/g)) {
+    const a = m[0];
+    if (!seen.has(a)) {
+      seen.add(a);
+      anchors.add(a);
+    }
+  }
+
+  // Error codes: ECONNRESET, EPIPE, ENOENT, SIGKILL, etc.
+  for (const m of rawText.matchAll(/\b(E[A-Z]{4,}|SIG[A-Z]+|ERR_[A-Z_]+)\b/g)) {
+    const a = m[0];
+    if (!seen.has(a)) {
+      seen.add(a);
+      anchors.add(a);
+    }
+  }
+
+  // Version strings: v0.4.27, 1.2.3, etc.
+  for (const m of rawText.matchAll(/\bv?\d+\.\d+(?:\.\d+)?\b/g)) {
+    const a = m[0];
+    if (!seen.has(a) && a.length >= 3) {
+      seen.add(a);
+      anchors.add(a);
+    }
+  }
+
+  // Alphanumeric command/function identifiers: at least 3+ alphanumeric chars with mixed case
+  for (const m of rawText.matchAll(/\b([a-z][a-zA-Z0-9]{2,}[A-Z][a-zA-Z0-9]*|[A-Z][a-z]+[A-Z][a-zA-Z0-9]*)\b/g)) {
+    const a = m[0];
+    const lower = a.toLowerCase();
+    // Skip common English words that match camelCase pattern
+    if (["the", "and", "for", "not", "but", "are", "was", "has", "had", "can", "all"]
+      .some(w => lower === w)) continue;
+    if (!seen.has(lower) && a.length >= 4) {
+      seen.add(lower);
+      anchors.add(a);
+    }
+  }
+
+  return Array.from(anchors);
+}
+
+/**
+ * [v0.4.27b] Count how many raw-text anchors appear in the narrative text.
+ * Case-insensitive substring matching.
+ */
+export function countAnchorHits(narrativeText: string, anchors: string[]): number {
+  const lower = narrativeText.toLowerCase();
+  let hits = 0;
+  for (const anchor of anchors) {
+    if (lower.includes(anchor.toLowerCase())) {
+      hits++;
+    }
+  }
+  return hits;
+}
+
 export function checkNarrativeFormat(text: string): { pass: boolean; reason: string } {
   const lines = text.split(/\r?\n/);
   const firstLine = lines[0] ?? "";
@@ -210,12 +331,18 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     "かしこまりました",
     "それではまとめ",
     "確認いたします",
+    // Note: [v0.4.27b] generic template phrases moved to Gate 3b body-scan
+    // (see GENERIC_TEMPLATE_PHRASES below). Not duplicated here per DRY principle.
   ];
   for (const phrase of assistantPhrases) {
     if (firstLine.trimStart().startsWith(phrase)) {
       return { pass: false, reason: `narrative-format: assistant-mode phrase "${phrase}" detected` };
     }
   }
+
+  // Note: [v0.4.27b] Generic template phrase detection moved to applyQualityGates()
+  // as a content gate (isContentGate=true) to enable early bailout routing.
+  // See GENERIC_TEMPLATE_PHRASES constant and Gate 3b logic there.
 
   // Gate 4: Emoji / kaomoji
   const emojiPat = /[\p{Emoji_Presentation}\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]|≧∇≦/u;
@@ -430,8 +557,8 @@ export class NarrativeWorker {
       console.log(`[NarrativeWorker] Phase "${phase.label}": trying provider=${phase.provider} model=${phase.model}, maxAttempts=${phase.maxAttempts}`);
 
       const result = phase.provider === "gemini-direct"
-        ? await this.narrativizeWithGeminiModel(item, phase.model, phase.maxAttempts, phase.label)
-        : await this.narrativizeWithModel(item, phase.model, phase.maxAttempts, phase.label);
+        ? await this.narrativizeWithGeminiModel(item, phase.model, phase.maxAttempts, phase.label, phase.contentGateEnabled)
+        : await this.narrativizeWithModel(item, phase.model, phase.maxAttempts, phase.label, phase.contentGateEnabled);
       if (result) return result;
 
       if (phaseIndex < phases.length - 1) {
@@ -446,24 +573,46 @@ export class NarrativeWorker {
 
   /**
    * [v0.4.19d] Determine retry model sequence.
-   * - If primary model is "openrouter/free" (default), single phase with MAX_RETRIES.
-   * - If primary model is custom, two phases: primary (MAX_RETRIES) + fallback (FALLBACK_RETRIES).
+   * [v0.4.27b] Content gate enabled only when fallback phase exists (prevents item-loss regression).
+   * - If primary model is "openrouter/free" (default):
+   *   - With GEMINI_API_KEY: primary (content gate) → gemini-direct (no content gate)
+   *   - Without GEMINI_API_KEY: primary only, content gate disabled (preserve current behavior)
+   * - If primary model is custom: primary + openrouter/free fallback + gemini-direct (if available)
    */
   private getRetryPhases(): RetryPhase[] {
     const primary = this.config.openrouterModel ?? "openrouter/free";
     const fallback = "openrouter/free";
+    const hasGeminiApiKey = !!process.env.GEMINI_API_KEY;
 
     if (primary === fallback) {
-      // Default: openrouter/free only → single phase
-      return [{ provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary" }];
+      // [v0.4.27b] Default: openrouter/free with optional Gemini fallback
+      // Content gate ONLY enabled when there's a Gemini fallback — otherwise
+      // content-gate rejects would cause item loss (worse than current behavior)
+      const phases: RetryPhase[] = [
+        { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary",
+          contentGateEnabled: hasGeminiApiKey },
+      ];
+      if (hasGeminiApiKey) {
+        phases.push({
+          provider: "gemini-direct",
+          model: GEMINI_DIRECT_MODEL,
+          maxAttempts: FALLBACK_GEMINI_RETRIES,
+          label: "fallback-gemini-content",
+          handoffReason: "fallback_2_of_3",
+          // Gemini is last-resort — no content gate to prevent item loss
+        });
+      }
+      return phases;
     }
 
+    // Custom primary model: multiple fallback phases
     const phases: RetryPhase[] = [
-      { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary" },
-      { provider: "openrouter", model: fallback, maxAttempts: FALLBACK_HEAD_RETRIES, label: "fallback-openrouter-head" },
+      { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary",
+        contentGateEnabled: true }, // Has fallback phases
+      { provider: "openrouter", model: fallback, maxAttempts: FALLBACK_HEAD_RETRIES, label: "fallback-openrouter-head",
+        contentGateEnabled: true }, // Has more fallback phases
     ];
 
-    const hasGeminiApiKey = !!process.env.GEMINI_API_KEY;
     if (hasGeminiApiKey) {
       phases.push({
         provider: "gemini-direct",
@@ -471,6 +620,7 @@ export class NarrativeWorker {
         maxAttempts: FALLBACK_GEMINI_RETRIES,
         label: "fallback-gemini-direct",
         handoffReason: "fallback_2_of_3",
+        // Gemini is last-resort — no content gate to prevent item loss
       });
       phases.push({ provider: "openrouter", model: fallback, maxAttempts: FALLBACK_TAIL_RETRIES, label: "fallback-openrouter-tail" });
       return phases;
@@ -497,6 +647,12 @@ export class NarrativeWorker {
     return this.geminiClient;
   }
 
+  /**
+   * Run all quality gates on generated narrative text.
+   * [v0.4.27b] Returns structured QualityGateResult to enable content-gate-aware retry routing.
+   * When contentGateEnabled=false, content-quality gates (Gate 4) are skipped entirely
+   * to preserve current behavior and prevent item-loss regression.
+   */
   private async applyQualityGates(
     text: string,
     item: CacheItem,
@@ -504,7 +660,8 @@ export class NarrativeWorker {
     attempt: number,
     maxAttempts: number,
     conversationText: string,
-  ): Promise<boolean> {
+    contentGateEnabled: boolean,
+  ): Promise<QualityGateResult> {
     const tokens = estimateTokens(text);
 
     // [v0.4.11] Quality gate 1: Token count & Compression ratio
@@ -515,7 +672,7 @@ export class NarrativeWorker {
         `Retrying for [${item.id}]...`
       );
       await this.sleep(500);
-      return false;
+      return { pass: false, reason: "compression-ratio", isContentGate: false };
     }
 
     // [v0.4.11] Quality gate 2: Verbatim echo detection
@@ -525,7 +682,7 @@ export class NarrativeWorker {
         `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
       );
       await this.sleep(500);
-      return false;
+      return { pass: false, reason: "verbatim-echo", isContentGate: false };
     }
 
     // [v0.4.17] Quality gate 3: Narrative format check
@@ -535,20 +692,63 @@ export class NarrativeWorker {
         `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
       );
       await this.sleep(500);
-      return false;
+      return { pass: false, reason: formatCheck.reason, isContentGate: false };
     }
 
-    return true;
+    // [v0.4.27b] Quality gate 3b: Generic template phrase body-scan (content quality).
+    // Unlike Gate 3 assistant-mode phrases (firstLine only), generic template phrases
+    // like "It is crucial", "自然な流れを心がけ" typically appear mid-text.
+    // This is a content gate (isContentGate=true) to enable early bailout routing.
+    // Only active when contentGateEnabled=true to prevent item-loss regression.
+    if (contentGateEnabled) {
+      const bodyScanText = text.substring(0, 300).toLowerCase();
+      for (const phrase of GENERIC_TEMPLATE_PHRASES) {
+        if (bodyScanText.includes(phrase.toLowerCase())) {
+          const reason = `narrative-content: generic-template phrase "${phrase}" detected in body`;
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
+          );
+          await this.sleep(500);
+          return { pass: false, reason, isContentGate: true };
+        }
+      }
+    }
+
+    // [v0.4.27b] Quality gate 4: Anchor Coverage (content quality)
+    // Only active when contentGateEnabled=true AND raw text has enough anchors for strict check.
+    // When disabled (no fallback phase exists), skip entirely to preserve current behavior.
+    if (contentGateEnabled) {
+      const anchors = extractContentAnchors(conversationText);
+      if (anchors.length >= MIN_ANCHOR_COUNT_FOR_STRICT) {
+        const hits = countAnchorHits(text, anchors);
+        if (hits < MIN_ANCHOR_HITS_REQUIRED) {
+          const reason = `narrative-content: low-anchor-coverage (${hits}/${anchors.length} anchors present, need >=${MIN_ANCHOR_HITS_REQUIRED})`;
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
+          );
+          await this.sleep(500);
+          return { pass: false, reason, isContentGate: true };
+        }
+        console.log(
+          `[NarrativeWorker] ${label} anchor coverage: ${hits}/${anchors.length} anchors present (>=${MIN_ANCHOR_HITS_REQUIRED} required) for [${item.id}]`
+        );
+      }
+    }
+
+    return { pass: true, reason: "", isContentGate: false };
   }
 
   /**
    * [v0.4.19d] Attempt narrative generation with a specific model for a fixed number of attempts.
+   * [v0.4.27b] Content gate early bailout: after CONTENT_GATE_REJECTS_BEFORE_FALLBACK consecutive
+   * content-gate rejects, return null early to force phase handoff instead of wasting remaining attempts.
    */
   private async narrativizeWithModel(
     item: CacheItem,
     model: string,
     maxAttempts: number,
     label: string,
+    contentGateEnabled: boolean = false,
   ): Promise<NarrativeResult | null> {
     const systemPrompt = this.resolveSystemPrompt();
     // [v0.4.21f] Workspace-isolated key prevents cross-workspace continuity bleed
@@ -557,6 +757,10 @@ export class NarrativeWorker {
       : undefined;
     const conversationText = item.rawText;
     const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
+    // [v0.4.27b] Track content-gate rejects across attempts for early bailout.
+    // Not reset on non-content rejects (format/compression) — 3 cumulative content-rejects
+    // still signals this model can't produce anchors, so early handoff is warranted.
+    let contentRejectCount = 0;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
@@ -565,8 +769,22 @@ export class NarrativeWorker {
           { modelOverride: model },
         );
         const text = sanitizeNarrativeOutput(rawText);
-        const pass = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText);
-        if (!pass) continue;
+        const gateResult = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText, contentGateEnabled);
+        if (!gateResult.pass) {
+          // [v0.4.27b] Content gate early bailout: if this model consistently fails
+          // content quality checks, stop wasting attempts and hand off to next phase
+          if (gateResult.isContentGate) {
+            contentRejectCount++;
+            if (contentRejectCount >= CONTENT_GATE_REJECTS_BEFORE_FALLBACK) {
+              console.warn(
+                `[NarrativeWorker] ${label}: ${contentRejectCount} content-gate rejects for [${item.id}]. ` +
+                `Forcing early handoff to next phase (attempt ${attempt + 1}/${maxAttempts}).`
+              );
+              return null; // triggers phase handoff in narrativizeWithRetry
+            }
+          }
+          continue;
+        }
 
         return {
           text,
@@ -591,6 +809,7 @@ export class NarrativeWorker {
     model: string,
     maxAttempts: number,
     label: string,
+    contentGateEnabled: boolean = false,
   ): Promise<NarrativeResult | null> {
     const geminiClient = this.getGeminiClient();
     if (!geminiClient) {
@@ -611,8 +830,11 @@ export class NarrativeWorker {
           { modelOverride: model },
         );
         const text = sanitizeNarrativeOutput(rawText);
-        const pass = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText);
-        if (!pass) continue;
+        const gateResult = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText, contentGateEnabled);
+        if (!gateResult.pass) continue;
+        // [v0.4.27b] Note: no content-gate early bailout here because Gemini phases
+        // have contentGateEnabled=false (last-resort, must save something). If that
+        // changes, add contentRejectCount tracking same as narrativizeWithModel.
 
         return {
           text,

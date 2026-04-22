@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.27] - 2026-04-22
+
+### Fixed
+- **Gateway stop ECONNRESET hardening (v0.4.27)**: Shutdown now marks the client as stopping, absorbs `ECONNRESET`/`EPIPE` from child stdio pipes during teardown, guards reconnect/stop races, and ensures `gateway_stop` continues even if one stop step throws.
+
+### Changed
+- **Narrative quality gate hardening (v0.4.27b)**: Added exam-style prompt requirements, generic template body scanning, anchor coverage checks, and content-gate-aware fallback routing so low-quality free-model outputs are rejected without losing items when a fallback exists.
+
+### Notes
+- Local validation was rerun after the hardening changes.
+
 ## [0.4.26] - 2026-04-22
 
 ### Removed

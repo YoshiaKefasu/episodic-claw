@@ -931,16 +931,26 @@ const episodicClawPlugin = {
         }
 
         // Narrative architecture (v0.4.0) — graceful stop of narrative worker
+        // [v0.4.27] Individual try/catch: if narrativeWorker.stop() throws,
+        // rpcClient.stop() must still run to prevent orphaned sidecar process.
         if (_singleton!.narrativeWorker) {
           console.log("[Episodic Memory] Stopping narrative worker...");
-          await Promise.race([
-            _singleton!.narrativeWorker.stop(),
-            new Promise(resolve => setTimeout(resolve, 15000)),
-          ]);
-          console.log("[Episodic Memory] Narrative worker stopped.");
+          try {
+            await Promise.race([
+              _singleton!.narrativeWorker.stop(),
+              new Promise(resolve => setTimeout(resolve, 15000)),
+            ]);
+            console.log("[Episodic Memory] Narrative worker stopped.");
+          } catch (err) {
+            console.error("[Episodic Memory] Error stopping narrative worker (continuing shutdown):", err);
+          }
         }
 
-        await rpcClient.stop();
+        try {
+          await rpcClient.stop();
+        } catch (err) {
+          console.error("[Episodic Memory] Error stopping RPC client (continuing shutdown):", err);
+        }
         _singleton!.sidecarStarted = false;
       });
 

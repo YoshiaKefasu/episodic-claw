@@ -52,6 +52,9 @@ export class EpisodicCoreClient {
     number,
     { resolve: (val: any) => void; reject: (err: any) => void }
   >();
+  /** [v0.4.27] Shutdown boundary guard — prevents Uncaught ECONNRESET/EPIPE
+   *  during gateway_stop when child stdio pipes are torn down. */
+  private isStopping = false;
 
   public onFileChange?: (event: FileEvent) => void;
 
@@ -149,6 +152,9 @@ export class EpisodicCoreClient {
   }
 
   async start(cfg?: any): Promise<void> {
+    // [v0.4.27] Reset shutdown guard on restart — prevents stale isStopping=true
+    // from suppressing error handlers during normal operation after gateway restart.
+    this.isStopping = false;
     // SECURITY_NOTE: `__dirname` resolves to `dist/` at runtime post-compilation.
     // Resolving ".." points back to the true plugin root. If bundler output structure
     // changes in the future, `fs.existsSync(binaryPath)` safely catches any path drift.
@@ -256,6 +262,26 @@ export class EpisodicCoreClient {
       }
     });
 
+    // [v0.4.27] Pipe error hardening: child stdio stderr/stdout error listeners.
+    // Without these, ECONNRESET/EPIPE on child pipes surfaces as Uncaught exception.
+    this.child.stderr.on("error", (err: NodeJS.ErrnoException) => {
+      if (this.isStopping && (err.code === "ECONNRESET" || err.code === "EPIPE")) {
+        // Expected during shutdown — absorb with info log
+        console.log(`[Plugin] stderr pipe error during shutdown (${err.code}): ${err.message}`);
+      } else {
+        console.error("[Plugin] Go sidecar stderr error:", err.message);
+      }
+    });
+    if (this.child.stdout) {
+      this.child.stdout.on("error", (err: NodeJS.ErrnoException) => {
+        if (this.isStopping && (err.code === "ECONNRESET" || err.code === "EPIPE")) {
+          console.log(`[Plugin] stdout pipe error during shutdown (${err.code}): ${err.message}`);
+        } else {
+          console.error("[Plugin] Go sidecar stdout error:", err.message);
+        }
+      });
+    }
+
     this.child.on("close", (code: number | null) => {
       console.log(`[Plugin] Go sidecar exited with code ${code}`);
       for (const [_, req] of this.pendingReqs) {
@@ -327,14 +353,30 @@ export class EpisodicCoreClient {
     };
 
     sock.on("close", () => {
-      console.warn("[Plugin] Go RPC socket closed unexpectedly");
-      rejectPending(new Error("Go sidecar socket closed unexpectedly"));
+      // [v0.4.27] During shutdown, socket close is expected — don't log as "unexpectedly"
+      if (this.isStopping) {
+        console.log("[Plugin] Go RPC socket closed during shutdown");
+      } else {
+        console.warn("[Plugin] Go RPC socket closed unexpectedly");
+      }
+      // Only reject pending requests if we're NOT stopping — during shutdown,
+      // pending requests will be rejected by the child "close" handler below.
+      if (!this.isStopping) {
+        rejectPending(new Error("Go sidecar socket closed unexpectedly"));
+      }
       if (this.socket === sock) this.socket = undefined;
     });
 
-    sock.on("error", (err) => {
-      console.error("[Plugin] Go RPC socket error (post-connect):", err.message);
-      rejectPending(err);
+    sock.on("error", (err: NodeJS.ErrnoException) => {
+      // [v0.4.27] During shutdown, ECONNRESET/EPIPE on the RPC socket is expected
+      if (this.isStopping && (err.code === "ECONNRESET" || err.code === "EPIPE")) {
+        console.log(`[Plugin] Go RPC socket error during shutdown (${err.code}): ${err.message}`);
+      } else {
+        console.error("[Plugin] Go RPC socket error (post-connect):", err.message);
+      }
+      if (!this.isStopping) {
+        rejectPending(err);
+      }
       sock.destroy();
       if (this.socket === sock) this.socket = undefined;
     });
@@ -364,6 +406,9 @@ export class EpisodicCoreClient {
   }
 
   async stop(): Promise<void> {
+    // [v0.4.27] Set isStopping FIRST so that concurrent pipe errors
+    // and socket close events know we're in shutdown mode.
+    this.isStopping = true;
     this.connectOpts = undefined;
     this.reconnectPromise = undefined;
     // ソケットアドレスファイルのクリーンアップ
@@ -402,6 +447,12 @@ export class EpisodicCoreClient {
    * P1-Fix3: 接続憨当中のエラーリスナーと接続後の運用中リスナーを分離
    */
   private reconnect(): Promise<void> {
+    // [v0.4.27] Reconnect/stop race guard: if we're shutting down,
+    // don't attempt reconnection — it would add handlers on a socket
+    // that's about to be destroyed.
+    if (this.isStopping) {
+      return Promise.reject(new Error("Cannot reconnect: client is stopping"));
+    }
     if (this.reconnectPromise) {
       // 既にリコネクト中ならその Promise を共有して待つ（競合防止）
       return this.reconnectPromise;
