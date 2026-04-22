@@ -38,6 +38,7 @@ var (
 	disableWorkers         *bool
 	lexicalLimit           *int
 	lexicalRebuildInterval *int
+	stage2TwoPhase         *bool // [v0.4.26g] enable 2-phase lock optimization for Stage2 scoring
 
 	storeMutex    sync.Mutex
 	isReplaying   int32
@@ -80,6 +81,7 @@ func init() {
 	disableWorkers = flag.Bool("disable-workers", false, "Disable background healing and consolidation workers")
 	lexicalLimit = flag.Int("lexical-limit", 1000, "Max lexical pre-filter limit")
 	lexicalRebuildInterval = flag.Int("lexical-rebuild-interval", 7, "Days between lexical index consistency checks")
+	stage2TwoPhase = flag.Bool("stage2-twophase", false, "[v0.4.26g] Enable 2-phase lock optimization for Stage2 batch scoring (default: legacy single-lock)")
 }
 
 type recallCacheEntry struct {
@@ -125,6 +127,26 @@ func closeGlobalStateStore() {
 	}
 }
 
+// persistStage2SummaryToStateDB persists Pass 3 summary for all Stage2 exit paths
+// (success/cancel/commit-error). This is the single caller-side persistence point
+// after v0.4.26f migration from vector.db -> state.db.
+func persistStage2SummaryToStateDB(agentWs string, summary vector.Stage2RunSummary) {
+	stateStore, ssErr := getGlobalStateStore()
+	if stateStore == nil || ssErr != nil {
+		EmitLog("HealingWorker: [Pass 3] StateDB unavailable, Stage2 summary not persisted (store=nil err=%v)", ssErr)
+		return
+	}
+	data, jsonErr := json.Marshal(summary)
+	if jsonErr != nil {
+		EmitLog("HealingWorker: [Pass 3] Failed to marshal Stage2 summary: %v", jsonErr)
+		return
+	}
+	s2Key := fmt.Sprintf("agent:__healing_worker__:ws:%s:stage2:last_summary", state.AgentWsHash(agentWs))
+	if setErr := stateStore.Set(s2Key, string(data)); setErr != nil {
+		EmitLog("HealingWorker: [Pass 3] Failed to save Stage2 summary to StateDB: %v", setErr)
+	}
+}
+
 func getStore(agentWs string) (*vector.Store, error) {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
@@ -147,6 +169,7 @@ func getStore(agentWs string) (*vector.Store, error) {
 	s, err := vector.NewStore(agentWs, vector.StoreConfig{
 		TombstoneTTL:       *tombstoneTTL,
 		LexicalFilterLimit: *lexicalLimit,
+		Stage2TwoPhase:     *stage2TwoPhase, // [v0.4.26g]
 	})
 	if err != nil {
 		return nil, err
@@ -1072,7 +1095,7 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 			EmitLog("Skipping legacy nested episode tree during rebuild: %s", path)
 			return filepath.SkipDir
 		}
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".md") && !strings.EqualFold(info.Name(), "anchor.md") {
 			files = append(files, fileRecord{path: path, modTime: info.ModTime()})
 		}
 		return nil
@@ -1713,7 +1736,7 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 			triggerHealing() // Wake up background worker to heal
 		}
 
-		// Update last_activity for Sleep Timer (vstore is non-nil here — already guarded by outer if)
+		// [v0.4.26c] Update last_activity timestamp (formerly for Sleep Timer; retained for future monitoring use)
 		vstore.SetMeta("last_activity", []byte(fmt.Sprintf("%d", now.Unix())))
 	}
 
@@ -1965,7 +1988,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 		}
 	}
 
-	// Ensure last_activity is updated for Sleep Timer consolidation
+	// [v0.4.26c] Ensure last_activity is updated (formerly for Sleep Timer consolidation; retained for future monitoring use)
 	if vstore != nil {
 		_ = vstore.SetMeta("last_activity", []byte(fmt.Sprintf("%d", time.Now().Unix())))
 	}
@@ -2278,11 +2301,17 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	EmitLog("HealingWorker: [Pass 3] Starting Stage 2 Batch Score update...")
 	ctxPass3, cancelPass3 := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancelPass3()
-	if err := vstore.ComputeStage2BatchScores(ctxPass3); err != nil {
-		EmitLog("HealingWorker: [Pass 3] Failed to compute batch scores: %v", err)
+	// [v0.4.26f] ComputeStage2BatchScores now returns summary; persist summary for
+	// all 3 exit paths via unified helper before evaluating error branch.
+	s2Summary, s2Err := vstore.ComputeStage2BatchScores(ctxPass3, agentWs)
+	persistStage2SummaryToStateDB(agentWs, s2Summary)
+	if s2Err != nil {
+		EmitLog("HealingWorker: [Pass 3] Failed to compute batch scores: %v", s2Err)
 	} else {
 		EmitLog("HealingWorker: [Pass 3] Completed Stage 2 Batch Score update.")
 	}
+	// [v0.4.26f] One-time cleanup of legacy vector.db key (idempotent, no-op after first run)
+	vstore.CleanupLegacyStage2Summary()
 
 	// ----------------------------------------------------
 	// Pass 4: Garbage Collection (Tombstone removal)
@@ -2701,7 +2730,22 @@ func handleTriggerBackgroundIndex(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Background indexing started", ID: req.ID})
 
 	// Spin up background daemon
-	go vector.ProcessBackgroundIndexing(params.FilePaths, params.AgentWs, apiKey, vstore, embedLimiter)
+	go vector.ProcessBackgroundIndexing(filterIndexableMarkdownFiles(params.FilePaths), params.AgentWs, apiKey, vstore, embedLimiter)
+}
+
+func filterIndexableMarkdownFiles(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(paths))
+	for _, p := range paths {
+		base := filepath.Base(p)
+		if strings.EqualFold(base, "anchor.md") {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	return filtered
 }
 
 func startWatchdog() {
@@ -2713,25 +2757,6 @@ func startWatchdog() {
 		// [v0.4.21c] Close state DB before exit to release file locks
 		closeGlobalStateStore()
 		os.Exit(0)
-	}()
-}
-
-func startSleepTimer(_ string) {
-	ticker := time.NewTicker(2 * time.Minute)
-	go func() {
-		for range ticker.C {
-			storeMutex.Lock()
-			snapshot := make(map[string]*vector.Store)
-			for k, v := range vectorStores {
-				snapshot[k] = v
-			}
-			storeMutex.Unlock()
-
-			// Check all active workspaces
-			for agentWs, vstore := range snapshot {
-				checkSleepThreshold(agentWs, vstore)
-			}
-		}
 	}()
 }
 
@@ -2775,43 +2800,6 @@ func checkReplayThreshold(agentWs string, vstore *vector.Store, apiKey string) {
 		}
 		_ = vs.SetMeta("last_replay", []byte(fmt.Sprintf("%d", time.Now().Unix())))
 	}(agentWs, vstore)
-}
-
-func checkSleepThreshold(agentWs string, vstore *vector.Store) {
-	val, closer, err := vstore.GetRawMeta([]byte("meta:last_activity"))
-	if err != nil {
-		if closer != nil {
-			closer.Close()
-		}
-		// H-2: pebble:not found is normal before first session. Suppress noise.
-		if strings.Contains(err.Error(), "not found") {
-			return
-		}
-		EmitLog("[SleepTimer] WARN: GetRawMeta failed for %s: %v", agentWs, err)
-		return
-	}
-	if len(val) == 0 {
-		closer.Close()
-		EmitLog("[SleepTimer] WARN: last_activity is empty for %s", agentWs)
-		return
-	}
-
-	var lastActivity int64
-	fmt.Sscanf(string(val), "%d", &lastActivity)
-	closer.Close()
-
-	if lastActivity == 0 {
-		EmitLog("[SleepTimer] WARN: last_activity is zero for %s", agentWs)
-		return
-	}
-
-	// 3 hours threshold
-	idleSeconds := time.Now().Unix() - lastActivity
-	if idleSeconds > 3*3600 {
-		// v0.4.1+: D1 consolidation is disabled. Narrative mode replaces the D1 pipeline.
-		EmitLog("[SleepTimer] Idle %dh%02dm for %s (consolidation disabled in v0.4.1+)",
-			idleSeconds/3600, (idleSeconds%3600)/60, agentWs)
-	}
 }
 
 func handleConsolidate(conn net.Conn, req RPCRequest) {
@@ -3062,7 +3050,7 @@ func main() {
 	}
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
-	startSleepTimer(apiKey)
+	// [v0.4.26c] SleepTimer removed — D1 consolidation deprecated in v0.4.1+, idle monitoring unused
 	startReplayTimer(apiKey)
 
 	EmitLog("Starting Go Sidecar on socket %s", *socketPath)

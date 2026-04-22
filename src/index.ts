@@ -685,7 +685,7 @@ const episodicClawPlugin = {
           narrativeWorker,
         );
         const archiver = new EpisodicArchiver(rpcClient, segmenter);
-        const anchorStore = new AnchorStore(rpcClient);
+        const anchorStore = new AnchorStore();
           const state: AgentRuntimeState = {
             agentId,
             lastAgentWs: "",
@@ -1580,7 +1580,7 @@ const episodicClawPlugin = {
             invalidateRecallCacheForWorkspace(agentWs);
 
             return {
-              content: [{ type: "text", text: `Anchor saved. Path: ${result.path}${result.slug ? `\nSlug: ${result.slug}` : ""}` }],
+              content: [{ type: "text", text: `Anchor saved. Path: ${result.path}` }],
               details: result
             };
           } catch (e: any) {

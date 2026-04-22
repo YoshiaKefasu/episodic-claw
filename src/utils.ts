@@ -30,6 +30,11 @@ export function estimateTokens(text: string): number {
  *  DESIGN NOTE (Option A): False identity collision (different dirs → same hash)
  *  is worse than false split (same dir → different hashes). Split only causes
  *  extra dedup misses; collision causes data corruption across workspaces.
+ *
+ *  SYNC CONTRACT:
+ *  - Keep this implementation in sync with Go `internal/state/wshash.go`
+ *  - If hash rules change here, update Go side + fixtures before release
+ *  - Run `go test ./internal/state` to verify cross-language fixtures
  */
 export function agentWsHash(agentWs: string): string {
   // Order: normalize separators → strip trailing slash → lowercase (win32 only)

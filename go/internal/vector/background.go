@@ -71,6 +71,9 @@ func ProcessBackgroundIndexing(filePaths []string, agentWs string, apiKey string
 	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 
 	for _, filePath := range filePaths {
+		if strings.EqualFold(filepath.Base(filePath), "anchor.md") {
+			continue
+		}
 		if strings.HasSuffix(strings.ToLower(filePath), ".md") {
 			ProcessMDFileIndex(filePath, agentWs, apiKey, vstore, embedLimiter)
 		} else {

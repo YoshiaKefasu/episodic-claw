@@ -634,16 +634,15 @@ Desired retention: %.2f
 }
 
 func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vstore *Store, limiter *rate.Limiter) error {
-	logger.Info(logger.CatBackground, "Starting replay scheduler for %s\n", agentWs)
-
 	startedAt := time.Now()
 	now := startedAt
+
+	// [v0.4.26d] Check candidates first — if none due, save summary and return silently
 	candidates, err := vstore.ListDueReplayCandidates(now, 3)
 	if err != nil {
 		return fmt.Errorf("failed to list replay candidates: %w", err)
 	}
 	if len(candidates) == 0 {
-		logger.Info(logger.CatBackground, "No due replay candidates for %s\n", agentWs)
 		summary := ReplayRunSummary{
 			WorkspaceID:   agentWs,
 			StartedAt:     startedAt,
@@ -653,8 +652,10 @@ func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vsto
 		if data, marshalErr := json.Marshal(summary); marshalErr == nil {
 			_ = vstore.SetMeta("replay:last_summary", data)
 		}
-		return nil
+		return nil // [v0.4.26d] Silent skip — no log output for no-due case
 	}
+
+	logger.Info(logger.CatBackground, "Starting replay scheduler for %s\n", agentWs)
 
 	rawLLM := ai.NewGoogleStudioProvider(apiKey, "gemma-3-27b-it")
 	llm := &ai.RetryLLM{

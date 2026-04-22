@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.26] - 2026-04-22
+
+### Removed
+- **SleepTimer removed (v0.4.26c)**: `startSleepTimer()` and `checkSleepThreshold()` functions removed from Go sidecar. D1 consolidation was deprecated in v0.4.1+ and narrative mode replaces the D1 pipeline. Idle monitoring logs (`[SleepTimer] Idle ...`) were noise in production logs since consolidation never fires. `startSleepTimer(apiKey)` call removed from `main()`, and related comments in `store.go` updated.
+
+### Changed
+- **Replay scheduler silent skip (v0.4.26d)**: `RunReplayScheduler()` now checks replay candidates before logging; zero-candidate runs return silently instead of emitting `"No due replay candidates"` noise. `Starting replay scheduler...` log is deferred until candidates > 0. Summary still saved for zero-candidate runs.
+- **ComputeStage2BatchScores hardening (v0.4.26e)**: Added context cancellation support (uncommitted records discarded on cancel), chunked commits every 300 records (replacing single monolithic commit), and structured `Stage2RunSummary` persisted to `meta:stage2:last_summary` with `agentWs/runId/durationMs/scanned/eligible/skippedRecent/rescored/tombstoned/commitCount/cancelled/cancelReason/commitError`. Scoring formulas and thresholds unchanged.
+- **Stage2 Summary StateDB Migration (v0.4.26f)**: `meta:stage2:last_summary` migrated from `vector.db` to `state.db` for memory purity. `ComputeStage2BatchScores` now returns `(Stage2RunSummary, error)` instead of `error`, and the caller (HealingWorker Pass 3) persists the summary to StateDB with key `agent:__healing_worker__:ws:{wsHash}:stage2:last_summary`. Legacy `vector.db` key is cleaned up idempotently via `CleanupLegacyStage2Summary()`. Added Go implementation of `agentWsHash` (`internal/state/wshash.go`) matching the TS convention exactly (UTF-16 code units, DJB2 + 0x7FFFFFFF mask, base-36 encoding) with cross-language fixture tests verified against TS output.
+
 ## [0.4.25] - 2026-04-21
 
 ### Fixed

@@ -118,8 +118,9 @@ type Watermark struct {
 }
 
 type StoreConfig struct {
-	TombstoneTTL       int // days
-	LexicalFilterLimit int // max items from bleve
+	TombstoneTTL       int  // days
+	LexicalFilterLimit int  // max items from bleve
+	Stage2TwoPhase     bool // [v0.4.26g] enable 2-phase lock optimization for Stage2 scoring
 }
 
 type Store struct {
@@ -284,17 +285,16 @@ func (s *Store) CleanOrphans() {
 	defer iter.Close()
 
 	var toDelete []string
+	var toDeleteEmptyID []string
 	var toMigrate []EpisodeRecord
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		var rec EpisodeRecord
 		if err := msgpack.Unmarshal(iter.Value(), &rec); err == nil && rec.SourcePath != "" {
-			// [v0.4.20b] Skip records with empty ID — cannot form valid Pebble delete keys.
-			// Note: TrimSpace is used here (not plain =="") because DB-sourced data may contain
-			// whitespace-padded IDs. Delete()/deleteLocked() use plain =="" because API-sourced
-			// IDs are already trimmed by the caller.
+			iterKey := append([]byte(nil), iter.Key()...)
+			// [v0.4.26b] Empty-ID records are orphaned cleanup targets, not warnings.
 			if strings.TrimSpace(rec.ID) == "" {
-				logger.Warn(logger.CatStore, "CleanOrphans: skipping record with empty ID (SourcePath=%s)", rec.SourcePath)
+				toDeleteEmptyID = append(toDeleteEmptyID, string(iterKey))
 				continue
 			}
 			if _, statErr := os.Stat(rec.SourcePath); os.IsNotExist(statErr) {
@@ -313,6 +313,32 @@ func (s *Store) CleanOrphans() {
 		for _, id := range toDelete {
 			s.Delete(id) // leverages the new pebble.Batch atomic deletion
 		}
+	}
+
+	if len(toDeleteEmptyID) > 0 {
+		logger.Info(logger.CatStore, "Orphan cleanup: deleting %d empty-ID record(s)", len(toDeleteEmptyID))
+		batch := s.db.NewBatch()
+		for _, rawKey := range toDeleteEmptyID {
+			if rawKey == "" {
+				continue
+			}
+			key := []byte(rawKey)
+			batch.Delete(key, nil)
+			if recBytes, closer, err := s.db.Get(key); err == nil {
+				var rec EpisodeRecord
+				if uErr := msgpack.Unmarshal(recBytes, &rec); uErr == nil && rec.SourcePath != "" {
+					normalizedPath := filepath.ToSlash(filepath.Clean(rec.SourcePath))
+					batch.Delete(append(append([]byte(nil), prefixP2I...), []byte(normalizedPath)...), nil)
+				}
+				closer.Close()
+			}
+		}
+		if err := batch.Commit(pebble.Sync); err != nil {
+			logger.Warn(logger.CatStore, "Orphan cleanup: failed to delete empty-ID records: %v", err)
+		} else {
+			logger.Info(logger.CatStore, "Orphan cleanup summary: removed %d empty-ID record(s)", len(toDeleteEmptyID))
+		}
+		batch.Close()
 	}
 
 	// Perform p2i migration for legacy records
@@ -1011,9 +1037,7 @@ func (s *Store) GetRawMeta(key []byte) ([]byte, io.Closer, error) {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	// Ensure the key starts with "meta:" if it's not already
-	// However, checkSleepThreshold already prefix "meta:" in "meta:last_activity" bytes.
-	// But checkSleepThreshold passes []byte("meta:last_activity")
+	// Ensure the key starts with "meta:" prefix for meta keys
 
 	val, closer, err := s.db.Get(key)
 	return val, closer, err
@@ -1667,44 +1691,151 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Stage2RunSummary captures observability data for a ComputeStage2BatchScores run.
+// [v0.4.26e] Added for operationally visible chunked-commit scoring.
+type Stage2RunSummary struct {
+	AgentWs       string    `json:"agent_ws"`
+	RunID         string    `json:"run_id"`
+	StartedAt     time.Time `json:"started_at"`
+	DurationMs    int64     `json:"duration_ms"`
+	Scanned       int       `json:"scanned"`
+	Eligible      int       `json:"eligible"`
+	SkippedRecent int       `json:"skipped_recent"`
+	Rescored      int       `json:"rescored"`
+	Tombstoned    int       `json:"tombstoned"`
+	CommitCount   int       `json:"commit_count"`
+	Cancelled     bool      `json:"cancelled"`
+	CancelReason  string    `json:"cancel_reason,omitempty"`
+	CommitError   string    `json:"commit_error,omitempty"` // [v0.4.26e] non-empty when commitBatch fails
+
+	// [v0.4.26g] Lock granularity optimization metrics
+	LockWaitMs     int64  `json:"lock_wait_ms"`              // Time spent waiting for lock acquisition
+	LockHoldMs     int64  `json:"lock_hold_ms"`              // Time spent holding write/exclusive lock
+	ReadLockHoldMs int64  `json:"read_lock_hold_ms"`         // [2phase] Time spent holding read lock (Phase 1)
+	IterMs         int64  `json:"iter_ms"`                   // Time spent in Pebble iteration + unmarshal
+	ComputeMs      int64  `json:"compute_ms"`                // Time spent in score computation
+	CommitMs       int64  `json:"commit_ms"`                 // Cumulative time spent in batch commits
+	PhaseMode      string `json:"phase_mode,omitempty"`      // "legacy" or "2phase"
+	StalePatches   int    `json:"stale_patches"`             // [2phase] Records modified between Phase1 and Phase3
+}
+
+// stage2BatchCommitSize controls how many records are accumulated before a
+// partial commit. Partial commits are allowed ("部分反映許容" policy);
+// uncommitted records on cancel are discarded.
+const stage2BatchCommitSize = 300
+
 // ComputeStage2BatchScores iterates over all D0 records (skipping those less than 30 mins old),
 // calculates the Stage 2 Hippocampus Scores (Importance & Noise), and writes them
-// back using a synchronous Pebble Batch.
-func (s *Store) ComputeStage2BatchScores(ctx context.Context) error {
+// back using chunked synchronous Pebble Batches.
+//
+// [v0.4.26e] Hardened with:
+//   - context cancellation: uncommitted records are discarded on cancel
+//   - chunked commits: every stage2BatchCommitSize records, a partial commit is issued
+//   - structured summary: returned to caller for StateDB persistence (v0.4.26f)
+//
+// [v0.4.26g] Dispatches to legacy or 2-phase implementation based on StoreConfig.Stage2TwoPhase.
+func (s *Store) ComputeStage2BatchScores(ctx context.Context, agentWs string) (Stage2RunSummary, error) {
+	if s.config.Stage2TwoPhase {
+		return s.computeStage2TwoPhase(ctx, agentWs)
+	}
+	return s.computeStage2Legacy(ctx, agentWs)
+}
+
+// computeStage2Legacy is the original single-lock implementation with [v0.4.26g] instrumentation.
+// It holds s.mutex.Lock() for the entire function, which is safe but may cause
+// reader starvation under heavy load.
+func (s *Store) computeStage2Legacy(ctx context.Context, agentWs string) (Stage2RunSummary, error) {
+	lockAttemptedAt := time.Now()
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	lockAcquiredAt := time.Now()
+
+	startedAt := lockAcquiredAt
+	runID := fmt.Sprintf("%d", startedAt.UnixNano())
+	summary := Stage2RunSummary{
+		AgentWs:   agentWs,
+		RunID:     runID,
+		StartedAt: startedAt,
+		PhaseMode: "legacy",
+	}
 
 	const maxLag = 30 * time.Minute
-	now := time.Now()
+	now := startedAt
 
+	iterStartedAt := time.Now()
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte("ep:"),
 		UpperBound: []byte("ep;"),
 	})
 	if err != nil {
-		return err
+		return summary, err
 	}
 	defer iter.Close()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	var updatedCount int
+	var batchCount int // records accumulated in current batch
+	var totalCommitMs int64
+
+	commitBatch := func() error {
+		if batchCount == 0 {
+			return nil
+		}
+		commitStart := time.Now()
+		if err := batch.Commit(pebble.Sync); err != nil {
+			logger.Warn(logger.CatStore, "ComputeStage2BatchScores: Failed to commit batch: %v", err)
+			// [v0.4.26f] Populate summary on commit failure for caller-side persistence
+			summary.CommitError = err.Error()
+			summary.DurationMs = time.Since(startedAt).Milliseconds()
+			return err
+		}
+		totalCommitMs += time.Since(commitStart).Milliseconds()
+		summary.CommitCount++
+		batch.Reset()
+		batchCount = 0
+		return nil
+	}
+
+	var computeMs int64
 
 	for iter.First(); iter.Valid(); iter.Next() {
+		// [v0.4.26e] Fix 1: context cancellation check
+		select {
+		case <-ctx.Done():
+			// Discard uncommitted records — contract: "未 commit 分破棄"
+			summary.Cancelled = true
+			summary.CancelReason = ctx.Err().Error()
+			summary.DurationMs = time.Since(startedAt).Milliseconds()
+			summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds()
+			summary.LockHoldMs = time.Since(lockAcquiredAt).Milliseconds()
+			summary.IterMs = time.Since(iterStartedAt).Milliseconds() - computeMs - totalCommitMs // approximate
+			summary.ComputeMs = computeMs
+			summary.CommitMs = totalCommitMs
+			logger.Info(logger.CatStore, "ComputeStage2BatchScores: Cancelled after %d commits, %d rescored, %d tombstoned (reason: %s)",
+				summary.CommitCount, summary.Rescored, summary.Tombstoned, summary.CancelReason)
+			return summary, ctx.Err()
+		default:
+		}
+
 		var rec EpisodeRecord
 		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
 			continue
 		}
+		summary.Scanned++
 
 		if !isActiveD0Record(rec) {
 			continue
 		}
+		summary.Eligible++
 
 		// Only recompute if uncomputed or older than maxLag
 		if !rec.LastScoredAt.IsZero() && now.Sub(rec.LastScoredAt) < maxLag {
+			summary.SkippedRecent++
 			continue
 		}
+
+		computeStart := time.Now()
 
 		// Age Penalty: max 30 days
 		ageDays := now.Sub(rec.Timestamp).Hours() / 24.0
@@ -1761,29 +1892,446 @@ func (s *Store) ComputeStage2BatchScores(ctx context.Context) error {
 		}
 
 		CalculateScoreStage2(&rec, params)
+		computeMs += time.Since(computeStart).Milliseconds()
+		summary.Rescored++
 
 		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
 			rec.PruneState = "tombstone"
 			rec.TombstonedAt = now
+			summary.Tombstoned++
 			logger.Info(logger.CatStore, "Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
 		}
 
 		// Write back to DB via batch
 		if serialized, mErr := msgpack.Marshal(rec); mErr == nil {
 			_ = batch.Set(iter.Key(), serialized, pebble.NoSync)
-			updatedCount++
+			batchCount++
+		}
+
+		// [v0.4.26e] Fix 2: Chunked commit every stage2BatchCommitSize records
+		if batchCount >= stage2BatchCommitSize {
+			if err := commitBatch(); err != nil {
+				return summary, err
+			}
 		}
 	}
 
-	if updatedCount > 0 {
+	// Final commit for remaining records
+	if err := commitBatch(); err != nil {
+		return summary, err
+	}
+
+	summary.DurationMs = time.Since(startedAt).Milliseconds()
+	summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds()
+	summary.LockHoldMs = time.Since(lockAcquiredAt).Milliseconds()
+	summary.IterMs = time.Since(iterStartedAt).Milliseconds() - computeMs - totalCommitMs // approximate: iter+unmarshal time
+	summary.ComputeMs = computeMs
+	summary.CommitMs = totalCommitMs
+
+	if summary.Rescored > 0 || summary.Tombstoned > 0 {
+		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d tombstoned=%d commits=%d dur=%dms lockWait=%dms lockHold=%dms iter=%dms compute=%dms commit=%dms",
+			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Tombstoned, summary.CommitCount, summary.DurationMs,
+			summary.LockWaitMs, summary.LockHoldMs, summary.IterMs, summary.ComputeMs, summary.CommitMs)
+	}
+
+	return summary, nil
+}
+
+// stage2ScorePatch represents a score-only update to be applied to an episode record.
+// [v0.4.26g] Used by 2-phase implementation to avoid lost-update: instead of writing
+// back the entire record (which could clobber concurrent Add/Update changes),
+// we re-read the current record and only patch the score-related fields.
+type stage2ScorePatch struct {
+	ID                   string
+	ImportanceScore      float32
+	NoiseScore           float32
+	PruneState           string
+	TombstonedAt         time.Time
+	LastScoredAt         time.Time
+	CanonicalParent      string
+	OriginalLastScoredAt time.Time // [v0.4.26g] Phase 1 snapshot's LastScoredAt for accurate stale detection
+}
+
+// computeStage2TwoPhase implements the 2-phase lock optimization for Stage2 scoring.
+// [v0.4.26g]
+//
+// Phase 1 (RLock): Snapshot records + compute feature parameters (needs topicIndex).
+// Phase 2 (no lock): Compute scores outside the lock — pure CPU, no shared state.
+// Phase 3 (Lock): Re-read current records, apply score-only patches, batch commit.
+//
+// Lost-update safety: Phase 3 re-reads each record under Lock and only patches the
+// 6 score fields (ImportanceScore, NoiseScore, PruneState, TombstonedAt, LastScoredAt,
+// CanonicalParent). Concurrent Add/UpdateRecord changes to other fields (Hits, Retrievals,
+// Tags, Topics, etc.) are preserved because we never overwrite the entire record.
+func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stage2RunSummary, error) {
+	startedAt := time.Now()
+	runID := fmt.Sprintf("%d", startedAt.UnixNano())
+	summary := Stage2RunSummary{
+		AgentWs:   agentWs,
+		RunID:     runID,
+		StartedAt: startedAt,
+		PhaseMode: "2phase",
+	}
+
+	const maxLag = 30 * time.Minute
+	now := startedAt
+
+	// ---- Phase 1: RLock snapshot ----
+	lockAttemptedAt := time.Now()
+	s.mutex.RLock()
+	lockAcquiredAt := time.Now()
+
+	iterStartedAt := time.Now()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("ep:"),
+		UpperBound: []byte("ep;"),
+	})
+	if err != nil {
+		s.mutex.RUnlock()
+		return summary, err
+	}
+
+	// scoreCandidate holds the data needed for Phase 2 score computation.
+	type scoreCandidate struct {
+		rec       EpisodeRecord
+		params    ScoreUpdateParams
+		pebbleKey []byte // original iterator key for Phase 3 lookup
+	}
+
+	var candidates []scoreCandidate
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-ctx.Done():
+			iter.Close()
+			s.mutex.RUnlock()
+			summary.Cancelled = true
+			summary.CancelReason = ctx.Err().Error()
+			summary.DurationMs = time.Since(startedAt).Milliseconds()
+			summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds()
+			summary.ReadLockHoldMs = time.Since(lockAcquiredAt).Milliseconds()
+			summary.IterMs = time.Since(iterStartedAt).Milliseconds()
+			return summary, ctx.Err()
+		default:
+		}
+
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		summary.Scanned++
+
+		if !isActiveD0Record(rec) {
+			continue
+		}
+		summary.Eligible++
+
+		if !rec.LastScoredAt.IsZero() && now.Sub(rec.LastScoredAt) < maxLag {
+			summary.SkippedRecent++
+			continue
+		}
+
+		// Compute feature parameters under RLock (needs topicIndex)
+		ageDays := now.Sub(rec.Timestamp).Hours() / 24.0
+		if ageDays > 30.0 {
+			ageDays = 30.0
+		} else if ageDays < 0.0 {
+			ageDays = 0.0
+		}
+		ageWithoutReusePenalty := ageDays / 30.0
+
+		persistenceScore := 0.0
+		topics, _ := ValidateTopics(rec.Topics)
+		if len(topics) == 0 {
+			topics = legacyTopicsFromTags(rec.Tags)
+		}
+		if len(topics) > 0 {
+			for _, t := range topics {
+				if b, ok := s.topicIndex[t]; ok {
+					bucketSize := float64(len(b))
+					if bucketSize > 10.0 {
+						bucketSize = 10.0
+					}
+					persistenceScore += bucketSize / 10.0
+				}
+			}
+			persistenceScore /= float64(len(topics))
+		}
+
+		redundancyWithD1 := 0.0
+		for _, e := range rec.Edges {
+			if e.Type == "child" {
+				_, closer, getErr := s.db.Get(append([]byte("ep:"), []byte(e.ID)...))
+				if getErr == nil {
+					redundancyWithD1 = 1.0
+					rec.CanonicalParent = e.ID
+					closer.Close()
+					break
+				}
+			}
+		}
+
+		noExpandNoHit := 0.0
+		if rec.ExpandCount == 0 && rec.Hits == 0 {
+			noExpandNoHit = 1.0
+		}
+
+		params := ScoreUpdateParams{
+			AgeWithoutReusePenalty: ageWithoutReusePenalty,
+			TopicsPersistence:      persistenceScore,
+			RedundancyWithD1:       redundancyWithD1,
+			NoExpandNoHit:          noExpandNoHit,
+		}
+
+		candidates = append(candidates, scoreCandidate{
+			rec:       rec,
+			params:    params,
+			pebbleKey: append([]byte(nil), iter.Key()...),
+		})
+	}
+	iter.Close()
+	rlockReleasedAt := time.Now()
+	s.mutex.RUnlock()
+
+	// ---- Phase 2: Compute scores outside the lock ----
+	computeStart := time.Now()
+
+	patches := make([]stage2ScorePatch, 0, len(candidates))
+	for i, cand := range candidates {
+		// [v0.4.26g] Phase 2 cancel check: respect context cancellation even
+		// during lock-free computation. Check every 100 iterations.
+		if i%100 == 0 {
+			select {
+			case <-ctx.Done():
+				summary.Cancelled = true
+				summary.CancelReason = ctx.Err().Error()
+				summary.DurationMs = time.Since(startedAt).Milliseconds()
+				summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds()
+				summary.ReadLockHoldMs = rlockReleasedAt.Sub(lockAcquiredAt).Milliseconds()
+				summary.IterMs = rlockReleasedAt.Sub(iterStartedAt).Milliseconds()
+				summary.ComputeMs = time.Since(computeStart).Milliseconds()
+				return summary, ctx.Err()
+			default:
+			}
+		}
+
+		rec := cand.rec // copy
+		CalculateScoreStage2(&rec, cand.params)
+		summary.Rescored++
+
+		tombstonedAt := time.Time{}
+		pruneState := rec.PruneState
+		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
+			pruneState = "tombstone"
+			tombstonedAt = now
+			summary.Tombstoned++
+			logger.Info(logger.CatStore, "Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
+		}
+
+		patches = append(patches, stage2ScorePatch{
+			ID:                   rec.ID,
+			ImportanceScore:      rec.ImportanceScore,
+			NoiseScore:           rec.NoiseScore,
+			PruneState:           pruneState,
+			TombstonedAt:         tombstonedAt,
+			LastScoredAt:         now,
+			CanonicalParent:      rec.CanonicalParent,
+			OriginalLastScoredAt: cand.rec.LastScoredAt, // [v0.4.26g] for accurate stale detection
+		})
+	}
+	computeMs := time.Since(computeStart).Milliseconds()
+
+	// [v0.4.26g] Pre-Phase 3 cancel check: if context was cancelled during Phase 2,
+	// abort before acquiring the write lock. This also handles the patches==0 edge
+	// case where the Phase 3 loop would never execute and thus never check ctx.
+	select {
+	case <-ctx.Done():
+		summary.Cancelled = true
+		summary.CancelReason = ctx.Err().Error()
+		summary.DurationMs = time.Since(startedAt).Milliseconds()
+		summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds()
+		summary.ReadLockHoldMs = rlockReleasedAt.Sub(lockAcquiredAt).Milliseconds()
+		summary.IterMs = rlockReleasedAt.Sub(iterStartedAt).Milliseconds()
+		summary.ComputeMs = computeMs
+		return summary, ctx.Err()
+	default:
+	}
+
+	// ---- Phase 3: Lock, re-read, apply score-only patches, commit ----
+	writeLockAttemptedAt := time.Now()
+	s.mutex.Lock()
+	writeLockAcquiredAt := time.Now() // measure actual write-lock wait time
+
+	batch := s.db.NewBatch()
+	var batchCount int
+	var totalCommitMs int64
+
+	commitBatch := func() error {
+		if batchCount == 0 {
+			return nil
+		}
+		commitStart := time.Now()
 		if err := batch.Commit(pebble.Sync); err != nil {
-			logger.Warn(logger.CatStore, "ComputeStage2BatchScores: Failed to commit batch: %v", err)
+			summary.CommitError = err.Error()
+			summary.DurationMs = time.Since(startedAt).Milliseconds()
+			batch.Close()
+			s.mutex.Unlock()
 			return err
 		}
-		logger.Info(logger.CatStore, "ComputeStage2BatchScores: Successfully updated Stage 2 scores for %d records.", updatedCount)
+		totalCommitMs += time.Since(commitStart).Milliseconds()
+		summary.CommitCount++
+		batch.Reset()
+		batchCount = 0
+		return nil
 	}
 
-	return nil
+	for i, patch := range patches {
+		select {
+		case <-ctx.Done():
+			summary.Cancelled = true
+			summary.CancelReason = ctx.Err().Error()
+			summary.DurationMs = time.Since(startedAt).Milliseconds()
+			summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds() + writeLockAcquiredAt.Sub(writeLockAttemptedAt).Milliseconds()
+			summary.LockHoldMs = time.Since(writeLockAcquiredAt).Milliseconds()
+			summary.ReadLockHoldMs = rlockReleasedAt.Sub(lockAcquiredAt).Milliseconds()
+			summary.IterMs = rlockReleasedAt.Sub(iterStartedAt).Milliseconds()
+			summary.ComputeMs = computeMs
+			summary.CommitMs = totalCommitMs
+			batch.Close()
+			s.mutex.Unlock()
+			return summary, ctx.Err()
+		default:
+		}
+
+		epKey := append(append([]byte(nil), prefixEp...), []byte(patch.ID)...)
+		val, closer, getErr := s.db.Get(epKey)
+		if getErr != nil {
+			// Record was deleted between Phase 1 and Phase 3 — skip
+			if getErr != pebble.ErrNotFound {
+				logger.Warn(logger.CatStore, "2phase: failed to re-read %s: %v", patch.ID, getErr)
+			}
+			summary.StalePatches++
+			continue
+		}
+
+		var current EpisodeRecord
+		if uErr := msgpack.Unmarshal(val, &current); uErr != nil {
+			closer.Close()
+			continue
+		}
+		closer.Close()
+
+		// [v0.4.26g] Staleness detection: compare current record's LastScoredAt
+		// against our Phase 1 snapshot's OriginalLastScoredAt. If they differ,
+		// the record was modified (scored or updated) between Phase 1 and Phase 3.
+		//
+		// Known limitation: Add()/UpdateRecord()/RecordHit() modify Hits, Retrievals,
+		// Tags, Topics etc. but do NOT touch LastScoredAt, so modifications to those
+		// fields alone will NOT be detected as stale. The score-only patch preserves
+		// the current field values (no data loss), but the PruneState decision may be
+		// based on outdated feature inputs. This is acceptable because Stage2 is periodic
+		// and the next run will re-evaluate with fresh data.
+		stale := !current.LastScoredAt.Equal(patch.OriginalLastScoredAt)
+
+		// Apply score-only patch (preserving all other fields from the current record).
+		// Score fields are always applied — they will be recomputed next run even if stale.
+		current.ImportanceScore = patch.ImportanceScore
+		current.NoiseScore = patch.NoiseScore
+		current.LastScoredAt = patch.LastScoredAt
+		current.CanonicalParent = patch.CanonicalParent
+
+		if stale {
+			// [v0.4.26g] Stale record: PruneState decision is unreliable because
+			// the score was computed from Phase 1 snapshot data (old Hits/Retrievals/etc).
+			// Skip PruneState change entirely — the next Stage2 run will re-evaluate
+			// with fresh data. This prevents stale-data-driven tombstones.
+			//
+			// Note: LastScoredAt is still set to `now`, giving the record a 30-min
+			// scoring cooldown even though PruneState was not re-evaluated. This is
+			// intentional to avoid hot-loop re-scoring on every run.
+			summary.StalePatches++
+		} else if (current.PruneState == "tombstone" || current.PruneState == "merged") && patch.PruneState != current.PruneState {
+			// [v0.4.26g] Prune-state resurrection guard: once a record is in a
+			// terminal prune state, a later scoring pass must NOT undo that decision.
+			// Score fields are still updated for observability.
+			summary.StalePatches++
+		} else {
+			current.PruneState = patch.PruneState
+			if !patch.TombstonedAt.IsZero() {
+				current.TombstonedAt = patch.TombstonedAt
+			}
+		}
+
+		if serialized, mErr := msgpack.Marshal(current); mErr == nil {
+			_ = batch.Set(epKey, serialized, pebble.NoSync)
+			batchCount++
+		}
+
+		if batchCount >= stage2BatchCommitSize {
+			if err := commitBatch(); err != nil {
+				return summary, err
+			}
+		}
+
+		// Periodic fairness yield: briefly unlock to let readers through
+		if i > 0 && i%100 == 0 {
+			if batchCount == 0 {
+				s.mutex.Unlock()
+				s.mutex.Lock()
+			}
+		}
+	}
+
+	// Final commit
+	if err := commitBatch(); err != nil {
+		return summary, err
+	}
+	batch.Close()
+	s.mutex.Unlock()
+
+	writeLockReleasedAt := time.Now()
+
+	summary.DurationMs = time.Since(startedAt).Milliseconds()
+	summary.LockWaitMs = lockAcquiredAt.Sub(lockAttemptedAt).Milliseconds() + writeLockAcquiredAt.Sub(writeLockAttemptedAt).Milliseconds()
+	summary.LockHoldMs = writeLockReleasedAt.Sub(writeLockAcquiredAt).Milliseconds()
+	summary.ReadLockHoldMs = rlockReleasedAt.Sub(lockAcquiredAt).Milliseconds()
+	summary.IterMs = rlockReleasedAt.Sub(iterStartedAt).Milliseconds()
+	summary.ComputeMs = computeMs
+	summary.CommitMs = totalCommitMs
+
+	if summary.Rescored > 0 || summary.Tombstoned > 0 {
+		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d tombstoned=%d commits=%d stale=%d dur=%dms lockWait=%dms rlockHold=%dms wlockHold=%dms iter=%dms compute=%dms commit=%dms",
+			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Tombstoned, summary.CommitCount, summary.StalePatches, summary.DurationMs,
+			summary.LockWaitMs, summary.ReadLockHoldMs, summary.LockHoldMs, summary.IterMs, summary.ComputeMs, summary.CommitMs)
+	}
+
+	return summary, nil
+}
+
+// CleanupLegacyStage2Summary removes the old meta:stage2:last_summary key from
+// vector.db that was written by the pre-v0.4.26f saveStage2Summary method.
+// This is a one-time idempotent migration — safe to call repeatedly.
+// [v0.4.26f] Summary persistence moved to StateDB; vector.db no longer stores it.
+func (s *Store) CleanupLegacyStage2Summary() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	key := []byte("meta:stage2:last_summary")
+	_, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return // already clean
+	}
+	if err != nil {
+		logger.Warn(logger.CatStore, "CleanupLegacyStage2Summary: failed to check key: %v", err)
+		return
+	}
+	closer.Close()
+
+	if err := s.db.Delete(key, pebble.Sync); err != nil {
+		logger.Warn(logger.CatStore, "CleanupLegacyStage2Summary: failed to delete key: %v", err)
+	} else {
+		logger.Info(logger.CatStore, "CleanupLegacyStage2Summary: removed legacy meta:stage2:last_summary from vector.db")
+	}
 }
 
 // RunGarbageCollector physically deletes files that have been marked as tombstone

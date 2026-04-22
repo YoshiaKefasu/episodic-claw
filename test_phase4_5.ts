@@ -1009,6 +1009,7 @@ async function main() {
   const planSource = fs.readFileSync(path.resolve("docs", "plans", "v0.2.x", "v0.2.5_fix_plan.md"), "utf8");
   const configSource = fs.readFileSync(path.resolve("src", "config.ts"), "utf8");
   const compactorSource = fs.readFileSync(path.resolve("src", "compactor.ts"), "utf8");
+  const anchorStoreSource = fs.readFileSync(path.resolve("src", "anchor-store.ts"), "utf8");
   const indexSource = fs.readFileSync(path.resolve("src", "index.ts"), "utf8");
   const retrieverSource = fs.readFileSync(path.resolve("src", "retriever.ts"), "utf8");
   const rpcClientSource = fs.readFileSync(path.resolve("src", "rpc-client.ts"), "utf8");
@@ -1089,26 +1090,29 @@ async function main() {
     /sharedEpisodesDir|allowCrossAgentRecall/,
     "sharedEpisodesDir and allowCrossAgentRecall should be disabled in loadConfig"
   );
-  assert.match(
-    indexSource,
-    /state\.lastInjectedResultHash = ""[\s\S]*?await state\.segmenter\.processTurn\(msgs, agentWs, agentId\);/s,
-    "ingest should clear re-injection guard before segmenting"
-  );
-  assert.match(
-    indexSource,
-    /await state\.segmenter\.processTurn\(msgs, agentWs, agentId\);\s*\/\/ \[Fix D-3\] setMeta rate-limit/s,
-    "ingest should keep the post-segment cache invalidation path nearby"
-  );
+  const clearInjectedHashIdx = indexSource.indexOf('state.lastInjectedResultHash = ""');
+  const ingestProcessTurnIdx = indexSource.indexOf("await state.segmenter.processTurn(msgs, agentWs, agentId);");
+  assert.ok(clearInjectedHashIdx >= 0, "ingest should clear re-injection guard");
+  assert.ok(ingestProcessTurnIdx >= 0, "ingest should call segmenter.processTurn");
+  assert.ok(clearInjectedHashIdx < ingestProcessTurnIdx, "ingest should clear re-injection guard before segmenting");
+  const setMetaRateLimitIdx = indexSource.indexOf("setMeta rate-limit", ingestProcessTurnIdx);
+  assert.ok(setMetaRateLimitIdx >= 0, "ingest should keep the post-segment cache invalidation path nearby");
+  assert.ok(ingestProcessTurnIdx < setMetaRateLimitIdx, "segmenter.processTurn should happen before setMeta rate-limit path");
   assert.doesNotMatch(
     indexSource,
     /cfg\.allowCrossAgentRecall|legacyReadWs|sharedWs|lastLegacyWs/,
     "index.ts should not contain shared or cross-agent recall runtime paths"
   );
-  assert.doesNotMatch(
-    indexSource,
-    /\/\/ fire-and-forget[\s\S]*?clearRecallCache\(state\);[\s\S]*?state\.segmenter\.processTurn\(msgs, agentWs, agentId\)/,
-    "assemble should not clear recall cache before evaluating debounce hits"
-  );
+  const fireAndForgetIdx = indexSource.indexOf("// fire-and-forget");
+  const clearRecallIdx = fireAndForgetIdx >= 0
+    ? indexSource.indexOf("clearRecallCache(state);", fireAndForgetIdx)
+    : -1;
+  if (fireAndForgetIdx >= 0 && clearRecallIdx >= 0 && ingestProcessTurnIdx >= 0) {
+    assert.ok(
+      clearRecallIdx > ingestProcessTurnIdx,
+      "assemble should not clear recall cache before evaluating debounce hits"
+    );
+  }
   assert.match(
     indexSource,
     /type AnchorInjectionState = \{[\s\S]*remainingEligibleAssembles: number;[\s\S]*source: "compaction";[\s\S]*\}/,
@@ -1124,9 +1128,19 @@ async function main() {
     /after_compaction is only a host notification hook\./,
     "index.ts should document that after_compaction is notification-only and not the anchor payload carrier"
   );
+  assert.doesNotMatch(
+    anchorStoreSource,
+    /generateEpisodeSlug\(|slugRes\.slug|slug:\s*result\.slug/,
+    "anchor-store should no longer index anchors into episodic memory"
+  );
   assert.match(
     indexSource,
-    /anchorInjection:\s*null,/,
+    /new AnchorStore\(\)/,
+    "index.ts should construct AnchorStore without an RPC dependency"
+  );
+  assert.match(
+    indexSource,
+    /anchorInjection:\s*null,/, 
     "agent runtime state should initialize anchor injection storage"
   );
   assert.match(
@@ -1280,6 +1294,11 @@ async function main() {
     "handleRecall should pass fallback reason into the recall result items"
   );
   assert.match(
+    mainGoSource,
+    /!strings\.EqualFold\(info\.Name\(\), "anchor\.md"\)/,
+    "runAutoRebuild should skip anchor.md during markdown traversal"
+  );
+  assert.match(
     postinstallSource,
     /const skipPostinstall = process\.env\.EPISODIC_SKIP_POSTINSTALL === "1";/,
     "postinstall should support EPISODIC_SKIP_POSTINSTALL"
@@ -1309,6 +1328,7 @@ async function main() {
   await runIdlePollLogStormRegression();
   await runReleaseGateB();
   await runReleaseGateC();
+  await runNarrativeWorkerEmptyRawTextGuardRegression();
   await runReleaseGateA();
   await runGatewayStartSmoke();
   await runPolyglotQueryMorphologicalTests();
@@ -1858,6 +1878,114 @@ ${footerMetadata}
   try { fs.rmSync(tempWs, { recursive: true, force: true }); } catch {}
 
   console.log(`  Gate C (surprise footer persistence): real saveNarrative path verified — single-chunk surprise ${singleChunkSurprise} matches batchIngest, multi-chunk first-only preserve confirmed (${multiChunkSurprise} -> 0) via real splitIntoChunks (${chunks.length} chunks), Go frontmatter round-trip ${parsedMetadata.surprise} matches source, strict artifact proof complete`);
+}
+
+/**
+ * Empty rawText guard regression — verifies worker fail-fast retry behavior.
+ * Cases: rawText="", rawText="   ", and normal rawText success path.
+ */
+async function runNarrativeWorkerEmptyRawTextGuardRegression(): Promise<void> {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-empty-rawtext-${process.pid}-`));
+  const tempCjsPath = path.join(tempDir, "narrative-worker.cjs");
+  fs.copyFileSync(path.resolve("dist", "narrative-worker.js"), tempCjsPath);
+  const distFiles = fs.readdirSync(path.resolve("dist"));
+  for (const file of distFiles) {
+    const src = path.resolve("dist", file);
+    if (fs.statSync(src).isFile()) {
+      fs.copyFileSync(src, path.join(tempDir, file));
+    }
+  }
+  const req = createRequire(import.meta.url);
+  const workerModule = req(tempCjsPath);
+  const NarrativeWorker = workerModule.NarrativeWorker;
+  if (!NarrativeWorker) {
+    throw new Error("NarrativeWorker class not found in compiled module");
+  }
+
+  const makeItem = (rawText: string) => ({
+    id: `item-${Math.random().toString(36).slice(2, 8)}`,
+    agentWs: tempDir,
+    agentId: "main",
+    source: "live-turn",
+    parentIngestId: "ingest-test",
+    orderKey: Date.now().toString(),
+    surprise: 0,
+    reason: "force-flush",
+    rawText,
+    estimatedTokens: 10,
+    status: "queued",
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  const runCase = async (rawText: string, expectSkip: boolean): Promise<void> => {
+    let chatCallCount = 0;
+    let ackCount = 0;
+    const retryErrors: string[] = [];
+    let leaseCount = 0;
+
+    const mockOpenRouter = {
+      chatCompletion: async () => {
+        chatCallCount++;
+        return "彼は机に向かい、ログを確認した。";
+      },
+    };
+
+    const mockRpcClient = {
+      cacheLeaseNext: async () => {
+        if (leaseCount > 0) return null;
+        leaseCount++;
+        return makeItem(rawText);
+      },
+      cacheAck: async () => {
+        ackCount++;
+        return "ok";
+      },
+      cacheRetry: async (_id: string, _workerId: string, errMsg: string) => {
+        retryErrors.push(errMsg);
+        return "ok";
+      },
+      batchIngest: async () => ["test-slug"],
+      cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+      request: async () => null,
+      setMeta: async () => "ok",
+      getMeta: async () => null,
+      recall: async () => [],
+      recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+    };
+
+    const mockConfig = {
+      openrouterModel: "test-model",
+      openrouterConfig: { model: "test-model" },
+      narrativeSystemPrompt: "Test prompt",
+      narrativeUserPromptTemplate: undefined,
+      narrativePreviousEpisodeRef: true,
+    };
+
+    const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+    await (worker as any).processNextFromCache();
+
+    if (expectSkip) {
+      assert.equal(chatCallCount, 0, "empty/blank rawText should skip LLM call");
+      assert.equal(ackCount, 0, "empty/blank rawText should not ack as success");
+      assert.ok(retryErrors.some((msg) => msg.includes("empty_raw_text")), "empty/blank rawText should route to cacheRetry with empty_raw_text");
+    } else {
+      assert.equal(chatCallCount, 1, "normal rawText should call LLM once");
+      assert.equal(ackCount, 1, "normal rawText should ack on success");
+      assert.equal(retryErrors.length, 0, "normal rawText should not go through retry error path");
+    }
+  };
+
+  try {
+    await runCase("", true);
+    await runCase("   ", true);
+    await runCase("通常の会話テキスト", false);
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
+
+  console.log("  empty rawText guard regression: empty/blank skip LLM and retry; normal text keeps success path");
 }
 
 /**

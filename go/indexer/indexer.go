@@ -60,6 +60,9 @@ func BuildIndex(dir string) ([]frontmatter.EpisodeMetadata, error) {
 		if err != nil {
 			return err
 		}
+		if !info.IsDir() && strings.EqualFold(info.Name(), "anchor.md") {
+			return nil
+		}
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
 			relPath, _ := filepath.Rel(dir, path)
 			validKeys[relPath] = true

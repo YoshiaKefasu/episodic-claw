@@ -76,6 +76,13 @@ type RetryPhase = {
   handoffReason?: "fallback_2_of_3";
 };
 
+class EmptyRawTextError extends Error {
+  constructor(item: CacheItem) {
+    super(`empty_raw_text: itemId=${item.id} agentId=${item.agentId} source=${item.source}`);
+    this.name = "EmptyRawTextError";
+  }
+}
+
 /**
  * Sanitize OpenRouter LLM output to remove OpenClaw agent response format tags
  * and other non-narrative artifacts that leak through when the model echoes
@@ -398,6 +405,13 @@ export class NarrativeWorker {
   }
 
   private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
+    if (item.rawText.trim().length === 0) {
+      console.warn(
+        `[NarrativeWorker] Skipping LLM call for [${item.id}] agent=${item.agentId} source=${item.source} reason=empty_raw_text`
+      );
+      throw new EmptyRawTextError(item);
+    }
+
     const phases = this.getRetryPhases();
 
     for (let phaseIndex = 0; phaseIndex < phases.length; phaseIndex++) {

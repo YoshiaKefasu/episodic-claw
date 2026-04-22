@@ -100,7 +100,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	// -----------------------------------------------------
 	t.Log("==> Scenario 3: Tombstone Pruning...")
 	// We force ComputeStage2BatchScores to mark them as tombstone (Imp: 0.1, Noise: 0.9)
-	err = s.ComputeStage2BatchScores(ctx)
+	_, err = s.ComputeStage2BatchScores(ctx, "test_ws")
 	if err != nil {
 		t.Fatalf("Failed ComputeStage2 Batch Scores: %v", err)
 	}

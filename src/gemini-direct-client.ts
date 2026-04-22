@@ -9,6 +9,7 @@ export type GeminiErrorClass =
   | "gemini_http_429"
   | "gemini_http_5xx"
   | "gemini_http_4xx"
+  | "gemini_missing_api_key"
   | "gemini_timeout"
   | "gemini_network"
   | "gemini_empty_candidates"
@@ -48,15 +49,29 @@ type GeminiGenerateContentResponse = {
 };
 
 export class GeminiDirectClient {
+  private readonly apiKey: string;
+  private readonly timeoutMs: number;
+
   constructor(
-    private apiKey: string,
-    private readonly timeoutMs: number = 30_000,
-  ) {}
+    apiKey: string,
+    timeoutMs: number = 30_000,
+  ) {
+    this.apiKey = apiKey.trim();
+    this.timeoutMs = timeoutMs;
+  }
 
   async generateNarrative(
     params: { systemPrompt: string; userMessage: string },
     opts?: { modelOverride?: string },
   ): Promise<string> {
+    if (!this.apiKey) {
+      throw new GeminiDirectError({
+        message: "gemini_missing_api_key: GEMINI_API_KEY is empty",
+        errorClass: "gemini_missing_api_key",
+        retriable: false,
+      });
+    }
+
     const model = opts?.modelOverride ?? "gemini-3.1-flash-lite-preview";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
