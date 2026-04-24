@@ -97,6 +97,14 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "narrativePreviousEpisodeRef",
     "narrativeTemperature",
     "openrouterReasoning",
+    // [v0.4.28a] Language guard config
+    "narrativeExpectedLanguage",
+    "narrativeLanguageThreshold",
+    "narrativeLanguageOnFail",
+    // [v0.4.28b] Content floor config — G5 Minimum Sentence Gate + G6 Minimum Content Floor
+    "narrativeGuardMinSentences",
+    "narrativeGuardMinCjkChars",
+    "narrativeGuardMinLatinWords",
   ];
 
   const missingKeys: string[] = [];
@@ -149,6 +157,14 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "narrativePreviousEpisodeRef",
     "narrativeTemperature",
     "openrouterReasoning",
+    // [v0.4.28a] Language guard config
+    "narrativeExpectedLanguage",
+    "narrativeLanguageThreshold",
+    "narrativeLanguageOnFail",
+    // [v0.4.28b] Content floor config — G5 Minimum Sentence Gate + G6 Minimum Content Floor
+    "narrativeGuardMinSentences",
+    "narrativeGuardMinCjkChars",
+    "narrativeGuardMinLatinWords",
   ]);
 
   const extraKeys: string[] = [];
@@ -378,6 +394,143 @@ test("REGRESSION: queryExcludedKeywords is not silently dropped (v0.4.14 fix)", 
 test("REGRESSION: openrouterMaxTokens is not silently dropped (v0.4.15 fix)", () => {
   const cfg = loadConfig({ openrouterConfig: { maxTokens: 2048 } });
   assert.equal(cfg.openrouterMaxTokens, 2048, "openrouterConfig.maxTokens should be extracted to openrouterMaxTokens");
+});
+
+test("REGRESSION: narrativeLanguageOnFail rejects 'exception' and normalizes to 'softwarn'", () => {
+  // [v0.4.28a] 'exception' is dangerous — would crash the pipeline and cause item loss
+  const cfg = loadConfig({ narrativeLanguageOnFail: "exception" });
+  assert.equal(cfg.narrativeLanguageOnFail, "softwarn", "exception should be normalized to softwarn");
+});
+
+test("narrativeExpectedLanguage: undefined = auto (no language check)", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeExpectedLanguage, undefined, "unset should be undefined (= auto)");
+});
+
+test("narrativeExpectedLanguage: invalid value → undefined", () => {
+  const cfg = loadConfig({ narrativeExpectedLanguage: "auto" });
+  assert.equal(cfg.narrativeExpectedLanguage, undefined, "'auto' should be normalized to undefined");
+
+  const cfg2 = loadConfig({ narrativeExpectedLanguage: "fr" });
+  assert.equal(cfg2.narrativeExpectedLanguage, undefined, "unsupported language should be normalized to undefined");
+});
+
+test("narrativeExpectedLanguage: valid values pass through", () => {
+  for (const lang of ["ja", "en", "zh", "ko", "id"]) {
+    const cfg = loadConfig({ narrativeExpectedLanguage: lang });
+    assert.equal(cfg.narrativeExpectedLanguage, lang, `${lang} should pass through`);
+  }
+});
+
+test("narrativeLanguageThreshold: default is 0.75, clamped to 0..1", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeLanguageThreshold, 0.75);
+
+  const tooHigh = loadConfig({ narrativeLanguageThreshold: 5.0 });
+  assert.equal(tooHigh.narrativeLanguageThreshold, 1.0);
+
+  const negative = loadConfig({ narrativeLanguageThreshold: -0.5 });
+  assert.equal(negative.narrativeLanguageThreshold, 0);
+});
+
+test("narrativeLanguageOnFail: default is softwarn, only accepts valid values", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeLanguageOnFail, "softwarn");
+
+  const reask = loadConfig({ narrativeLanguageOnFail: "reask" });
+  assert.equal(reask.narrativeLanguageOnFail, "reask");
+
+  const handoff = loadConfig({ narrativeLanguageOnFail: "handoff" });
+  assert.equal(handoff.narrativeLanguageOnFail, "handoff");
+
+  const invalid = loadConfig({ narrativeLanguageOnFail: "block" });
+  assert.equal(invalid.narrativeLanguageOnFail, "softwarn", "invalid value should fallback to softwarn");
+});
+
+// ─── 6b. v0.4.28b Content Floor Config ─────────────────────────────────
+
+console.log("\n=== 6b. v0.4.28b Content Floor Config ===\n");
+
+test("narrativeGuardMinSentences: default is 3, clamped to 1..20", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeGuardMinSentences, 3);
+
+  const tooLow = loadConfig({ narrativeGuardMinSentences: 0 });
+  assert.equal(tooLow.narrativeGuardMinSentences, 1, "minimum should be 1");
+
+  const tooHigh = loadConfig({ narrativeGuardMinSentences: 50 });
+  assert.equal(tooHigh.narrativeGuardMinSentences, 20, "maximum should be 20");
+
+  const normal = loadConfig({ narrativeGuardMinSentences: 5 });
+  assert.equal(normal.narrativeGuardMinSentences, 5);
+});
+
+test("narrativeGuardMinCjkChars: default is 120, clamped to 10..500", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeGuardMinCjkChars, 120);
+
+  const tooLow = loadConfig({ narrativeGuardMinCjkChars: 0 });
+  assert.equal(tooLow.narrativeGuardMinCjkChars, 10, "minimum should be 10");
+
+  const tooHigh = loadConfig({ narrativeGuardMinCjkChars: 999 });
+  assert.equal(tooHigh.narrativeGuardMinCjkChars, 500, "maximum should be 500");
+
+  const normal = loadConfig({ narrativeGuardMinCjkChars: 200 });
+  assert.equal(normal.narrativeGuardMinCjkChars, 200);
+});
+
+test("narrativeGuardMinLatinWords: default is 80, clamped to 5..300", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeGuardMinLatinWords, 80);
+
+  const tooLow = loadConfig({ narrativeGuardMinLatinWords: 0 });
+  assert.equal(tooLow.narrativeGuardMinLatinWords, 5, "minimum should be 5");
+
+  const tooHigh = loadConfig({ narrativeGuardMinLatinWords: 999 });
+  assert.equal(tooHigh.narrativeGuardMinLatinWords, 300, "maximum should be 300");
+
+  const normal = loadConfig({ narrativeGuardMinLatinWords: 100 });
+  assert.equal(normal.narrativeGuardMinLatinWords, 100);
+});
+
+test("REGRESSION: narrativeGuardMinSentences is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ narrativeGuardMinSentences: 7 });
+  assert.equal(cfg.narrativeGuardMinSentences, 7, "user's value should be preserved");
+});
+
+test("REGRESSION: narrativeGuardMinCjkChars is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ narrativeGuardMinCjkChars: 250 });
+  assert.equal(cfg.narrativeGuardMinCjkChars, 250, "user's value should be preserved");
+});
+
+test("REGRESSION: narrativeGuardMinLatinWords is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ narrativeGuardMinLatinWords: 120 });
+  assert.equal(cfg.narrativeGuardMinLatinWords, 120, "user's value should be preserved");
+});
+
+test("narrativeGuardMinSentences: NaN falls back to default 3 (gate silently disabled without guard)", () => {
+  const cfg = loadConfig({ narrativeGuardMinSentences: NaN });
+  assert.equal(cfg.narrativeGuardMinSentences, 3, "NaN should fall back to default 3");
+});
+
+test("narrativeGuardMinCjkChars: NaN falls back to default 120", () => {
+  const cfg = loadConfig({ narrativeGuardMinCjkChars: NaN });
+  assert.equal(cfg.narrativeGuardMinCjkChars, 120, "NaN should fall back to default 120");
+});
+
+test("narrativeGuardMinLatinWords: NaN falls back to default 80", () => {
+  const cfg = loadConfig({ narrativeGuardMinLatinWords: NaN });
+  assert.equal(cfg.narrativeGuardMinLatinWords, 80, "NaN should fall back to default 80");
+});
+
+test("narrativeGuardMinSentences: Infinity falls back to default 3", () => {
+  const cfg = loadConfig({ narrativeGuardMinSentences: Infinity });
+  assert.equal(cfg.narrativeGuardMinSentences, 3, "Infinity should fall back to default 3");
+});
+
+test("narrativeGuardMinCjkChars: -Infinity falls back to default 120", () => {
+  const cfg = loadConfig({ narrativeGuardMinCjkChars: -Infinity });
+  assert.equal(cfg.narrativeGuardMinCjkChars, 120, "-Infinity should fall back to default 120");
 });
 
 test("REGRESSION: openrouterConfig nested fields are all destructured into flat fields", () => {

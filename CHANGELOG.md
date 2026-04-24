@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.28] - 2026-04-24
+
+### Fixed
+- **CLI skip log flood suppressed (v0.4.28d)**: `[Episodic Memory] CLI mode detected...` no longer emits on every CLI-mode process load, stopping log flood in multi-process environments (incident 2026-04-24). `EPISODIC_LOG_CLI_SKIP=1` restores it for debugging.
+
+### Changed
+- **Runtime mode detection refactored (v0.4.28d)**: Inline `DAEMON_CMDS`/`isDaemon` logic replaced with `resolveRuntimeMode(argv)` pure helper in `src/runtime-mode.ts`. Same logic, testable extraction. No behavior change for existing argv patterns.
+
+### Added
+- **Language Guard foundation (v0.4.28a)**: Gate G0 (language guard) in narrative quality pipeline with `softwarn` default. Config keys: `narrativeLanguage`, `narrativeLanguageOnFail`, `narrativeLanguageThreshold`. `initLanguageDetector()` integration for automatic runtime language detection.
+- **Content Floor gates (v0.4.28b)**: G5 (Minimum Sentences) and G6 (Content Floor) added to reject insufficient narratives. Config keys: `narrativeMinSentences`, `narrativeContentFloor`, `narrativeContentFloorOnFail`.
+- **Language enforcement reask/handoff (v0.4.28c)**: `onFail=reask|handoff` forces retry or provider handoff on language mismatch. `exception` mode removed (YAGNI). Reask re-prompts with language instruction; handoff routes to Gemini direct when available.
+- **Structured runtime-mode event (v0.4.28d)**: Daemon registration emits JSON event `{ source, event, mode, reason }` for canary observability.
+- **`EPISODIC_LOG_CLI_SKIP` env flag (v0.4.28d)**: Set to `"1"` to restore CLI skip log for debugging.
+- **Test coverage**: `test_runtime_mode_detection.ts` (17 assertions across 9 test cases).
+
+### Notes
+- **Deferred to follow-up PR**: `DAEMON_CMDS` → add `"node"` and `OPENCLAW_SERVICE_KIND` env priority check. Both require `register()` lazy-init refactor first (see incident 2026-04-24).
+- See `docs/v0.4.28_canary_release_guide.md` for Canary observation procedure (recommended 48h).
+
 ## [0.4.27] - 2026-04-22
 
 ### Fixed

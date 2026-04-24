@@ -11,6 +11,7 @@ import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 
 import { stripReasoningTagsFromText } from "./reasoning-tags";
+import { detectLanguageDetailed, detectLanguage } from "./lang-detect";
 import type { Message } from "./segmenter";
 import type { CacheQueueItem } from "./narrative-queue";
 
@@ -69,6 +70,28 @@ const MIN_ANCHOR_COUNT_FOR_STRICT = 4; // Raw text must have >=4 anchors for str
 const MIN_ANCHOR_HITS_REQUIRED = 3; // Narrative must include >=3 of the raw anchors (when strict)
 const CONTENT_GATE_REJECTS_BEFORE_FALLBACK = 3; // Consecutive content-gate rejects before forcing phase handoff
 
+// [v0.4.28b] Content floor gate — CJK language codes for G5/G6 runtime branching
+const CJK_LANG_CODES = new Set(["ja", "zh", "ko"]);
+
+// [v0.4.28b] Heuristic CJK detection fallback — used when detectLanguage() returns "unknown".
+// Checks for CJK Unicode character ranges (Hiragana, Katakana, Han, Hangul).
+// When eld is not loaded or detection fails on short text, this prevents CJK narratives
+// from being misrouted to the Latin word-count path in G6 (which would always reject them).
+const CJK_CHAR_PATTERN = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}\p{Script=Hangul}]/u;
+function hasCjkChars(text: string): boolean {
+  return CJK_CHAR_PATTERN.test(text.substring(0, 200)); // check first 200 chars only (perf)
+}
+
+// [v0.4.28c] Language reask constants — Gate Result Routing pattern
+// Reask appends a language hint to the user prompt; after LANGUAGE_REASK_MAX attempts,
+// auto-escalates to handoff (return null → phase handoff).
+const LANGUAGE_REASK_MAX = 1; // Only 1 reask attempt, then escalate to handoff
+const LANGUAGE_NAME_MAP: Record<string, string> = {
+  ja: "Japanese", en: "English", zh: "Chinese", ko: "Korean", id: "Indonesian",
+};
+const LANGUAGE_REASK_SUFFIX = (lang: string): string =>
+  `\n[IMPORTANT: Write the narrative in ${LANGUAGE_NAME_MAP[lang] ?? lang} language.]`;
+
 // [v0.4.27b] Generic template / lazy narrative phrases — DRY single source of truth.
 // Used in applyQualityGates Gate 3b (body-scan, isContentGate=true).
 // NOT duplicated in checkNarrativeFormat Gate 3 (firstLine-only, isContentGate=false).
@@ -97,10 +120,12 @@ const GENERIC_TEMPLATE_PHRASES = [
 
 // Use the canonical queue item type (avoids type duplication with narrative-queue.ts)
 // [v0.4.27b] Structured quality gate result — enables content-gate-aware retry logic
+// [v0.4.28c] Added isLanguageGate for language-policy-aware routing (orthogonal to isContentGate).
 type QualityGateResult = {
   pass: boolean;
   reason: string;
   isContentGate: boolean; // true if this is a content-quality gate (vs format/compression)
+  isLanguageGate: boolean; // [v0.4.28c] true if this is a language-policy gate (G0 mismatch)
 };
 
 type CacheItem = CacheQueueItem;
@@ -276,7 +301,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
   const firstLine = lines[0] ?? "";
   const firstChars = text.substring(0, 100);
 
-  // Gate 1: Line starts with markdown header / list / numbered list
+  // Fmt-G1: Line starts with markdown header / list / numbered list
   for (const line of lines) {
     if (/^\s*#{1,6}\s/.test(line)) {
       return { pass: false, reason: "narrative-format: markdown header detected" };
@@ -289,7 +314,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     }
   }
 
-  // Gate 2: CoT / Planning phrase detection (English + Japanese)
+  // Fmt-G2: CoT / Planning phrase detection (English + Japanese)
   const cotPatterns = [
     // --- English (existing) ---
     /\bOkay\b.*\b(let me|I need|I should|I'll|first)\b/i,
@@ -312,7 +337,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     }
   }
 
-  // Gate 3: Japanese assistant-mode phrases at the start of the first line
+  // Fmt-G3: Japanese assistant-mode phrases at the start of the first line
   // [v0.4.17] Scoped to the beginning of firstLine (not full text) to avoid False Positives.
   // When a conversation character legitimately says "ありがとうございます" as role-play,
   // the narrative will embed it mid-sentence (e.g. 彼は「ありがとうございます」と答えた)
@@ -331,7 +356,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     "かしこまりました",
     "それではまとめ",
     "確認いたします",
-    // Note: [v0.4.27b] generic template phrases moved to Gate 3b body-scan
+    // Note: [v0.4.27b] generic template phrases moved to applyQualityGates Gate 3b body-scan
     // (see GENERIC_TEMPLATE_PHRASES below). Not duplicated here per DRY principle.
   ];
   for (const phrase of assistantPhrases) {
@@ -344,13 +369,13 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
   // as a content gate (isContentGate=true) to enable early bailout routing.
   // See GENERIC_TEMPLATE_PHRASES constant and Gate 3b logic there.
 
-  // Gate 4: Emoji / kaomoji
+  // Fmt-G4: Emoji / kaomoji
   const emojiPat = /[\p{Emoji_Presentation}\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]|≧∇≦/u;
   if (emojiPat.test(text)) {
     return { pass: false, reason: "narrative-format: emoji or kaomoji detected" };
   }
 
-  // Gate 5: First line doesn't look like narrative start
+  // Fmt-G5: First line doesn't look like narrative start
   // Narrative starts with: CJK character, or proper noun, or time expression
   // Assistant starts with: greeting, explanation, or English planning
   const narrativeStartPat = /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}0-9A-Z\u00C0-\u017F"「『]/u;
@@ -361,7 +386,7 @@ export function checkNarrativeFormat(text: string): { pass: boolean; reason: str
     }
   }
 
-  // Gate 6: Minimum paragraph structure
+  // Fmt-G6: Minimum paragraph structure
   // [v0.4.19b] Narrative output with 500+ characters should have at least 2 paragraphs
   // (separated by \n\n). Single-paragraph wall-of-text indicates model failure
   // to structure output — common with free models producing "stream of consciousness".
@@ -650,8 +675,9 @@ export class NarrativeWorker {
   /**
    * Run all quality gates on generated narrative text.
    * [v0.4.27b] Returns structured QualityGateResult to enable content-gate-aware retry routing.
-   * When contentGateEnabled=false, content-quality gates (Gate 4) are skipped entirely
-   * to preserve current behavior and prevent item-loss regression.
+   * When contentGateEnabled=false: G3b/G4 skip entirely (preserve current behavior, prevent item-loss).
+   * [v0.4.28b] G5/G6 always run — emit softwarn when contentGateEnabled=false (observability),
+   * reject+retry when contentGateEnabled=true.
    */
   private async applyQualityGates(
     text: string,
@@ -662,6 +688,76 @@ export class NarrativeWorker {
     conversationText: string,
     contentGateEnabled: boolean,
   ): Promise<QualityGateResult> {
+    // [v0.4.28a→28c] Quality gate 0: Language guard
+    // Transplanted from Guardrails AI correct_language validator pattern.
+    // When expected language is undefined (= auto), skip entirely.
+    // When mismatch detected:
+    //   onFail=softwarn: log warning but DO NOT early-return — downstream gates must still run.
+    //   onFail=reask|handoff: return { pass:false, isLanguageGate:true } — caller handles action.
+    // [v0.4.28c] Gate Result Routing: applyQualityGates() returns isLanguageGate=true;
+    //   narrativizeWithModel() performs reask (prompt suffix) or handoff (return null).
+    const expectedLang = this.config.narrativeExpectedLanguage;
+    if (expectedLang) {
+      const langResult = detectLanguageDetailed(text);
+      const onFail = this.config.narrativeLanguageOnFail ?? "softwarn";
+      const threshold = this.config.narrativeLanguageThreshold ?? 0.75;
+
+      if (langResult.lang !== expectedLang && langResult.lang !== "unknown") {
+        // Only flag if detection confidence exceeds threshold (avoid false positives on short/ambiguous text)
+        if (langResult.confidence >= threshold) {
+          // [v0.4.28a] Fix A6: Observation log for language mismatch
+          console.log(JSON.stringify({
+            source: "episodic-claw",
+            event: "narrative-language-guard",
+            expected: expectedLang,
+            detected: langResult.lang,
+            confidence: langResult.confidence,
+            isReliable: langResult.isReliable,
+            onFail,
+            phase: label,
+            attempt: attempt + 1,
+            itemId: item.id,
+          }));
+
+          if (onFail === "softwarn") {
+            // v0.4.28a: Softwarn — log but don't block (observation mode)
+            // IMPORTANT: Do NOT early-return here — downstream gates must still evaluate.
+            // Early return with pass:true would bypass compression/echo/format/anchor checks.
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: narrative-language: mismatch-softwarn ` +
+              `(expected=${expectedLang}, detected=${langResult.lang}, confidence=${langResult.confidence.toFixed(3)}, ` +
+              `isReliable=${langResult.isReliable}) for [${item.id}]. Continuing to downstream gates.`
+            );
+            // Fall through to subsequent gates — softwarn is observational only.
+          } else if (onFail === "reask" || onFail === "handoff") {
+            // [v0.4.28c] Gate Result Routing: return isLanguageGate=true to let caller decide action.
+            // Only active when contentGateEnabled=true (same pattern as G5/G6 — prevents item-loss regression).
+            if (contentGateEnabled) {
+              const reason = `language-mismatch: expected=${expectedLang} detected=${langResult.lang}`;
+              console.warn(
+                `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: narrative-language: mismatch-${onFail} ` +
+                `(expected=${expectedLang}, detected=${langResult.lang}, confidence=${langResult.confidence.toFixed(3)}) for [${item.id}].`
+              );
+              return { pass: false, reason, isContentGate: false, isLanguageGate: true };
+            } else {
+              // Softwarn fallback — no fallback phase exists, don't block save (same as G5/G6)
+              console.warn(
+                `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: narrative-language: mismatch-${onFail}-softwarn-fallback ` +
+                `(contentGateEnabled=false, expected=${expectedLang}, detected=${langResult.lang}) for [${item.id}]. Continuing to downstream gates.`
+              );
+              // Fall through to subsequent gates — same as softwarn
+            }
+          } else {
+            // Unknown onFail value — treat as softwarn (defensive)
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: narrative-language: mismatch ` +
+              `(expected=${expectedLang}, detected=${langResult.lang}) with unrecognized onFail='${onFail}' for [${item.id}]. Treating as softwarn.`
+            );
+          }
+        }
+      }
+    }
+
     const tokens = estimateTokens(text);
 
     // [v0.4.11] Quality gate 1: Token count & Compression ratio
@@ -672,7 +768,7 @@ export class NarrativeWorker {
         `Retrying for [${item.id}]...`
       );
       await this.sleep(500);
-      return { pass: false, reason: "compression-ratio", isContentGate: false };
+      return { pass: false, reason: "compression-ratio", isContentGate: false, isLanguageGate: false };
     }
 
     // [v0.4.11] Quality gate 2: Verbatim echo detection
@@ -682,7 +778,7 @@ export class NarrativeWorker {
         `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
       );
       await this.sleep(500);
-      return { pass: false, reason: "verbatim-echo", isContentGate: false };
+      return { pass: false, reason: "verbatim-echo", isContentGate: false, isLanguageGate: false };
     }
 
     // [v0.4.17] Quality gate 3: Narrative format check
@@ -692,7 +788,7 @@ export class NarrativeWorker {
         `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
       );
       await this.sleep(500);
-      return { pass: false, reason: formatCheck.reason, isContentGate: false };
+      return { pass: false, reason: formatCheck.reason, isContentGate: false, isLanguageGate: false };
     }
 
     // [v0.4.27b] Quality gate 3b: Generic template phrase body-scan (content quality).
@@ -709,7 +805,7 @@ export class NarrativeWorker {
             `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
           );
           await this.sleep(500);
-          return { pass: false, reason, isContentGate: true };
+          return { pass: false, reason, isContentGate: true, isLanguageGate: false };
         }
       }
     }
@@ -727,7 +823,7 @@ export class NarrativeWorker {
             `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
           );
           await this.sleep(500);
-          return { pass: false, reason, isContentGate: true };
+          return { pass: false, reason, isContentGate: true, isLanguageGate: false };
         }
         console.log(
           `[NarrativeWorker] ${label} anchor coverage: ${hits}/${anchors.length} anchors present (>=${MIN_ANCHOR_HITS_REQUIRED} required) for [${item.id}]`
@@ -735,7 +831,81 @@ export class NarrativeWorker {
       }
     }
 
-    return { pass: true, reason: "", isContentGate: false };
+    // [v0.4.28b] Quality gates 5 & 6: Content floor checks (sentence count + content size)
+    // Both gates share a single detectLanguage() call to avoid redundant detection.
+    // When contentGateEnabled=false: softwarn only (don't block save to prevent item-loss regression).
+    {
+      const detectedLang = detectLanguage(text);
+      // When detectLanguage() returns "unknown" (eld not loaded, short text, detection failure),
+      // fall back to heuristic CJK character detection to prevent CJK narratives from being
+      // misrouted to the Latin word-count path in G6 (which would always reject them).
+      const isCjk = CJK_LANG_CODES.has(detectedLang) || (detectedLang === "unknown" && hasCjkChars(text));
+      const isCjkHeuristic = detectedLang === "unknown" && isCjk; // true only when heuristic fallback triggered
+
+      // Gate 5: Minimum Sentence Gate
+      // CJK: >= narrativeGuardMinSentences (default 3) sentences
+      // Latin: >= narrativeGuardMinSentences + 1 (default 4) sentences
+      const minSentences = this.config.narrativeGuardMinSentences ?? 3;
+      const requiredSentences = isCjk ? minSentences : minSentences + 1;
+      const sentenceCount = text.split(/[。！？!?.]+/).filter(s => s.trim().length > 0).length;
+      if (sentenceCount < requiredSentences) {
+        const langLabel = isCjkHeuristic ? 'CJK (heuristic)' : isCjk ? 'CJK' : 'Latin';
+        const reason = `narrative-content: too-few-sentences (${sentenceCount} sentences, need >=${requiredSentences} for ${langLabel} text)`;
+        if (contentGateEnabled) {
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
+          );
+          await this.sleep(500);
+          return { pass: false, reason, isContentGate: true, isLanguageGate: false };
+        } else {
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason}-softwarn for [${item.id}]. contentGateEnabled=false — saving anyway.`
+          );
+        }
+      }
+
+      // Gate 6: Minimum Content Floor
+      // CJK: >= narrativeGuardMinCjkChars (default 120) chars (whitespace stripped)
+      // Latin: >= narrativeGuardMinLatinWords (default 80) words
+      if (isCjk) {
+        const minCjkChars = this.config.narrativeGuardMinCjkChars ?? 120;
+        const charCount = text.replace(/\s+/g, "").length;
+        if (charCount < minCjkChars) {
+          const langLabel = isCjkHeuristic ? 'CJK (heuristic)' : 'CJK';
+          const reason = `narrative-content: too-short-content-floor (${charCount} ${langLabel} chars, need >=${minCjkChars})`;
+          if (contentGateEnabled) {
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
+            );
+            await this.sleep(500);
+            return { pass: false, reason, isContentGate: true, isLanguageGate: false };
+          } else {
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason}-softwarn for [${item.id}]. contentGateEnabled=false — saving anyway.`
+            );
+          }
+        }
+      } else {
+        const minLatinWords = this.config.narrativeGuardMinLatinWords ?? 80;
+        const wordCount = text.split(/\s+/).filter(w => w.length > 0).length;
+        if (wordCount < minLatinWords) {
+          const reason = `narrative-content: too-short-content-floor (${wordCount} Latin words, need >=${minLatinWords})`;
+          if (contentGateEnabled) {
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
+            );
+            await this.sleep(500);
+            return { pass: false, reason, isContentGate: true, isLanguageGate: false };
+          } else {
+            console.warn(
+              `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason}-softwarn for [${item.id}]. contentGateEnabled=false — saving anyway.`
+            );
+          }
+        }
+      }
+    }
+
+    return { pass: true, reason: "", isContentGate: false, isLanguageGate: false };
   }
 
   /**
@@ -761,16 +931,93 @@ export class NarrativeWorker {
     // Not reset on non-content rejects (format/compression) — 3 cumulative content-rejects
     // still signals this model can't produce anchors, so early handoff is warranted.
     let contentRejectCount = 0;
+    // [v0.4.28c] Track language reask usage — max LANGUAGE_REASK_MAX reasks, then auto-escalate to handoff.
+    // Note: resets per-phase (each narrativizeWithModel call) — after handoff,
+    // the next phase/model gets fresh reask attempts (may produce correct language).
+    let languageReaskCount = 0;
+    // [v0.4.28c] Mutable userMessage — reask appends language hint suffix on retry.
+    let currentUserMessage = userMessage;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const rawText = await this.client.chatCompletion(
-          { systemPrompt, userMessage },
+          { systemPrompt, userMessage: currentUserMessage },
           { modelOverride: model },
         );
         const text = sanitizeNarrativeOutput(rawText);
         const gateResult = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText, contentGateEnabled);
         if (!gateResult.pass) {
+          // [v0.4.28c] Language gate routing — reask/handoff/softwarn based on isLanguageGate + onFail + contentGateEnabled
+          if (gateResult.isLanguageGate) {
+            const onFail = this.config.narrativeLanguageOnFail ?? "softwarn";
+            const expectedLang = this.config.narrativeExpectedLanguage;
+
+            if (onFail === "handoff") {
+              // [C3-b] Immediate handoff — language mismatch with onFail=handoff
+              // [v0.4.28c][C3-d] Emit structured JSON event for canary observability
+              console.log(JSON.stringify({
+                source: "episodic-claw",
+                event: "narrative-phase-handoff",
+                phaseHandoffReason: "language_mismatch",
+                provider: "openrouter",
+                model,
+                itemId: item.id,
+              }));
+              console.warn(
+                `[NarrativeWorker] ${label}: language-mismatch handoff for [${item.id}]. ` +
+                `Forcing early handoff to next phase (attempt ${attempt + 1}/${maxAttempts}).`
+              );
+              return null; // triggers phase handoff in narrativizeWithRetry
+            }
+
+            if (onFail === "reask") {
+              if (languageReaskCount < LANGUAGE_REASK_MAX && contentGateEnabled && attempt + 1 < maxAttempts) {
+                // [C2-c] Reask — append language hint suffix and retry (up to LANGUAGE_REASK_MAX)
+                // [v0.4.28c] Guard: only reask if there's at least 1 remaining attempt,
+                // otherwise the continue would exit the loop without using the modified prompt.
+                languageReaskCount++;
+                // [v0.4.28c] Idempotency guard: only append suffix once, even if LANGUAGE_REASK_MAX > 1.
+                // Re-asking without a new suffix just wastes an LLM call — the model already saw the hint.
+                if (expectedLang && !currentUserMessage.includes(LANGUAGE_REASK_SUFFIX(expectedLang))) {
+                  currentUserMessage = currentUserMessage + LANGUAGE_REASK_SUFFIX(expectedLang);
+                }
+                console.warn(
+                  `[NarrativeWorker] ${label}: language-mismatch reask for [${item.id}]. ` +
+                  `Appending language hint, retrying (attempt ${attempt + 1}/${maxAttempts}, reask ${languageReaskCount}/${LANGUAGE_REASK_MAX}).`
+                );
+                await this.sleep(500); // [v0.4.28c] Rate-limit pause — consistent with other gate rejects
+                continue; // retry with modified prompt
+              } else {
+                // [C2-d/C3-c] Reask exhausted, no fallback, or no remaining attempts — auto-escalate to handoff
+                // Note: !contentGateEnabled branch is unreachable in practice (G0 softwarn-fallbacks
+                // when contentGateEnabled=false, so isLanguageGate=true never reaches here), but
+                // included defensively in case the G0 logic changes.
+                const reason = languageReaskCount >= LANGUAGE_REASK_MAX ? "reask limit reached"
+                  : !contentGateEnabled ? "no fallback phase (defensive)" : "no remaining attempts";
+                // [v0.4.28c][C3-d] Emit structured JSON event for canary observability
+                console.log(JSON.stringify({
+                  source: "episodic-claw",
+                  event: "narrative-phase-handoff",
+                  phaseHandoffReason: "language_reask_exhausted",
+                  detail: reason,
+                  provider: "openrouter",
+                  model,
+                  reaskCount: languageReaskCount,
+                  itemId: item.id,
+                }));
+                console.warn(
+                  `[NarrativeWorker] ${label}: language-mismatch reask exhausted for [${item.id}]. ` +
+                  `Escalating to handoff (${reason}, attempt ${attempt + 1}/${maxAttempts}, reaskCount=${languageReaskCount}/${LANGUAGE_REASK_MAX}, contentGateEnabled=${contentGateEnabled}).`
+                );
+                return null; // triggers phase handoff
+              }
+            }
+
+            // onFail=softwarn — G0 returned pass:false (fall-through in applyQualityGates is impossible
+            // since softwarn doesn't return pass:false). This branch is unreachable but defensive.
+            continue;
+          }
+
           // [v0.4.27b] Content gate early bailout: if this model consistently fails
           // content quality checks, stop wasting attempts and hand off to next phase
           if (gateResult.isContentGate) {
@@ -831,7 +1078,18 @@ export class NarrativeWorker {
         );
         const text = sanitizeNarrativeOutput(rawText);
         const gateResult = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText, contentGateEnabled);
-        if (!gateResult.pass) continue;
+        if (!gateResult.pass) {
+          // [v0.4.28c] Defensive: Gemini phases have contentGateEnabled=false, so G0
+          // softwarn-fallbacks and never returns isLanguageGate=true. But if a user
+          // configures Gemini with content gates, log a warning instead of silently continuing.
+          if (gateResult.isLanguageGate) {
+            console.warn(
+              `[NarrativeWorker] ${label}: language-mismatch in Gemini phase for [${item.id}]. ` +
+              `Gemini is last-resort — no reask/handoff routing. Continuing normal retry.`
+            );
+          }
+          continue;
+        }
         // [v0.4.27b] Note: no content-gate early bailout here because Gemini phases
         // have contentGateEnabled=false (last-resort, must save something). If that
         // changes, add contentRejectCount tracking same as narrativizeWithModel.

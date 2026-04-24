@@ -16,6 +16,7 @@ import { NarrativePool } from "./narrative-pool";
 import { RecallFallbackReason, RecallMatchedBy } from "./types";
 import { initLanguageDetector } from "./lang-detect";
 import { tokenize } from "kuromojin";
+import { resolveRuntimeMode } from "./runtime-mode";
 
 export interface OpenClawPluginApi {
   // フック登録 — openclaw types.ts の PluginHookName に準拠
@@ -543,13 +544,19 @@ const episodicClawPlugin = {
       const CLI_SKIP_FLAG = Symbol.for("episodic.cli.skipped");
       const CLI_REGISTER_FLAG = Symbol.for("episodic.cli.registered");
 
-      // CLIモード判定：OpenClaw固有のデーモンコマンド（gateway / agent / test）の場合のみ初期化を行う。
-      // "start" は npm start / yarn start でも argv に現れるため意図的に除外している。
-      const DAEMON_CMDS = ["gateway", "agent", "test"];
-      const isDaemon = DAEMON_CMDS.some(cmd => process.argv.includes(cmd));
-      if (!isDaemon) {
+      // [v0.4.28d] Runtime mode detection — extracted to pure helper for testability.
+      // OPENCLAW_SERVICE_KIND env priority and "node" daemon classification are deferred to a follow-up PR.
+      const runtimeMode = resolveRuntimeMode(process.argv);
+
+      if (runtimeMode.mode === "cli") {
         if (!(global as any)[CLI_SKIP_FLAG]) {
-          console.log("[Episodic Memory] CLI mode detected. Skipping plugin initialization to prevent blocks.");
+          // [v0.4.28d][D2] CLI skip log is silent by default to prevent log flood in
+          // multi-process environments (see incident 2026-04-24). Set EPISODIC_LOG_CLI_SKIP=1
+          // to restore the skip message for debugging.
+          // Note: only the exact string "1" activates the log (not "true", "yes", etc.).
+          if (process.env.EPISODIC_LOG_CLI_SKIP === "1") {
+            console.log("[Episodic Memory] CLI mode detected. Skipping plugin initialization to prevent blocks.");
+          }
           (global as any)[CLI_SKIP_FLAG] = true;
         }
         return;
@@ -557,6 +564,16 @@ const episodicClawPlugin = {
 
       // デーモンモード: 初回のみ登録ログを出力
       if (!(global as any)[CLI_REGISTER_FLAG]) {
+        // [v0.4.28d][D3] Emit structured runtime-mode event for canary observability.
+        // Note: this JSON line now appears BEFORE the existing "Registering plugin..." log,
+        // so log parsers expecting [Episodic Memory] as the first daemon message should
+        // account for the preceding JSON line.
+        console.log(JSON.stringify({
+          source: "episodic-claw",
+          event: "runtime-mode",
+          mode: runtimeMode.mode,
+          reason: runtimeMode.reason,
+        }));
         console.log("[Episodic Memory] Registering plugin...");
         (global as any)[CLI_REGISTER_FLAG] = true;
       }

@@ -136,6 +136,26 @@ export interface EpisodicPluginConfig {
     maxTokens?: number;
     exclude?: boolean;
   };
+  // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
+  /** Expected output language for narrative generation. When set, the language guard
+   *  checks that generated narratives match this language. Leave unset to disable (auto). */
+  narrativeExpectedLanguage?: "ja" | "en" | "zh" | "ko" | "id";
+  /** Confidence threshold (0..1) for language detection. Only triggers on_fail when
+   *  the detected language confidence exceeds this threshold and doesn't match expected. Default: 0.75. */
+  narrativeLanguageThreshold?: number;
+  /** Action when narrative language doesn't match expected. 'softwarn' = log only (observational),
+   *  'reask' = retry same model (v0.4.28c), 'handoff' = switch to fallback model (v0.4.28c).
+   *  No 'exception' — would crash the pipeline and cause item loss. */
+  narrativeLanguageOnFail?: "softwarn" | "reask" | "handoff";
+  // [v0.4.28b] Content floor config — Minimum Sentence Gate (G5) + Minimum Content Floor (G6)
+  /** Minimum sentence count for narrative output. Runtime branches by detected language:
+   *  CJK (ja/zh/ko): this value (default 3). Latin (en/id/unknown): this value + 1 (default 4).
+   *  Single variable + runtime branching — KISS, no need for separate cjkMin/latinMin keys. */
+  narrativeGuardMinSentences?: number;
+  /** Minimum CJK character count for narrative output (whitespace stripped). Default: 120. */
+  narrativeGuardMinCjkChars?: number;
+  /** Minimum Latin word count for narrative output (whitespace-split). Default: 80. */
+  narrativeGuardMinLatinWords?: number;
 }
 
 export interface RecallCalibration {

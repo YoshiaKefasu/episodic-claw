@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.27",
+  "version": "0.4.28",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -235,6 +235,45 @@
         "minimum": 1,
         "default": 15,
         "description": "Time gap threshold (minutes) that controls both (1) automatic segment boundary detection when a time gap is detected between user messages, and (2) idle auto-flush timeout — the delay before an unfinished buffer is automatically finalized when no new messages arrive. Default: 15. One-knob policy: changing this value affects both behaviors equally.\n⚠️ [Blast Radius] If too short: Excessive segmentation breaks conversation flow. If too long: Long pauses don't create natural episode boundaries."
+      },
+      "narrativeExpectedLanguage": {
+        "type": "string",
+        "enum": ["ja", "en", "zh", "ko", "id"],
+        "description": "Expected output language for narrative generation. When set, the language guard checks that generated narratives match this language. Leave unset (undefined) to disable language checking (auto mode). Default: unset (no language enforcement). Transplanted from Guardrails AI correct_language validator.\n⚠️ [Blast Radius] If set incorrectly: Valid narratives in the wrong language get flagged as mismatches. If unset: No language checking occurs."
+      },
+      "narrativeLanguageThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.75,
+        "description": "Confidence threshold (0..1) for language detection. Only triggers on_fail when the detected language confidence exceeds this threshold and doesn't match the expected language. Default: 0.75. Lower values catch more mismatches but increase false positives. Transplanted from Guardrails AI correct_language threshold parameter.\n⚠️ [Blast Radius] If too low: Short texts may trigger false mismatch warnings. If too high: Genuine language mismatches may be missed."
+      },
+      "narrativeLanguageOnFail": {
+        "type": "string",
+        "enum": ["softwarn", "reask", "handoff"],
+        "default": "softwarn",
+        "description": "Action when narrative language doesn't match expected language. 'softwarn' = log warning but save narrative (observational, no data loss). 'reask' = retry with same model (v0.4.28c). 'handoff' = switch to fallback model (v0.4.28c). Default: softwarn (safe observation mode). Transplanted from Guardrails AI correct_language on_fail, simplified from callable to enum for TS runtime safety.\n⚠️ [Blast Radius] 'reask'/'handoff' in v0.4.28c may cause item loss if all retries fail — use softwarn until confident in your language settings."
+      },
+      "narrativeGuardMinSentences": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3,
+        "description": "Minimum sentence count for narrative output. Runtime branches by detected language: CJK (ja/zh/ko) uses this value directly (default 3). Latin (en/id/unknown) uses this value + 1 (default 4). Single variable + runtime branching for KISS. Default: 3.\n⚠️ [Blast Radius] If too high: Valid short narratives get rejected and retried unnecessarily. If too low: Short/low-quality narratives slip through."
+      },
+      "narrativeGuardMinCjkChars": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 500,
+        "default": 120,
+        "description": "Minimum CJK character count (whitespace stripped) for narrative output. Only applies when detected language is CJK (ja/zh/ko). Default: 120.\n⚠️ [Blast Radius] If too high: Valid concise narratives get rejected. If too low: Very short/empty narratives slip through."
+      },
+      "narrativeGuardMinLatinWords": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 300,
+        "default": 80,
+        "description": "Minimum Latin word count (whitespace-split) for narrative output. Applies when detected language is Latin (en/id/unknown). Default: 80.\n⚠️ [Blast Radius] If too high: Valid concise narratives get rejected. If too low: Very short/empty narratives slip through."
       }
     }
   },

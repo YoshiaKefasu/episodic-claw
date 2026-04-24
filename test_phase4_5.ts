@@ -4,6 +4,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createRequire, Module } from "node:module";
 
+// [v0.4.28b] Shared mock narratives — must satisfy ALL quality gates:
+//   G4 (Fmt-G4): multi-paragraph (>=2 paragraphs for >500 chars)
+//   G5: CJK >=3 sentences / Latin >=4 sentences (5 for safety margin)
+//   G6: CJK >=120 chars (whitespace-stripped) / Latin >=80 words
+const MOCK_CJK_NARRATIVE =
+  "彼は深い沈黙の後、画面上のログを注意深く確認した。システムの挙動に違和感を覚え、原因の解析を始めた。" +
+  "数分の集中作業の末、バグの根本原因が特定され、修正コードが即座に適用された。" +
+  "\n\n" +
+  "動作確認テストを実行し、全てのパスが正常に通過することを確認した後、本番環境へのデプロイを承認した。" +
+  "その日の夕方には全ての主要機能が安定稼働を確認し、二人は成功を祝った。";
+const MOCK_LATIN_NARRATIVE =
+  "The user asked about the weather today. The assistant reported sunny conditions with a high of 25 degrees Celsius, noting that the forecast predicted clear skies for the remainder of the week with no precipitation expected. The conversation then shifted to weekend plans, where they discussed visiting the local farmers market on Saturday morning and attending a community music festival in the park on Sunday afternoon."
+  + "\n\n"
+  + "Finally, they reviewed upcoming development tasks for the project, agreeing to prioritize the authentication module refactor, the database migration scripts, and the performance optimization ticket before the next sprint review meeting scheduled for Friday. They also decided to set up a pair programming session for the most complex task to ensure knowledge sharing across the team.";
+
 function readJson(relPath: string): any {
   const absPath = path.resolve(relPath);
   return JSON.parse(fs.readFileSync(absPath, "utf8"));
@@ -129,19 +144,23 @@ async function runAnchorInjectionSmoke(): Promise<void> {
     "segmenter.js",
     "types.js",
     "utils.js",
+    "runtime-mode.js",
   ]) {
     fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
   }
 
   // Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  // [v0.4.28a] Added detectLanguageDetailed export + DetectedLanguage type for narrative-worker G0 guard.
   fs.writeFileSync(
     path.join(runtimeDist, "lang-detect.js"),
     `"use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.initLanguageDetector = initLanguageDetector;
 exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
 async function initLanguageDetector() { return true; }
 function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
 `,
     "utf8"
   );
@@ -368,14 +387,17 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
 
   // Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
   // When eld is unavailable, detectLanguage() returns "unknown", and tokenizeCjk falls back to regex.
+  // [v0.4.28a] Added detectLanguageDetailed export + DetectedLanguage type for narrative-worker G0 guard.
   fs.writeFileSync(
     path.join(runtimeDist, "lang-detect.js"),
     `"use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.initLanguageDetector = initLanguageDetector;
 exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
 async function initLanguageDetector() { return true; }
 function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
 `,
     "utf8"
   );
@@ -828,21 +850,25 @@ async function runGatewayStartSmoke(): Promise<void> {
     "segmenter.js",
     "transcript-repair.js",
     "types.js",
-    "utils.js"
+    "utils.js",
+    "runtime-mode.js"
   ];
   for (const file of distJsFiles) {
     fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));
   }
 
   // Stub lang-detect.js and cjk-tokenizer.js for CJS require context — eld/kuromojin are ESM-only.
+  // [v0.4.28a] Added detectLanguageDetailed export + DetectedLanguage type for narrative-worker G0 guard.
   fs.writeFileSync(
     path.join(runtimeDist, "lang-detect.js"),
     `"use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.initLanguageDetector = initLanguageDetector;
 exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
 async function initLanguageDetector() { return true; }
 function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
 `,
     "utf8"
   );
@@ -1329,6 +1355,7 @@ async function main() {
   await runReleaseGateB();
   await runReleaseGateC();
   await runNarrativeWorkerEmptyRawTextGuardRegression();
+  await runLanguageGuardReaskHandoffRegression();
   await runReleaseGateA();
   await runGatewayStartSmoke();
   await runPolyglotQueryMorphologicalTests();
@@ -1359,6 +1386,22 @@ async function runReleaseGateA(): Promise<void> {
       fs.copyFileSync(src, path.join(tempDir, file));
     }
   }
+  // [v0.4.28a] Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  // Without this stub, narrative-worker.js (which imports detectLanguageDetailed from lang-detect)
+  // triggers ERR_PACKAGE_PATH_NOT_EXPORTED when CJS require() hits eld's ESM-only package.json.
+  fs.writeFileSync(
+    path.join(tempDir, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+    "utf8"
+  );
   const req = createRequire(import.meta.url);
   const narrativeWorkerModule = req(tempCjsPath);
   const NarrativeWorker = narrativeWorkerModule.NarrativeWorker;
@@ -1380,7 +1423,7 @@ async function runReleaseGateA(): Promise<void> {
   const mockOpenRouter = {
     chatCompletion: async (_params: any) => {
       narrativizeCallCount++;
-      return "The user asked about the weather today. The assistant reported sunny conditions with a high of 25 degrees. The conversation then shifted to weekend plans and upcoming development tasks.";
+      return MOCK_LATIN_NARRATIVE;
     },
   };
 
@@ -1526,6 +1569,21 @@ async function runReleaseGateB(): Promise<void> {
       fs.copyFileSync(src, path.join(tempDir, file));
     }
   }
+  // [v0.4.28a] Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  // segmenter.js -> narrative-worker.js -> lang-detect.js -> eld (ESM-only) fails in CJS require().
+  fs.writeFileSync(
+    path.join(tempDir, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+    "utf8"
+  );
   const req = createRequire(import.meta.url);
   const segmenterModule = req(tempCjsPath);
   const EventSegmenter = segmenterModule.EventSegmenter;
@@ -1704,6 +1762,20 @@ async function runReleaseGateC(): Promise<void> {
       fs.copyFileSync(src, path.join(tempDir, file));
     }
   }
+  // [v0.4.28a] Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  fs.writeFileSync(
+    path.join(tempDir, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+    "utf8"
+  );
   const req = createRequire(import.meta.url);
   const narrativeWorkerModule = req(tempCjsPath);
   const NarrativeWorker = narrativeWorkerModule.NarrativeWorker;
@@ -1748,7 +1820,8 @@ async function runReleaseGateC(): Promise<void> {
   };
 
   const mockOpenRouter = {
-    chatCompletion: async () => "The user asked about the weather today. The assistant reported sunny conditions with a high of 25 degrees. The conversation then shifted to weekend plans and upcoming development tasks.",
+    // [v0.4.28b] Uses MOCK_LATIN_NARRATIVE — passes G5 (>=4 Latin sentences), G6 (>=80 Latin words), G4 (multi-paragraph).
+    chatCompletion: async () => MOCK_LATIN_NARRATIVE,
   };
 
   const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
@@ -1895,6 +1968,20 @@ async function runNarrativeWorkerEmptyRawTextGuardRegression(): Promise<void> {
       fs.copyFileSync(src, path.join(tempDir, file));
     }
   }
+  // [v0.4.28a] Stub lang-detect.js for CJS require context — eld is ESM-only and cannot be require()'d.
+  fs.writeFileSync(
+    path.join(tempDir, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+    "utf8"
+  );
   const req = createRequire(import.meta.url);
   const workerModule = req(tempCjsPath);
   const NarrativeWorker = workerModule.NarrativeWorker;
@@ -1928,7 +2015,7 @@ async function runNarrativeWorkerEmptyRawTextGuardRegression(): Promise<void> {
     const mockOpenRouter = {
       chatCompletion: async () => {
         chatCallCount++;
-        return "彼は机に向かい、ログを確認した。";
+        return MOCK_CJK_NARRATIVE;
       },
     };
 
@@ -1980,12 +2067,475 @@ async function runNarrativeWorkerEmptyRawTextGuardRegression(): Promise<void> {
   try {
     await runCase("", true);
     await runCase("   ", true);
-    await runCase("通常の会話テキスト", false);
+    // [v0.4.28b] rawText must be realistic length — G5/G6 check LLM output, not rawText,
+    // but longer rawText is more representative of real usage.
+    await runCase("ユーザーがシステムの調子を尋ね、応答としてログの確認と解析結果を報告した。その後、修正コードを適用し動作確認を実施した。", false);
   } finally {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 
   console.log("  empty rawText guard regression: empty/blank skip LLM and retry; normal text keeps success path");
+}
+
+/**
+ * [v0.4.28c] Language Guard reask/handoff regression — verifies Gate Result Routing.
+ * Tests:
+ *   1. onFail=reask: mismatch → reask with suffix → 2nd LLM call with modified prompt
+ *   2. onFail=handoff: mismatch → immediate handoff (return null → cacheRetry)
+ *   3. lang=unknown skip: standard "unknown" stub → no mismatch detected → normal flow
+ *   4. Source verification: isLanguageGate, LANGUAGE_REASK_MAX, LANGUAGE_NAME_MAP, LANGUAGE_REASK_SUFFIX
+ */
+async function runLanguageGuardReaskHandoffRegression(): Promise<void> {
+  const workerSource = fs.readFileSync(path.resolve("src", "narrative-worker.ts"), "utf8");
+
+  // ── Source verification (structural) ──────────────────────────────
+  // 4a. QualityGateResult has isLanguageGate field
+  assert.ok(
+    workerSource.includes("isLanguageGate: boolean"),
+    "QualityGateResult should have isLanguageGate: boolean field"
+  );
+  // 4b. LANGUAGE_REASK_MAX constant exists
+  assert.ok(
+    workerSource.includes("LANGUAGE_REASK_MAX"),
+    "LANGUAGE_REASK_MAX constant should exist"
+  );
+  // 4c. LANGUAGE_NAME_MAP constant exists
+  assert.ok(
+    workerSource.includes("LANGUAGE_NAME_MAP"),
+    "LANGUAGE_NAME_MAP constant should exist"
+  );
+  // 4d. LANGUAGE_REASK_SUFFIX function exists
+  assert.ok(
+    workerSource.includes("LANGUAGE_REASK_SUFFIX"),
+    "LANGUAGE_REASK_SUFFIX function should exist"
+  );
+  // 4e. G0 mismatch returns isLanguageGate: true when contentGateEnabled=true
+  assert.ok(
+    /onFail === ["']reask["'] \|\| onFail === ["']handoff["']/.test(workerSource),
+    "G0 should check onFail=reask|handoff"
+  );
+  assert.ok(
+    workerSource.includes("isLanguageGate: true"),
+    "G0 should return isLanguageGate: true on mismatch with contentGateEnabled=true"
+  );
+  // 4f. G0 softwarn fallback when contentGateEnabled=false
+  assert.ok(
+    workerSource.includes("mismatch-${onFail}-softwarn-fallback"),
+    "G0 should softwarn-fallback when contentGateEnabled=false with onFail=reask|handoff"
+  );
+  // 4g. narrativizeWithModel handles isLanguageGate routing
+  assert.ok(
+    workerSource.includes("gateResult.isLanguageGate"),
+    "narrativizeWithModel should check gateResult.isLanguageGate"
+  );
+  // 4h. Gemini defensive check for isLanguageGate
+  // The check is: gateResult.isLanguageGate branch inside narrativizeWithGeminiModel(),
+  // which logs "language-mismatch in Gemini phase" — that string proves the defensive routing.
+  assert.ok(
+    workerSource.includes("language-mismatch in Gemini phase"),
+    "Gemini path should have defensive isLanguageGate handling (language-mismatch in Gemini phase)"
+  );
+  console.log("  language guard source verification: isLanguageGate, constants, routing, Gemini defensive — all present");
+
+  // ── Integration test: onFail=reask ──────────────────────────────
+  {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-lang-reask-${process.pid}-`));
+    const tempCjsPath = path.join(tempDir, "narrative-worker.cjs");
+    fs.copyFileSync(path.resolve("dist", "narrative-worker.js"), tempCjsPath);
+    const distFiles = fs.readdirSync(path.resolve("dist"));
+    for (const file of distFiles) {
+      const src = path.resolve("dist", file);
+      if (fs.statSync(src).isFile()) {
+        fs.copyFileSync(src, path.join(tempDir, file));
+      }
+    }
+    // Custom stub: detectLanguageDetailed returns "en" to trigger mismatch with expectedLang="ja"
+    fs.writeFileSync(
+      path.join(tempDir, "lang-detect.js"),
+      `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "en"; }
+function detectLanguageDetailed(_text) { return { lang: "en", confidence: 0.95, isReliable: true }; }
+`,
+      "utf8"
+    );
+    const req = createRequire(import.meta.url);
+    const workerModule = req(tempCjsPath);
+    const NarrativeWorker = workerModule.NarrativeWorker;
+    if (!NarrativeWorker) throw new Error("NarrativeWorker class not found in compiled module");
+
+    let chatCallCount = 0;
+    const userMessages: string[] = [];
+    let leaseCount = 0;
+    let ackCount = 0;
+
+    const mockOpenRouter = {
+      chatCompletion: async (params: any) => {
+        chatCallCount++;
+        if (params?.userMessage) userMessages.push(params.userMessage);
+        return MOCK_LATIN_NARRATIVE; // English narrative → detected as "en"
+      },
+    };
+
+    const mockRpcClient = {
+      cacheLeaseNext: async () => {
+        if (leaseCount > 0) return null;
+        leaseCount++;
+        return {
+          id: `lang-reask-item-${process.pid}`,
+          agentWs: tempDir,
+          agentId: "main",
+          source: "live-turn",
+          parentIngestId: "ingest-test",
+          orderKey: Date.now().toString(),
+          surprise: 0,
+          reason: "force-flush",
+          rawText: "ユーザーがシステムの調子を尋ね、応答としてログの確認と解析結果を報告した。その後、修正コードを適用し動作確認を実施した。",
+          estimatedTokens: 10,
+          status: "queued",
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+      },
+      cacheAck: async () => { ackCount++; return "ok"; },
+      cacheRetry: async () => "ok",
+      batchIngest: async () => ["test-slug"],
+      cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+      request: async () => null,
+      setMeta: async () => "ok",
+      getMeta: async () => null,
+      recall: async () => [],
+      recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+    };
+
+    // Config with expectedLanguage=ja + onFail=reask → G0 mismatch triggers reask
+    // NOTE: openrouterModel="test-model" triggers custom-model path in buildRetryPhases(),
+    // which sets contentGateEnabled=true for the primary phase (no need for GEMINI_API_KEY).
+    // contentGateEnabled in mockConfig is dead code — phase-level value comes from buildRetryPhases().
+    const mockConfig = {
+      openrouterModel: "test-model",
+      openrouterConfig: { model: "test-model" },
+      narrativeSystemPrompt: "Test prompt",
+      narrativeUserPromptTemplate: undefined,
+      narrativePreviousEpisodeRef: true,
+      narrativeExpectedLanguage: "ja",
+      narrativeLanguageOnFail: "reask",
+    };
+
+    const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+    await (worker as any).processNextFromCache();
+
+    // Test 1: reask should trigger a 2nd LLM call with language suffix appended
+    assert.ok(chatCallCount >= 2, `onFail=reask should trigger at least 2 LLM calls (actual: ${chatCallCount})`);
+    const hasSuffix = userMessages.some(msg => msg.includes("Japanese language"));
+    assert.ok(hasSuffix, `reask should append LANGUAGE_REASK_SUFFIX with full language name; got messages: ${JSON.stringify(userMessages.slice(0, 2))}`);
+
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    console.log(`  language guard reask: ${chatCallCount} LLM calls, suffix appended=${hasSuffix} — reask path verified`);
+  }
+
+  // ── Integration test: onFail=handoff ──────────────────────────────
+  {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-lang-handoff-${process.pid}-`));
+    const tempCjsPath = path.join(tempDir, "narrative-worker.cjs");
+    fs.copyFileSync(path.resolve("dist", "narrative-worker.js"), tempCjsPath);
+    const distFiles = fs.readdirSync(path.resolve("dist"));
+    for (const file of distFiles) {
+      const src = path.resolve("dist", file);
+      if (fs.statSync(src).isFile()) {
+        fs.copyFileSync(src, path.join(tempDir, file));
+      }
+    }
+    // Same stub: returns "en" to trigger mismatch with expectedLang="ja"
+    fs.writeFileSync(
+      path.join(tempDir, "lang-detect.js"),
+      `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "en"; }
+function detectLanguageDetailed(_text) { return { lang: "en", confidence: 0.95, isReliable: true }; }
+`,
+      "utf8"
+    );
+    const req = createRequire(import.meta.url);
+    const workerModule = req(tempCjsPath);
+    const NarrativeWorker = workerModule.NarrativeWorker;
+    if (!NarrativeWorker) throw new Error("NarrativeWorker class not found in compiled module");
+
+    let chatCallCount = 0;
+    let leaseCount = 0;
+    let ackCount = 0;
+
+    const mockOpenRouter = {
+      chatCompletion: async () => {
+        chatCallCount++;
+        return MOCK_LATIN_NARRATIVE; // English → detected as "en"
+      },
+    };
+
+    const mockRpcClient = {
+      cacheLeaseNext: async () => {
+        if (leaseCount > 0) return null;
+        leaseCount++;
+        return {
+          id: `lang-handoff-item-${process.pid}`,
+          agentWs: tempDir,
+          agentId: "main",
+          source: "live-turn",
+          parentIngestId: "ingest-test",
+          orderKey: Date.now().toString(),
+          surprise: 0,
+          reason: "force-flush",
+          rawText: "ユーザーがシステムの調子を尋ね、応答としてログの確認と解析結果を報告した。その後、修正コードを適用し動作確認を実施した。",
+          estimatedTokens: 10,
+          status: "queued",
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+      },
+      cacheAck: async () => { ackCount++; return "ok"; },
+      cacheRetry: async () => "ok",
+      batchIngest: async () => ["test-slug"],
+      cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+      request: async () => null,
+      setMeta: async () => "ok",
+      getMeta: async () => null,
+      recall: async () => [],
+      recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+    };
+
+    // Config with expectedLanguage=ja + onFail=handoff → G0 mismatch triggers immediate handoff
+    // NOTE: openrouterModel="test-model" triggers custom-model path in buildRetryPhases(),
+    // which sets contentGateEnabled=true for primary+fallback phases.
+    // The last fallback phase has no contentGateEnabled → softwarn-fallback → save succeeds.
+    const mockConfig = {
+      openrouterModel: "test-model",
+      openrouterConfig: { model: "test-model" },
+      narrativeSystemPrompt: "Test prompt",
+      narrativeUserPromptTemplate: undefined,
+      narrativePreviousEpisodeRef: true,
+      narrativeExpectedLanguage: "ja",
+      narrativeLanguageOnFail: "handoff",
+    };
+
+    const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+    await (worker as any).processNextFromCache();
+
+    // Test 2: handoff causes immediate phase transition (return null) in content-gated phases.
+    // Custom model path: 3 phases total. Phases 1-2 have contentGateEnabled=true → handoff.
+    // Phase 3 has no contentGateEnabled → softwarn-fallback → save succeeds.
+    // So we expect multiple LLM calls (proving phase handoff occurred) and a successful save.
+    assert.ok(chatCallCount >= 2, `onFail=handoff should trigger LLM calls across multiple phases (actual: ${chatCallCount})`);
+    assert.ok(ackCount >= 1, `onFail=handoff should eventually save via last-resort fallback phase (actual ack: ${ackCount})`);
+
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    console.log(`  language guard handoff: ${chatCallCount} LLM calls, ${ackCount} ack — handoff path verified`);
+  }
+
+  // ── Integration test: unknown skip (no regression) ─────────────────
+  {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-lang-unknown-${process.pid}-`));
+    const tempCjsPath = path.join(tempDir, "narrative-worker.cjs");
+    fs.copyFileSync(path.resolve("dist", "narrative-worker.js"), tempCjsPath);
+    const distFiles = fs.readdirSync(path.resolve("dist"));
+    for (const file of distFiles) {
+      const src = path.resolve("dist", file);
+      if (fs.statSync(src).isFile()) {
+        fs.copyFileSync(src, path.join(tempDir, file));
+      }
+    }
+    // Standard stub: returns "unknown" → G0 skips mismatch entirely
+    fs.writeFileSync(
+      path.join(tempDir, "lang-detect.js"),
+      `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+      "utf8"
+    );
+    const req = createRequire(import.meta.url);
+    const workerModule = req(tempCjsPath);
+    const NarrativeWorker = workerModule.NarrativeWorker;
+    if (!NarrativeWorker) throw new Error("NarrativeWorker class not found in compiled module");
+
+    let chatCallCount = 0;
+    let leaseCount = 0;
+    let ackCount = 0;
+
+    const mockOpenRouter = {
+      chatCompletion: async () => {
+        chatCallCount++;
+        return MOCK_CJK_NARRATIVE;
+      },
+    };
+
+    const mockRpcClient = {
+      cacheLeaseNext: async () => {
+        if (leaseCount > 0) return null;
+        leaseCount++;
+        return {
+          id: `lang-unknown-item-${process.pid}`,
+          agentWs: tempDir,
+          agentId: "main",
+          source: "live-turn",
+          parentIngestId: "ingest-test",
+          orderKey: Date.now().toString(),
+          surprise: 0,
+          reason: "force-flush",
+          rawText: "ユーザーがシステムの調子を尋ね、応答としてログの確認と解析結果を報告した。その後、修正コードを適用し動作確認を実施した。",
+          estimatedTokens: 10,
+          status: "queued",
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+      },
+      cacheAck: async () => { ackCount++; return "ok"; },
+      cacheRetry: async () => "ok",
+      batchIngest: async () => ["test-slug"],
+      cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+      request: async () => null,
+      setMeta: async () => "ok",
+      getMeta: async () => null,
+      recall: async () => [],
+      recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+    };
+
+    // Config with expectedLanguage=ja but onFail=reask — unknown should skip mismatch entirely
+    const mockConfig = {
+      openrouterModel: "test-model",
+      openrouterConfig: { model: "test-model" },
+      narrativeSystemPrompt: "Test prompt",
+      narrativeUserPromptTemplate: undefined,
+      narrativePreviousEpisodeRef: true,
+      narrativeExpectedLanguage: "ja",
+      narrativeLanguageOnFail: "reask",
+    };
+
+    const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+    await (worker as any).processNextFromCache();
+
+    // Test 3: unknown detection should NOT trigger reask — normal flow (1 LLM call)
+    assert.equal(chatCallCount, 1, `lang=unknown should skip G0 mismatch and call LLM once (actual: ${chatCallCount})`);
+    assert.equal(ackCount, 1, `lang=unknown should result in successful save (actual ack: ${ackCount})`);
+
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    console.log(`  language guard unknown skip: ${chatCallCount} LLM call, ${ackCount} ack — G0 skip preserved, no regression`);
+  }
+
+  // ── Integration test: contentGateEnabled=false + onFail=reask → softwarn-fallback ────
+  // Plan §5 item 3: "contentGateEnabled=false 時は onFail=reask|handoff 設定でも保存阻害しない"
+  // Using default model path (openrouterModel unset → "openrouter/free") + no GEMINI_API_KEY
+  // → buildRetryPhases() sets contentGateEnabled=false → G0 softwarn-fallbacks.
+  {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "episodic-claw-runtime-"));
+    fs.mkdirSync(path.join(tempDir, "dist"), { recursive: true });
+    const distDir = path.resolve("dist");
+    for (const f of fs.readdirSync(distDir)) {
+      if (f.endsWith(".js")) fs.copyFileSync(path.join(distDir, f), path.join(tempDir, "dist", f));
+    }
+    fs.writeFileSync(
+      path.join(tempDir, "dist", "lang-detect.js"),
+      `// Softwarn-fallback stub: returns en (mismatch with expectedLang=ja)
+module.exports = { detectLanguage: () => "en", detectLanguageDetailed: () => ({ lang: "en", confidence: 0.99, isReliable: true }) };
+`
+    );
+    const distRequire = createRequire(path.join(tempDir, "dist", "_dummy.js"));
+    const compiled = distRequire(path.join(tempDir, "dist", "narrative-worker.js"));
+    const NarrativeWorker = compiled.NarrativeWorker;
+    if (!NarrativeWorker) throw new Error("NarrativeWorker class not found in compiled module");
+
+    let chatCallCount = 0;
+    let ackCount = 0;
+    const userMessages: string[] = [];
+
+    const mockOpenRouter = {
+      chatCompletion: async (params: any) => {
+        chatCallCount++;
+        userMessages.push(params.userMessage || "");
+        return MOCK_CJK_NARRATIVE;
+      },
+    };
+
+    const mockRpcClient = {
+      cacheLeaseNext: async () => {
+        if (ackCount > 0) return null;
+        return {
+          id: `lang-softwarn-item-${process.pid}`,
+          agentWs: tempDir,
+          agentId: "main",
+          source: "live-turn",
+          parentIngestId: "ingest-test",
+          orderKey: Date.now().toString(),
+          surprise: 0,
+          reason: "force-flush",
+          rawText: "ユーザーがシステムの調子を尋ねた。その後ログを確認し解析結果を報告した。",
+          estimatedTokens: 10,
+          status: "queued",
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+      },
+      cacheAck: async () => { ackCount++; return "ok"; },
+      cacheRetry: async () => "ok",
+      batchIngest: async () => ["test-slug"],
+      cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+      request: async () => null,
+      setMeta: async () => "ok",
+      getMeta: async () => null,
+      recall: async () => [],
+      recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+    };
+
+    // Default model path (no openrouterModel) + no GEMINI_API_KEY → contentGateEnabled=false
+    // This triggers G0 softwarn-fallback instead of isLanguageGate routing.
+    const savedGeminiKey = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try {
+      const mockConfig = {
+        narrativeSystemPrompt: "Test prompt",
+        narrativeUserPromptTemplate: undefined,
+        narrativePreviousEpisodeRef: true,
+        narrativeExpectedLanguage: "ja",
+        narrativeLanguageOnFail: "reask",
+      };
+
+      const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+      await (worker as any).processNextFromCache();
+
+      // Test 4: contentGateEnabled=false + onFail=reask should NOT block save
+      // G0 softwarn-fallbacks → narrative passes all gates → normal save
+      assert.equal(chatCallCount, 1, `contentGateEnabled=false + onFail=reask should call LLM once (softwarn, no reask) (actual: ${chatCallCount})`);
+      assert.equal(ackCount, 1, `contentGateEnabled=false + onFail=reask should save successfully (softwarn fallback) (actual ack: ${ackCount})`);
+      // No reask suffix should be appended — mismatch was softwarn, not reask
+      const hasSuffix = userMessages.some(msg => msg.includes("Japanese language"));
+      assert.ok(!hasSuffix, `contentGateEnabled=false should NOT append reask suffix; got messages: ${JSON.stringify(userMessages)}`);
+
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      console.log(`  language guard softwarn-fallback: ${chatCallCount} LLM call, ${ackCount} ack, suffix=${hasSuffix} — contentGateEnabled=false does not block save`);
+    } finally {
+      // Restore GEMINI_API_KEY for subsequent tests (even if assertion throws)
+      if (savedGeminiKey) process.env.GEMINI_API_KEY = savedGeminiKey;
+    }
+  }
+
+  console.log("  language guard reask/handoff/unknown/softwarn regression: all 4 integration tests + source verification passed");
+
 }
 
 /**
@@ -2759,6 +3309,15 @@ async function runPolyglotQueryMorphologicalTests(): Promise<void> {
   assert.ok(
     langDetectSource.includes("export function detectLanguage"),
     "lang-detect should export detectLanguage"
+  );
+  // [v0.4.28a] Verify detectLanguageDetailed export for G0 language guard
+  assert.ok(
+    langDetectSource.includes("export function detectLanguageDetailed"),
+    "lang-detect should export detectLanguageDetailed for G0 language guard"
+  );
+  assert.ok(
+    langDetectSource.includes("DetectLanguageDetailedResult"),
+    "lang-detect should export DetectLanguageDetailedResult type"
   );
   assert.ok(
     langDetectSource.includes("import eld from \"eld\""),

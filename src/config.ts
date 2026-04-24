@@ -10,6 +10,33 @@ function clampUnitInterval(value: unknown, fallback: number): number {
   return value;
 }
 
+/** [v0.4.28b] Clamp a numeric config value to [min, max] with NaN/Infinity guard.
+ *  Returns fallback if value is not a finite number. Same pattern as clampUnitInterval().
+ *  Without this guard, Math.max(1, NaN) = NaN → comparison < NaN = false → gate silently disabled.
+ */
+function clampFiniteInt(value: unknown, min: number, max: number, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+/** [v0.4.28a] Validate and normalize narrativeExpectedLanguage.
+ *  Only accepts ja|en|zh|ko|id. Invalid values → undefined (= auto, no check). */
+const VALID_LANGUAGE_CODES = new Set(["ja", "en", "zh", "ko", "id"]);
+function normalizeLanguageCode(value: unknown): "ja" | "en" | "zh" | "ko" | "id" | undefined {
+  if (typeof value !== "string") return undefined;
+  const lower = value.trim().toLowerCase();
+  return VALID_LANGUAGE_CODES.has(lower) ? lower as "ja" | "en" | "zh" | "ko" | "id" : undefined;
+}
+
+/** [v0.4.28a] Validate and normalize narrativeLanguageOnFail.
+ *  Only accepts softwarn|reask|handoff. Invalid values → softwarn (safe default). */
+const VALID_ON_FAIL = new Set(["softwarn", "reask", "handoff"]);
+function normalizeLanguageOnFail(value: unknown): "softwarn" | "reask" | "handoff" {
+  if (typeof value !== "string") return "softwarn";
+  const lower = value.trim().toLowerCase();
+  return VALID_ON_FAIL.has(lower) ? lower as "softwarn" | "reask" | "handoff" : "softwarn";
+}
+
 /**
  * Normalize OpenRouter reasoning config from raw user input.
  *
@@ -116,6 +143,19 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     openrouterReasoning: normalizeOpenRouterReasoning(
       rawConfig?.openrouterConfig?.reasoning ?? { enabled: true, effort: "high" }
     ),
+    // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
+    // narrativeExpectedLanguage: undefined = auto (no check). Only accept valid language codes.
+    narrativeExpectedLanguage: normalizeLanguageCode(rawConfig?.narrativeExpectedLanguage),
+    narrativeLanguageThreshold: clampUnitInterval(rawConfig?.narrativeLanguageThreshold, 0.75),
+    narrativeLanguageOnFail: normalizeLanguageOnFail(rawConfig?.narrativeLanguageOnFail),
+    // [v0.4.28b] Content floor config — G5 Minimum Sentence Gate + G6 Minimum Content Floor
+    // Uses clampFiniteInt() for NaN/Infinity guard (same pattern as clampUnitInterval).
+    // narrativeGuardMinSentences: clamp [1, 20], default 3. Runtime branches: CJK=this, Latin=this+1.
+    narrativeGuardMinSentences: clampFiniteInt(rawConfig?.narrativeGuardMinSentences, 1, 20, 3),
+    // narrativeGuardMinCjkChars: clamp [10, 500], default 120.
+    narrativeGuardMinCjkChars: clampFiniteInt(rawConfig?.narrativeGuardMinCjkChars, 10, 500, 120),
+    // narrativeGuardMinLatinWords: clamp [5, 300], default 80.
+    narrativeGuardMinLatinWords: clampFiniteInt(rawConfig?.narrativeGuardMinLatinWords, 5, 300, 80),
   };
 }
 
