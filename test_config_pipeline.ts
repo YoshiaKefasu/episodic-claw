@@ -91,6 +91,9 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "openrouterApiKey",
     "openrouterModel",
     "openrouterMaxTokens",
+    // [v0.4.28f] Transport timeout/retry control
+    "openrouterTimeoutMs",
+    "openrouterMaxRetries",
     "narrativeSystemPrompt",
     "narrativeUserPromptTemplate",
     "maxPoolChars",
@@ -151,6 +154,9 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "openrouterApiKey",
     "openrouterModel",
     "openrouterMaxTokens",
+    // [v0.4.28f] Transport timeout/retry control
+    "openrouterTimeoutMs",
+    "openrouterMaxRetries",
     "narrativeSystemPrompt",
     "narrativeUserPromptTemplate",
     "maxPoolChars",
@@ -252,6 +258,8 @@ test("loadConfig({}) returns correct defaults for all fields", () => {
   assert.deepEqual(cfg.queryExcludedKeywords, []);
   assert.equal(cfg.openrouterModel, "openrouter/free");
   assert.equal(cfg.openrouterMaxTokens, undefined);  // No default max tokens
+  assert.equal(cfg.openrouterTimeoutMs, 30000, "default timeoutMs should be 30000");
+  assert.equal(cfg.openrouterMaxRetries, 3, "default maxRetries should be 3");
   assert.equal(cfg.narrativeTemperature, 0.4);
   assert.equal(cfg.maxPoolChars, 15000);
   assert.equal(cfg.narrativePreviousEpisodeRef, true);
@@ -549,6 +557,9 @@ test("REGRESSION: openrouterConfig nested fields are all destructured into flat 
   assert.equal(cfg.narrativeTemperature, 0.3, "openrouterConfig.temperature → narrativeTemperature");
   assert.ok(cfg.openrouterReasoning, "openrouterConfig.reasoning → openrouterReasoning");
   assert.equal(cfg.openrouterReasoning!.enabled, true);
+  // [v0.4.28f] timeout/retries should also flow through
+  assert.equal(cfg.openrouterTimeoutMs, 30000, "default timeoutMs when not set in openrouterConfig");
+  assert.equal(cfg.openrouterMaxRetries, 3, "default maxRetries when not set in openrouterConfig");
 });
 
 // ─── 7. v0.4.19a Bug #0: Config Propagation ────────────────────────────
@@ -731,6 +742,65 @@ test("resolvePrompt resolves Windows absolute path directly", () => {
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+// ─── 6c. v0.4.28f Transport Timeout/Retry Config ──────────────────────────
+
+console.log("\n=== 6c. v0.4.28f Transport Timeout/Retry Config ===\n");
+
+test("openrouterTimeoutMs: default is 30000, nested extraction works", () => {
+  const cfg = loadConfig({ openrouterConfig: { timeoutMs: 180000 } });
+  assert.equal(cfg.openrouterTimeoutMs, 180000, "openrouterConfig.timeoutMs → openrouterTimeoutMs");
+});
+
+test("openrouterMaxRetries: default is 3, nested extraction works", () => {
+  const cfg = loadConfig({ openrouterConfig: { maxRetries: 0 } });
+  assert.equal(cfg.openrouterMaxRetries, 0, "maxRetries=0 (fail-fast) should be preserved");
+});
+
+test("openrouterTimeoutMs: clamped to [30000, 300000]", () => {
+  const tooLow = loadConfig({ openrouterConfig: { timeoutMs: 5000 } });
+  assert.equal(tooLow.openrouterTimeoutMs, 30000, "below 30000 should be clamped to 30000");
+
+  const tooHigh = loadConfig({ openrouterConfig: { timeoutMs: 600000 } });
+  assert.equal(tooHigh.openrouterTimeoutMs, 300000, "above 300000 should be clamped to 300000");
+
+  const at5min = loadConfig({ openrouterConfig: { timeoutMs: 300000 } });
+  assert.equal(at5min.openrouterTimeoutMs, 300000, "300000 (5 min) should pass through");
+
+  const at3min = loadConfig({ openrouterConfig: { timeoutMs: 180000 } });
+  assert.equal(at3min.openrouterTimeoutMs, 180000, "180000 (3 min) should pass through");
+});
+
+test("openrouterMaxRetries: clamped to [0, 5]", () => {
+  const tooLow = loadConfig({ openrouterConfig: { maxRetries: -1 } });
+  assert.equal(tooLow.openrouterMaxRetries, 0, "negative should be clamped to 0");
+
+  const tooHigh = loadConfig({ openrouterConfig: { maxRetries: 6 } });
+  assert.equal(tooHigh.openrouterMaxRetries, 5, "above 5 should be clamped to 5");
+
+  const strictFail = loadConfig({ openrouterConfig: { maxRetries: 0 } });
+  assert.equal(strictFail.openrouterMaxRetries, 0, "0 (strict fail-fast) should be preserved");
+});
+
+test("openrouterTimeoutMs: NaN falls back to default 30000", () => {
+  const cfg = loadConfig({ openrouterConfig: { timeoutMs: NaN } });
+  assert.equal(cfg.openrouterTimeoutMs, 30000, "NaN should fall back to default 30000");
+});
+
+test("openrouterMaxRetries: NaN falls back to default 3", () => {
+  const cfg = loadConfig({ openrouterConfig: { maxRetries: NaN } });
+  assert.equal(cfg.openrouterMaxRetries, 3, "NaN should fall back to default 3");
+});
+
+test("REGRESSION [v0.4.28f]: openrouterTimeoutMs is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ openrouterConfig: { timeoutMs: 240000 } });
+  assert.equal(cfg.openrouterTimeoutMs, 240000, "user's 4-min timeout should be preserved");
+});
+
+test("REGRESSION [v0.4.28f]: openrouterMaxRetries is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ openrouterConfig: { maxRetries: 1 } });
+  assert.equal(cfg.openrouterMaxRetries, 1, "user's maxRetries=1 should be preserved");
 });
 
 // ─── Summary ────────────────────────────────────────────────

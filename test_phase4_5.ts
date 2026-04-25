@@ -69,6 +69,7 @@ function loadCompactorCtor(): typeof import("./src/compactor.ts").Compactor {
   fs.copyFileSync(path.resolve("dist", "compactor.js"), tempCjsPath);
   for (const file of [
     "large-payload.js",
+    "untrusted-metadata.js",
     "rpc-client.js",
     "segmenter.js",
     "narrative-pool.js",
@@ -92,6 +93,7 @@ function loadCompactorModule(): typeof import("./src/compactor.ts") {
   fs.copyFileSync(path.resolve("dist", "compactor.js"), tempCjsPath);
   for (const file of [
     "large-payload.js",
+    "untrusted-metadata.js",
     "rpc-client.js",
     "segmenter.js",
     "narrative-pool.js",
@@ -128,6 +130,7 @@ async function runAnchorInjectionSmoke(): Promise<void> {
     "cjk-tokenizer.js",
     "lang-detect.js",
     "large-payload.js",
+    "untrusted-metadata.js",
     "compactor.js",
     "config.js",
     "index.js",
@@ -363,6 +366,7 @@ async function runDegradedFallbackGuardSmoke(): Promise<void> {
     "cjk-tokenizer.js",
     "lang-detect.js",
     "large-payload.js",
+    "untrusted-metadata.js",
     "compactor.js",
     "config.js",
     "retriever.js",
@@ -690,6 +694,7 @@ async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
   fs.mkdirSync(runtimeDist, { recursive: true });
   for (const file of [
     "large-payload.js",
+    "untrusted-metadata.js",
     "rpc-client.js",
     "segmenter.js",
     "reasoning-tags.js",
@@ -833,6 +838,7 @@ async function runGatewayStartSmoke(): Promise<void> {
     "cjk-tokenizer.js",
     "lang-detect.js",
     "large-payload.js",
+    "untrusted-metadata.js",
     "compactor.js",
     "config.js",
     "index.js",
@@ -3265,7 +3271,23 @@ async function runRetrieverSourceSmoke(): Promise<void> {
     "index.ts should pass retriever opts in both before_prompt_build and assemble paths"
   );
 
+  // 11. [v0.4.28f] Wiring smoke: verify index.ts passes timeout/retries to OpenRouterClient
+  // Source-level guard — prevents silent regression where cfg fields are defined but never wired.
+  assert.ok(
+    indexSource.includes("timeoutMs: cfg.openrouterTimeoutMs"),
+    "index.ts [v0.4.28f] must wire cfg.openrouterTimeoutMs to OpenRouterClient"
+  );
+  assert.ok(
+    indexSource.includes("maxRetries: cfg.openrouterMaxRetries"),
+    "index.ts [v0.4.28f] must wire cfg.openrouterMaxRetries to OpenRouterClient"
+  );
+  assert.ok(
+    indexSource.includes("openrouterTimeoutMs=${cfg.openrouterTimeoutMs}"),
+    "index.ts [v0.4.28f] must log openrouterTimeoutMs in Config loaded"
+  );
+
   console.log("  retriever source smoke: attachment markers, script-aware extraction, observability all present");
+  console.log("  [v0.4.28f] wiring smoke: timeoutMs + maxRetries → OpenRouterClient verified in index.ts");
 }
 
 /**

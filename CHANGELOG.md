@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.29] - 2026-04-25
+
+### Fixed
+- **Untrusted metadata recall-query contamination (v0.4.28e)**: blocked `Conversation info (untrusted metadata)` leakage into recall query keywords by adding shared metadata stripping, hardening `raw_prompt_fallback` anchor normalization, and adding a query-side defensive strip in deterministic rewrite.
+- **OpenRouter timeout/retry control for 3–5 minute wait windows (v0.4.28f)**: added config-driven transport controls (`openrouterConfig.timeoutMs`, `openrouterConfig.maxRetries`) and wired them into `OpenRouterClient`, enabling long-wait strict failure policies (e.g., `timeoutMs=180000~300000`, `maxRetries=0`).
+
+### Changed
+- Added startup observability for OpenRouter transport config (`openrouterTimeoutMs`, `openrouterMaxRetries`) in config-loaded logs.
+- Expanded regression coverage:
+  - `test_untrusted_metadata.ts`
+  - `test_anchor_sanitize.ts`
+  - `test_config_pipeline.ts` Section 6c
+  - `test_phase4_5.ts` wiring smoke for timeout/retry propagation
+
+### Notes
+- This release consolidates the post-`v0.4.28` hardening tracks previously documented as `v0.4.28e` and `v0.4.28f`.
+
 ## [0.4.28] - 2026-04-24
 
 ### Fixed

@@ -134,6 +134,10 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     openrouterModel: rawConfig?.openrouterConfig?.model ?? rawConfig?.openrouterModel ?? "openrouter/free",
     // [v0.4.15] Max tokens for narrative generation — previously dropped by v0.4.14 Fix B
     openrouterMaxTokens: rawConfig?.openrouterConfig?.maxTokens,
+    // [v0.4.28f] Transport timeout/retry control — configures OpenRouterClient directly
+    // clampFiniteInt guards against NaN/Infinity (same pattern as v0.4.28b narrativeGuard fields)
+    openrouterTimeoutMs: clampFiniteInt(rawConfig?.openrouterConfig?.timeoutMs, 30000, 300000, 30000),
+    openrouterMaxRetries: clampFiniteInt(rawConfig?.openrouterConfig?.maxRetries, 0, 5, 3),
     narrativeTemperature: Math.max(0, Math.min(1, rawConfig?.openrouterConfig?.temperature ?? rawConfig?.narrativeTemperature ?? 0.4)),
     narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt, platform),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate, platform),

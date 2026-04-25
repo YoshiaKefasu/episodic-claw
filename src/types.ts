@@ -119,6 +119,13 @@ export interface EpisodicPluginConfig {
   /** Max tokens cap for narrative generation. Sources from openrouterConfig.maxTokens.
    *  Omit to use the model's default context window. */
   openrouterMaxTokens?: number;
+  /** Request timeout in ms for OpenRouter API calls. Sources from openrouterConfig.timeoutMs.
+   *  Clamped to [30000, 300000]. Default: 30000. Set to 180000-300000 for free-tier models. */
+  openrouterTimeoutMs?: number;
+  /** Transport-level retry count after transient failures (timeout, 5xx, rate-limit).
+   *  Sources from openrouterConfig.maxRetries. Clamped to [0, 5]. Default: 3.
+   *  Set to 0 for strict fail-fast mode (no retries). */
+  openrouterMaxRetries?: number;
   /** Narrative system prompt (inline text). */
   narrativeSystemPrompt?: string;
   /** Narrative user prompt template (inline text). */

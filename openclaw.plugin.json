@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.28",
+  "version": "0.4.29",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -180,6 +180,20 @@
             "maximum": 1,
             "default": 0.4,
             "description": "Sampling temperature for narrative generation. Default: 0.4 (factual, consistent)."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 30000,
+            "maximum": 300000,
+            "default": 30000,
+            "description": "HTTP request timeout for OpenRouter API calls in milliseconds. Default: 30000 (30s). For models that take longer to generate (e.g., free-tier inference queues), set to 180000 (3 min) or 300000 (5 min). Values outside [30000, 300000] are clamped automatically.\n\u26a0\ufe0f [Blast Radius] If too high: A stalled request holds a NarrativeWorker slot for the full timeout. Combine with maxRetries=0 to bound total wait time."
+          },
+          "maxRetries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5,
+            "default": 3,
+            "description": "Number of transport-level retries after a transient failure (timeout, 5xx, rate-limit). Default: 3. For strict 3-5 min fail judgment, set to 0 (no retries — one shot only). Values outside [0, 5] are clamped automatically.\n\u26a0\ufe0f [Blast Radius] If 0: A single transient failure immediately fails the narrative item. Recommended only when combined with a long timeoutMs."
           },
           "reasoning": {
             "type": "object",

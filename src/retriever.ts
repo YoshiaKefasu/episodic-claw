@@ -14,6 +14,7 @@ import { stripReasoningTagsFromText } from "./reasoning-tags";
 import * as stopwords from "stopwords-iso";
 import { detectLanguage, initLanguageDetector, type DetectedLanguage } from "./lang-detect";
 import { tokenizeCjk } from "./cjk-tokenizer";
+import { stripUntrustedMetadataBlocks } from "./untrusted-metadata";
 
 // ─── TS-side recall result cache ────────────────────────────────────────────
 // Caches the last recall outcome by queryHash for RECALL_CACHE_TTL_MS.
@@ -146,12 +147,8 @@ export function classifyAndStripAttachment(text: string): {
       let tailCleaned = afterBoundary;
       // Remove System: lines
       tailCleaned = tailCleaned.replace(/^System:\s.*$/gm, "");
-      // Remove untrusted metadata headers
-      tailCleaned = tailCleaned.replace(
-        /^(Conversation info|Sender|Replied message)\s+\(untrusted[^)]*\):.*$/gim, ""
-      );
-      // Remove fenced json blocks (```json ... ```)
-      tailCleaned = tailCleaned.replace(/```json[\s\S]*?```/g, "");
+      // Remove untrusted metadata headers and fenced json blocks via shared helper (E1/DRY)
+      tailCleaned = stripUntrustedMetadataBlocks(tailCleaned);
       // Remove bare media:type lines
       tailCleaned = tailCleaned.replace(/^media:(image|document|audio|video)\s*$/gim, "");
       // Remove <media:...> tags
@@ -302,6 +299,10 @@ export async function instantDeterministicRewrite(messages: Message[], config?: 
     .map(text => text
       .replace(/\[\[reply_to_current\]\]/g, "")
       .replace(/^System:\s*\[.*?\]\s*/gm, "")
+      // E4: strip untrusted metadata header lines (last-resort guard, mirrors anchor sanitize)
+      .replace(/^(Conversation info|Sender|Replied message)\s+\(untrusted[^)]*\):.*$/gim, "")
+      // E4a: strip orphaned fenced json blocks left after header removal (BLIND SPOT fix)
+      .replace(/```json[\s\S]*?```/gi, "")
       .replace(/<[^>]+>/g, "")
       .replace(/\p{Extended_Pictographic}/gu, "")
       .replace(/\s+/g, " ")

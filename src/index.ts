@@ -17,6 +17,7 @@ import { RecallFallbackReason, RecallMatchedBy } from "./types";
 import { initLanguageDetector } from "./lang-detect";
 import { tokenize } from "kuromojin";
 import { resolveRuntimeMode } from "./runtime-mode";
+import { stripUntrustedMetadataBlocks } from "./untrusted-metadata";
 
 export interface OpenClawPluginApi {
   // フック登録 — openclaw types.ts の PluginHookName に準拠
@@ -94,9 +95,14 @@ type PromptAnchorNormalizationResult = {
   anchorNormalizedPreview: string;
   anchorAcceptedReason: string;
   anchorRejectedReason: string;
+  // [E5] Sanitize observability
+  anchorSanitizeApplied: boolean;
+  anchorSanitizedLength: number;
+  anchorSanitizeDroppedMetadata: boolean;
 };
 
-function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult {
+/** @internal exported for testing only */
+export function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult {
   if (typeof prompt !== "string") {
     return {
       latestUserAnchor: "",
@@ -104,6 +110,9 @@ function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult
       anchorNormalizedPreview: "",
       anchorAcceptedReason: "",
       anchorRejectedReason: "missing_or_non_string_prompt",
+      anchorSanitizeApplied: false,
+      anchorSanitizedLength: 0,
+      anchorSanitizeDroppedMetadata: false,
     };
   }
 
@@ -120,9 +129,23 @@ function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult
       candidate = (match[2] || "").trim();
     }
   }
+  // [E3] raw_prompt_fallback: sanitize first, then extract meaningful tail lines.
+  // Avoids adopting metadata-only prompts as anchor.
   if (!candidate) {
-    candidate = raw;
+    const sanitizedRaw = stripUntrustedMetadataBlocks(raw);
+    if (sanitizedRaw.length >= 3) {
+      const tailLines = sanitizedRaw.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+      candidate = tailLines.slice(-5).join("\n").trim();
+    }
+    // If still empty after sanitize, candidate stays "" and will be rejected below
   }
+
+  // [E2] Apply metadata sanitize to candidate regardless of path (belt-and-suspenders)
+  const preSanitizeLength = candidate.length;
+  candidate = stripUntrustedMetadataBlocks(candidate);
+  const anchorSanitizedLength = candidate.length;
+  const anchorSanitizeDroppedMetadata = preSanitizeLength > 0 && candidate.length < preSanitizeLength;
+  const anchorSanitizeApplied = true; // sanitize function was called on this path; use anchorSanitizeDroppedMetadata for "actually changed"
 
   const normalized = candidate
     .replace(/```[\s\S]*?```/g, " ")
@@ -139,7 +162,12 @@ function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult
       anchorRawPreview,
       anchorNormalizedPreview,
       anchorAcceptedReason: "",
-      anchorRejectedReason: roleMatched ? "user_block_empty_after_normalization" : "empty_after_normalization",
+      anchorRejectedReason: roleMatched
+        ? "user_block_empty_after_normalization"
+        : (anchorSanitizeDroppedMetadata ? "metadata_only_after_sanitize" : "empty_after_normalization"),
+      anchorSanitizeApplied: anchorSanitizeApplied,
+      anchorSanitizedLength: anchorSanitizedLength,
+      anchorSanitizeDroppedMetadata: anchorSanitizeDroppedMetadata,
     };
   }
   if (normalized.length < 3) {
@@ -149,6 +177,9 @@ function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult
       anchorNormalizedPreview,
       anchorAcceptedReason: "",
       anchorRejectedReason: "too_short",
+      anchorSanitizeApplied: anchorSanitizeApplied,
+      anchorSanitizedLength: anchorSanitizedLength,
+      anchorSanitizeDroppedMetadata: anchorSanitizeDroppedMetadata,
     };
   }
 
@@ -156,8 +187,14 @@ function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizationResult
     latestUserAnchor: normalized,
     anchorRawPreview,
     anchorNormalizedPreview,
-    anchorAcceptedReason: roleMatched ? "last_user_block" : "raw_prompt_fallback",
+    // [E2] Suffix reason with _sanitized when metadata was actually stripped
+    anchorAcceptedReason: roleMatched
+      ? (anchorSanitizeDroppedMetadata ? "last_user_block_sanitized" : "last_user_block")
+      : (anchorSanitizeDroppedMetadata ? "raw_prompt_tail_sanitized" : "raw_prompt_fallback"),
     anchorRejectedReason: "",
+    anchorSanitizeApplied: anchorSanitizeApplied,
+    anchorSanitizedLength: anchorSanitizedLength,
+    anchorSanitizeDroppedMetadata: anchorSanitizeDroppedMetadata,
   };
 }
 
@@ -609,7 +646,8 @@ const episodicClawPlugin = {
         console.log(
           `[Episodic Memory] Config loaded: recallQueryRecentMessageCount=${cfg.recallQueryRecentMessageCount}, ` +
           `narrativeSystemPrompt=${cfg.narrativeSystemPrompt ? `(custom, ${cfg.narrativeSystemPrompt.length} chars)` : "(default)"}, ` +
-          `model=${cfg.openrouterModel}`
+          `model=${cfg.openrouterModel}, ` +
+          `openrouterTimeoutMs=${cfg.openrouterTimeoutMs}, openrouterMaxRetries=${cfg.openrouterMaxRetries}`
         );
 
         const rpcClient = new EpisodicCoreClient();
@@ -623,6 +661,9 @@ const episodicClawPlugin = {
               maxTokens: cfg.openrouterMaxTokens,
               temperature: cfg.narrativeTemperature,
               reasoning: cfg.openrouterReasoning,
+              // [v0.4.28f] Transport timeout/retry — user-configurable, default 30s/3
+              timeoutMs: cfg.openrouterTimeoutMs,
+              maxRetries: cfg.openrouterMaxRetries,
             })
           : null;
         const narrativeWorker = openRouterClient
@@ -1077,6 +1118,10 @@ const episodicClawPlugin = {
             anchorNormalizedPreview: anchorNormalization.anchorNormalizedPreview,
             anchorAcceptedReason: anchorNormalization.anchorAcceptedReason,
             anchorRejectedReason: anchorNormalization.anchorRejectedReason,
+            // [E5] Sanitize observability
+            anchorSanitizeApplied: anchorNormalization.anchorSanitizeApplied,
+            anchorSanitizedLength: anchorNormalization.anchorSanitizedLength,
+            anchorSanitizeDroppedMetadata: anchorNormalization.anchorSanitizeDroppedMetadata,
           }));
         }
 
