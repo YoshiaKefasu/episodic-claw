@@ -10,8 +10,15 @@
 - **Coverage restoration for v0.4.29a-d**: repaired environment-restore and assertion drift in modularized test flows so full downstream suites (`test_anchor_sanitize`, `test_config_pipeline`, etc.) execute reliably after `test_phase4_5.ts`.
 - **Language guard regression assertions aligned to v0.4.29c route semantics**: no-custom-model `reask` path now asserts `reask -> handoff -> final fallback save` behavior instead of pre-29c assumptions.
 
+### Included tracks from v0.4.29a-d (documentation alignment)
+- **v0.4.29a**: media-caption-only query extraction in anchor normalization path (exclude `[media attached: ...]` scaffolds; keep caption text only).
+- **v0.4.29b**: MIME scaffold rescue + DRY unification (`(image/jpeg)`-style markers handled consistently via shared media-scaffold detection).
+- **v0.4.29c**: Google-first narrative routing + `narrativeConfig` unification + reasoning.exclude internal fix (details preserved in dedicated `0.4.29c` section below).
+- **v0.4.29d**: one-shot deprecation warning cleanup for `openrouterConfig` fallback path.
+
 ### Notes
 - This release focuses on test architecture and reliability hardening; runtime plugin behavior is unchanged.
+- This release note now explicitly maps all v0.4.29a-d tracks for audit/readability.
 
 ## [0.4.29c] - 2026-04-27
 
