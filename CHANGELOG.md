@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.30] - 2026-04-27
+
+### Changed
+- **Phase4/5 test modular split (v0.4.29e)**: refactored monolithic `test_phase4_5.ts` into responsibility-scoped modules (`gateway_runtime`, `retriever_anchor`, `narrative_worker`, `cache_compaction_segmenter`) with a thin orchestrator entrypoint to preserve `npm test` workflow.
+- **Deterministic test runtime guard**: `npm test` now runs with `GEMINI_API_KEY=` at the entry command to prevent accidental network-bound Gemini retries from slowing local CI validation.
+
+### Fixed
+- **Coverage restoration for v0.4.29a-d**: repaired environment-restore and assertion drift in modularized test flows so full downstream suites (`test_anchor_sanitize`, `test_config_pipeline`, etc.) execute reliably after `test_phase4_5.ts`.
+- **Language guard regression assertions aligned to v0.4.29c route semantics**: no-custom-model `reask` path now asserts `reask -> handoff -> final fallback save` behavior instead of pre-29c assumptions.
+
+### Notes
+- This release focuses on test architecture and reliability hardening; runtime plugin behavior is unchanged.
+
 ## [0.4.29c] - 2026-04-27
 
 ### Added
