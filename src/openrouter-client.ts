@@ -136,7 +136,7 @@ export interface OpenRouterConfig {
   reasoning?: {
     effort?: string;
     maxTokens?: number;
-    exclude?: boolean;
+    // [v0.4.29c Fix C3] exclude always true — no longer configurable
   };
 }
 
@@ -261,7 +261,9 @@ export class OpenRouterClient {
       ],
       temperature: this.config.temperature,
     };
-    if (this.config.maxTokens !== undefined) {
+    // [v0.4.29c BUG-FIX] Only send max_tokens when > 0.
+    // maxTokens=0 is invalid (would produce empty output) — treat as unset.
+    if (this.config.maxTokens !== undefined && this.config.maxTokens > 0) {
       body.max_tokens = this.config.maxTokens;
     }
 
@@ -274,9 +276,8 @@ export class OpenRouterClient {
       if (this.config.reasoning.maxTokens !== undefined) {
         reasoning.max_tokens = this.config.reasoning.maxTokens;
       }
-      if (this.config.reasoning.exclude === true) {
-        reasoning.exclude = true;
-      }
+      // [v0.4.29c Fix C3] exclude always true — always send to prevent CoT leakage
+      reasoning.exclude = true;
       if (Object.keys(reasoning).length > 0) {
         body.reasoning = reasoning;
       }

@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.29c] - 2026-04-27
+
+### Added
+- **Google-first narrative retry architecture (Gemini/Gemma primary)**: Narrative generation now uses a Google-first 6/6/3/3 phase sequence — `gemini-main(6)` → `gemma-main(6)` → `openrouter-model(3)` → `openrouter-free(3)` — dramatically improving quality by prioritizing Google's high-reasoning models. OpenRouter serves as fallback only (Round 2).
+- **`narrativeConfig` unified configuration**: New `narrativeConfig` top-level config key replaces `openrouterConfig` as the primary config source. Applies to both Google (Gemini/Gemma) and OpenRouter providers. Priority: `narrativeConfig` > `openrouterConfig` (deprecated) > flat fields > defaults. `openrouterConfig` retained for backward compatibility with deprecation warning.
+- **`narrativeConfigSource` observability field**: `loadConfig()` now returns `narrativeConfigSource` ("narrativeConfig" | "openrouterConfig" | "flat" | "default") for startup tracing.
+- **Gemini thinkingConfig wiring**: `GeminiDirectClient` now respects `temperature`, `maxTokens`, and `thinkingConfig` (thinkingLevel/thinkingBudget) from `narrativeConfig.reasoning`. Maps `effort` → `thinkingLevel` and `maxTokens` → `thinkingBudget` with Gemini 2.5 vs Gemini 3 model awareness.
+- **One-time Gemini client unavailable warning**: When `GEMINI_API_KEY` is missing, a single `console.warn` explains that Google phases will be skipped — replaces silently returning null.
+
+### Changed
+- **`reasoning.exclude` is always `true` (internal fixed)**: Removed `exclude` from schema (`openclaw.plugin.json` + `index.ts` TypeBox), types, and config return. `OpenRouterClient` always sends `reasoning.exclude=true` to prevent CoT token leakage. No longer user-configurable. **Breaking**: existing configs with `openrouterConfig.reasoning.exclude` will be rejected by TypeBox validation — remove the field from your config.
+- **`getRetryPhases()` restructured**: Replaced old 12-attempt OpenRouter-primary sequence with Google-first 6/6/3/3. Removed `MAX_RETRIES`, `FALLBACK_RETRIES`, `FALLBACK_HEAD_RETRIES`, `FALLBACK_GEMINI_RETRIES`, `FALLBACK_TAIL_RETRIES` constants in favor of `GEMINI_MAIN_ATTEMPTS`, `GEMMA_MAIN_ATTEMPTS`, `OPENROUTER_MODEL_ATTEMPTS`, `OPENROUTER_FREE_ATTEMPTS`.
+- **Removed `geminiMissingKeyWarned` field**: `GEMINI_API_KEY` is now `required: true` in the schema, making the conditional branch dead code (YAGNI). Replaced with one-time warn in `narrativizeWithGeminiModel()`.
+- **`narrativizeWithRetry()` returns `{ result, totalAttempts }`**: Callers can now observe the total number of attempts consumed across all phases.
+- **Startup log includes `narrativeConfigSource`**: `index.ts` config-loaded log now shows which config source was resolved.
+- **Deprecation warning for `openrouterConfig`**: `loadConfig()` emits `console.warn` when `openrouterConfig` is used without `narrativeConfig`.
+
+### Fixed
+- **Gemini 3/Gemma 4 thinkingLevel fallback**: When `reasoning.effort` is dropped by maxTokens precedence (OpenRouter Rule B), `mapThinkingConfig` now defaults `thinkingLevel="high"` for Gemini 3/Gemma 4 models — ensuring deep thinking with a token cap.
+- **Gemini primary phase language gate routing (CRITICAL)**: `narrativizeWithGeminiModel()` was missing language gate reask/handoff routing and content-gate early bailout — previously Gemini was last-resort (no routing needed), but as primary phase (6/6/3/3) it must mirror `narrativizeWithModel()` logic: `onFail=reask` appends `LANGUAGE_REASK_SUFFIX`, `onFail=handoff` returns null for phase handoff, 3 consecutive content-gate rejects trigger early handoff.
+- **maxTokens=0 guard (CRITICAL)**: Both `GeminiDirectClient` and `OpenRouterClient` now skip sending `maxOutputTokens`/`max_tokens` when value is 0. Previously `maxTokens=0` would be sent as `maxOutputTokens:0` / `max_tokens:0`, causing empty output from the API. `maxTokens=0` is now treated as unset at the client layer (config layer still preserves 0 for observability).
+
+### Tests
+- Updated `test_reasoning.ts`: removed `exclude` assertions, added `testBodyExcludeAlwaysTrue` (verifies `reasoning.exclude=true` always sent), added `testNormalizeExcludeRemoved`.
+- Updated `test_config_pipeline.ts`: added `narrativeConfigSource` to expected keys, added Section 9 with 7 new tests for `narrativeConfig` priority, field flow, source tracking, and reasoning propagation.
+
+### Notes
+- `openrouterConfig` is deprecated but fully functional. Will be removed in a future release.
+- Google model IDs (`gemini-3.1-flash-lite-preview`, `gemma-4-31B-it`) are hardcoded and not user-configurable.
+- See `docs/plans/v0.4.x/v0.4.29c_*.md` for full plan and AC verification.
+
 ## [0.4.29] - 2026-04-25
 
 ### Fixed

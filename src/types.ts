@@ -42,7 +42,26 @@ export interface OpenRouterReasoningConfig {
   enabled?: boolean;
   effort?: OpenRouterReasoningEffort;
   maxTokens?: number;
-  exclude?: boolean;
+  // [v0.4.29c Fix C3] exclude removed from schema — always true internally
+}
+
+/** [v0.4.29c Fix C1] Unified narrative generation configuration.
+ *  Applies to both Google (Gemini/Gemma) and OpenRouter providers.
+ *  Replaces openrouterConfig as the primary config source.
+ */
+export interface NarrativeConfig {
+  /** Model ID for OpenRouter fallback phases (Round 2). Default: 'openrouter/free'. */
+  model?: string;
+  /** Max tokens cap for narrative generation. Omit to use model default. */
+  maxTokens?: number;
+  /** Sampling temperature. Default: 0.4. */
+  temperature?: number;
+  /** HTTP request timeout in ms. Clamped to [30000, 300000]. Default: 30000. */
+  timeoutMs?: number;
+  /** Transport-level retries after transient failure. Clamped to [0, 5]. Default: 3. */
+  maxRetries?: number;
+  /** Reasoning/thinking control. Maps to OpenRouter reasoning and Google thinkingConfig. */
+  reasoning?: OpenRouterReasoningConfig;
 }
 
 export interface EpisodicPluginConfig {
@@ -141,8 +160,10 @@ export interface EpisodicPluginConfig {
     enabled: boolean;
     effort?: string;
     maxTokens?: number;
-    exclude?: boolean;
+    // [v0.4.29c Fix C3] exclude always true — no longer configurable
   };
+  /** [v0.4.29c Fix C1] Source of narrative config — for observability logging. */
+  narrativeConfigSource?: "narrativeConfig" | "openrouterConfig" | "flat" | "default";
   // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
   /** Expected output language for narrative generation. When set, the language guard
    *  checks that generated narratives match this language. Leave unset to disable (auto). */

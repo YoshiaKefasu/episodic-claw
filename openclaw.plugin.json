@@ -158,15 +158,15 @@
         "description": "OpenRouter API key for narrative episode generation. Falls back to OPENROUTER_API_KEY env var. Leave empty to disable narrative mode.",
         "secret": true
       },
-      "openrouterConfig": {
+      "narrativeConfig": {
         "type": "object",
-        "description": "Configuration for the OpenRouter narrative generation model. Nested fields take precedence over flat equivalents.",
+        "description": "[v0.4.29c] Unified narrative generation configuration. Applies to both Google (Gemini/Gemma) and OpenRouter providers. Takes precedence over openrouterConfig (deprecated) and flat equivalents.",
         "additionalProperties": false,
         "properties": {
           "model": {
             "type": "string",
             "default": "openrouter/free",
-            "description": "OpenRouter model ID. Default: 'openrouter/free'. Example: 'qwen/qwen3-235b-a22b:free', 'deepseek/deepseek-chat-v3-0324:free'."
+            "description": "Model ID for OpenRouter fallback phases (Round 2). Default: 'openrouter/free'. Example: 'qwen/qwen3-235b-a22b:free', 'deepseek/deepseek-chat-v3-0324:free'. Google models (Gemini/Gemma) are configured automatically and cannot be overridden here."
           },
           "maxTokens": {
             "type": "integer",
@@ -197,7 +197,7 @@
           },
           "reasoning": {
             "type": "object",
-            "description": "OpenRouter reasoning/thinking control for narrative generation. Default: enabled=true, effort=high (output quality prioritized). Adjust to low/medium/none if latency or token cost is a concern.",
+            "description": "Reasoning/thinking control for narrative generation. Maps to OpenRouter reasoning params and Google thinkingConfig (thinkingLevel/thinkingBudget). Default: enabled=true, effort=high.",
             "additionalProperties": false,
             "properties": {
               "enabled": {
@@ -215,11 +215,62 @@
                 "type": "integer",
                 "minimum": 1,
                 "description": "Optional. Max reasoning tokens cap. When set alongside effort, maxTokens takes precedence and effort is dropped."
-              },
-              "exclude": {
+              }
+            }
+          }
+        }
+      },
+      "openrouterConfig": {
+        "type": "object",
+        "description": "[DEPRECATED v0.4.29c] Use narrativeConfig instead. This key is retained for backward compatibility only and will be removed in a future release. Nested fields take precedence over flat equivalents.",
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Deprecated: use narrativeConfig.model instead."
+          },
+          "maxTokens": {
+            "type": "integer",
+            "minimum": 256,
+            "maximum": 32768,
+            "description": "Deprecated: use narrativeConfig.maxTokens instead."
+          },
+          "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Deprecated: use narrativeConfig.temperature instead."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 30000,
+            "maximum": 300000,
+            "description": "Deprecated: use narrativeConfig.timeoutMs instead."
+          },
+          "maxRetries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5,
+            "description": "Deprecated: use narrativeConfig.maxRetries instead."
+          },
+          "reasoning": {
+            "type": "object",
+            "description": "Deprecated: use narrativeConfig.reasoning instead.",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
                 "type": "boolean",
-                "default": true,
-                "description": "When true, sends reasoning.exclude=true to request the model to exclude reasoning output from the response. Default: true."
+                "description": "Deprecated: use narrativeConfig.reasoning.enabled instead."
+              },
+              "effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "description": "Deprecated: use narrativeConfig.reasoning.effort instead."
+              },
+              "maxTokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Deprecated: use narrativeConfig.reasoning.maxTokens instead."
               }
             }
           }

@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadConfig, normalizeOpenRouterReasoning } from "./src/config";
+import { loadConfig, normalizeOpenRouterReasoning, _resetWarnedOpenrouterDeprecatedForTest } from "./src/config";
 import type { EpisodicPluginConfig } from "./src/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -108,6 +108,8 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "narrativeGuardMinSentences",
     "narrativeGuardMinCjkChars",
     "narrativeGuardMinLatinWords",
+    // [v0.4.29c Fix C1] narrativeConfigSource for observability
+    "narrativeConfigSource",
   ];
 
   const missingKeys: string[] = [];
@@ -171,6 +173,8 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "narrativeGuardMinSentences",
     "narrativeGuardMinCjkChars",
     "narrativeGuardMinLatinWords",
+    // [v0.4.29c Fix C1] narrativeConfigSource for observability
+    "narrativeConfigSource",
   ]);
 
   const extraKeys: string[] = [];
@@ -279,8 +283,10 @@ test("recallReInjectionCooldownTurns default is 24 (not 10 — loadConfig has pr
 
 console.log("\n=== 4. Edge Cases ===\n");
 
-test("openrouterConfig.maxTokens: 0 passes through as 0 (not undefined)", () => {
-  // Note: openrouterMaxTokens has no ?? fallback, so 0 should pass through
+test("openrouterConfig.maxTokens: 0 passes through as 0 (not undefined) — but clients skip maxTokens=0 as invalid", () => {
+  // Note: loadConfig() preserves 0 (no ?? fallback), but both OpenRouterClient
+  // and GeminiDirectClient now skip sending maxTokens=0 to their APIs (would produce empty output).
+  // This is a two-layer guard: config layer preserves, client layer validates.
   const cfg = loadConfig({ openrouterConfig: { maxTokens: 0 } });
   assert.equal(cfg.openrouterMaxTokens, 0);
 });
@@ -801,6 +807,93 @@ test("REGRESSION [v0.4.28f]: openrouterTimeoutMs is not silently dropped by load
 test("REGRESSION [v0.4.28f]: openrouterMaxRetries is not silently dropped by loadConfig", () => {
   const cfg = loadConfig({ openrouterConfig: { maxRetries: 1 } });
   assert.equal(cfg.openrouterMaxRetries, 1, "user's maxRetries=1 should be preserved");
+});
+
+// ─── 9. v0.4.29c narrativeConfig Priority Tests ──────────────────────────
+
+console.log("\n=== 9. v0.4.29c narrativeConfig Priority Tests ===\n");
+
+test("narrativeConfig.model → openrouterModel (takes precedence over openrouterConfig)", () => {
+  const cfg = loadConfig({ narrativeConfig: { model: "nc-model" }, openrouterConfig: { model: "oc-model" } });
+  assert.equal(cfg.openrouterModel, "nc-model", "narrativeConfig should take precedence over openrouterConfig");
+});
+
+test("narrativeConfig fields flow to flat outputs", () => {
+  const cfg = loadConfig({
+    narrativeConfig: {
+      model: "nc-test-model",
+      maxTokens: 4096,
+      temperature: 0.7,
+      timeoutMs: 180000,
+      maxRetries: 1,
+    },
+  });
+  assert.equal(cfg.openrouterModel, "nc-test-model", "narrativeConfig.model → openrouterModel");
+  assert.equal(cfg.openrouterMaxTokens, 4096, "narrativeConfig.maxTokens → openrouterMaxTokens");
+  assert.equal(cfg.narrativeTemperature, 0.7, "narrativeConfig.temperature → narrativeTemperature");
+  assert.equal(cfg.openrouterTimeoutMs, 180000, "narrativeConfig.timeoutMs → openrouterTimeoutMs");
+  assert.equal(cfg.openrouterMaxRetries, 1, "narrativeConfig.maxRetries → openrouterMaxRetries");
+});
+
+test("narrativeConfigSource is 'narrativeConfig' when narrativeConfig is used", () => {
+  const cfg = loadConfig({ narrativeConfig: { model: "test" } });
+  assert.equal(cfg.narrativeConfigSource, "narrativeConfig");
+});
+
+test("narrativeConfigSource is 'openrouterConfig' when only openrouterConfig is used", () => {
+  const cfg = loadConfig({ openrouterConfig: { model: "test" } });
+  assert.equal(cfg.narrativeConfigSource, "openrouterConfig");
+});
+
+test("narrativeConfigSource is 'flat' when flat fields are used", () => {
+  const cfg = loadConfig({ openrouterModel: "test" });
+  assert.equal(cfg.narrativeConfigSource, "flat");
+});
+
+test("narrativeConfigSource is 'default' when nothing is user-configured", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeConfigSource, "default");
+});
+
+test("narrativeConfig.reasoning flows to openrouterReasoning", () => {
+  const cfg = loadConfig({ narrativeConfig: { reasoning: { enabled: true, effort: "low" } } });
+  assert.ok(cfg.openrouterReasoning, "narrativeConfig.reasoning → openrouterReasoning");
+  assert.equal(cfg.openrouterReasoning!.effort, "low");
+});
+
+// ─── 10. v0.4.29d openrouterConfig Deprecation Warning Tests ─────────────
+
+console.log("\n=== 10. v0.4.29d Deprecation Warning Tests ===\n");
+
+test("openrouterConfig deprecation warning fires only once per process", () => {
+  // Reset the flag so the test works regardless of previous tests
+  _resetWarnedOpenrouterDeprecatedForTest();
+
+  const originalWarn = console.warn;
+  let warnCount = 0;
+  let lastMessage = "";
+  console.warn = (msg: string) => {
+    warnCount++;
+    lastMessage = msg;
+  };
+
+  try {
+    // 1st call - should warn
+    loadConfig({ openrouterConfig: { model: "test1" } });
+    assert.equal(warnCount, 1, "First call should emit exactly 1 warning");
+    assert.ok(lastMessage.includes("using openrouterConfig fallback"), "Warning message should include transition guidance");
+
+    // 2nd call - should not warn again
+    loadConfig({ openrouterConfig: { model: "test2" } });
+    assert.equal(warnCount, 1, "Second call should NOT emit a warning (warnCount remains 1)");
+
+    // 3rd call - should not warn again
+    loadConfig({ openrouterConfig: { model: "test3" } });
+    assert.equal(warnCount, 1, "Third call should NOT emit a warning");
+  } finally {
+    // Restore console.warn
+    console.warn = originalWarn;
+  }
 });
 
 // ─── Summary ────────────────────────────────────────────────

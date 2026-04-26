@@ -47,12 +47,13 @@ ${conversationText}
 
 Write narrative text only.`;
 
-const MAX_RETRIES = 12;
-const FALLBACK_RETRIES = 3;
-const FALLBACK_HEAD_RETRIES = 1;
-const FALLBACK_GEMINI_RETRIES = 2;
-const FALLBACK_TAIL_RETRIES = 2;
+// [v0.4.29c Fix C5] Phase attempt counts — Google-first 6/6/3/3
 const GEMINI_DIRECT_MODEL = "gemini-3.1-flash-lite-preview";
+const GEMMA_DIRECT_MODEL = "gemma-4-31B-it";
+const GEMINI_MAIN_ATTEMPTS = 6;
+const GEMMA_MAIN_ATTEMPTS = 6;
+const OPENROUTER_MODEL_ATTEMPTS = 3;
+const OPENROUTER_FREE_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 3000;
 const MAX_RETRY_DELAY_MS = 600_000; // 10min cap
 const SAVE_HASH_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -425,7 +426,7 @@ export class NarrativeWorker {
   private readonly SAVE_HASH_PERSIST_INTERVAL = 5; // persist every 5th save
   private geminiClient: GeminiDirectClient | null = null;
   private geminiClientKey = "";
-  private geminiMissingKeyWarned = false;
+  // [v0.4.29c Fix C5] Removed geminiMissingKeyWarned — GEMINI_API_KEY is required=true (YAGNI)
 
   constructor(
     private client: OpenRouterClient,
@@ -523,7 +524,7 @@ export class NarrativeWorker {
         );
 
         try {
-          const result = await this.narrativizeWithRetry(item);
+          const { result, totalAttempts } = await this.narrativizeWithRetry(item);
           if (result) {
             await this.saveNarrative(result, item);
             await this.rpcClient.cacheAck(item.id, "narrative-worker");
@@ -533,8 +534,9 @@ export class NarrativeWorker {
             // Fallback summary would pollute: context (lastNarrativeByAgent), vector store, and UX
             // rawText is preserved in PebbleDB (Ack deleteAfter=false) for manual requeue later
             await this.rpcClient.cacheRetry(item.id, "narrative-worker", "Quality gate exhausted: all retries failed", MAX_CACHE_ATTEMPTS);
+            // [v0.4.29c QW-5] Use dynamically computed totalAttempts instead of hardcoded MAX_RETRIES
             console.warn(
-              `[NarrativeWorker] Quality gate: all ${MAX_RETRIES} LLM attempts exhausted for [${item.id}]. Re-queued for later retry (${item.attempts}/${MAX_CACHE_ATTEMPTS}).`
+              `[NarrativeWorker] Quality gate: all ${totalAttempts} LLM attempts exhausted for [${item.id}]. Re-queued for later retry (${item.attempts}/${MAX_CACHE_ATTEMPTS}).`
             );
           }
         } catch (err) {
@@ -556,7 +558,8 @@ export class NarrativeWorker {
     }
   }
 
-  private async narrativizeWithRetry(item: CacheItem): Promise<NarrativeResult | null> {
+  /** [v0.4.29c QW-2] Extended return type to include totalAttempts for dynamic logging */
+  private async narrativizeWithRetry(item: CacheItem): Promise<{ result: NarrativeResult | null; totalAttempts: number }> {
     if (item.rawText.trim().length === 0) {
       console.warn(
         `[NarrativeWorker] Skipping LLM call for [${item.id}] agent=${item.agentId} source=${item.source} reason=empty_raw_text`
@@ -565,6 +568,8 @@ export class NarrativeWorker {
     }
 
     const phases = this.getRetryPhases();
+    // [v0.4.29c QW-5] Compute total attempts dynamically from phase configuration
+    const totalAttempts = phases.reduce((sum, p) => sum + p.maxAttempts, 0);
 
     for (let phaseIndex = 0; phaseIndex < phases.length; phaseIndex++) {
       const phase = phases[phaseIndex];
@@ -584,7 +589,7 @@ export class NarrativeWorker {
       const result = phase.provider === "gemini-direct"
         ? await this.narrativizeWithGeminiModel(item, phase.model, phase.maxAttempts, phase.label, phase.contentGateEnabled)
         : await this.narrativizeWithModel(item, phase.model, phase.maxAttempts, phase.label, phase.contentGateEnabled);
-      if (result) return result;
+      if (result) return { result, totalAttempts };
 
       if (phaseIndex < phases.length - 1) {
         console.warn(
@@ -593,70 +598,55 @@ export class NarrativeWorker {
       }
     }
 
-    return null;
+    return { result: null, totalAttempts };
   }
 
   /**
-   * [v0.4.19d] Determine retry model sequence.
-   * [v0.4.27b] Content gate enabled only when fallback phase exists (prevents item-loss regression).
-   * - If primary model is "openrouter/free" (default):
-   *   - With GEMINI_API_KEY: primary (content gate) → gemini-direct (no content gate)
-   *   - Without GEMINI_API_KEY: primary only, content gate disabled (preserve current behavior)
-   * - If primary model is custom: primary + openrouter/free fallback + gemini-direct (if available)
+   * [v0.4.29c Fix C5] Determine retry model sequence — Google-first, OpenRouter final fallback.
+   * Phase order: Gemini(6) → Gemma(6) → OpenRouter model(3) → openrouter/free(3)
+   * GEMINI_API_KEY is required=true in plugin manifest — no key-missing branch needed (YAGNI).
+   * Content gate enabled only when a subsequent fallback phase exists (prevents item-loss regression).
    */
   private getRetryPhases(): RetryPhase[] {
-    const primary = this.config.openrouterModel ?? "openrouter/free";
+    const customModel = this.config.openrouterModel; // Will become narrativeConfig.model after Fix C2
     const fallback = "openrouter/free";
-    const hasGeminiApiKey = !!process.env.GEMINI_API_KEY;
+    const round2Model = customModel || fallback; // AC-2: unset → openrouter/free
 
-    if (primary === fallback) {
-      // [v0.4.27b] Default: openrouter/free with optional Gemini fallback
-      // Content gate ONLY enabled when there's a Gemini fallback — otherwise
-      // content-gate rejects would cause item loss (worse than current behavior)
-      const phases: RetryPhase[] = [
-        { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary",
-          contentGateEnabled: hasGeminiApiKey },
-      ];
-      if (hasGeminiApiKey) {
-        phases.push({
-          provider: "gemini-direct",
-          model: GEMINI_DIRECT_MODEL,
-          maxAttempts: FALLBACK_GEMINI_RETRIES,
-          label: "fallback-gemini-content",
-          handoffReason: "fallback_2_of_3",
-          // Gemini is last-resort — no content gate to prevent item loss
-        });
-      }
-      return phases;
-    }
-
-    // Custom primary model: multiple fallback phases
-    const phases: RetryPhase[] = [
-      { provider: "openrouter", model: primary, maxAttempts: MAX_RETRIES, label: "primary",
-        contentGateEnabled: true }, // Has fallback phases
-      { provider: "openrouter", model: fallback, maxAttempts: FALLBACK_HEAD_RETRIES, label: "fallback-openrouter-head",
-        contentGateEnabled: true }, // Has more fallback phases
-    ];
-
-    if (hasGeminiApiKey) {
-      phases.push({
+    return [
+      // Round 1 (Main): Google models — 12 attempts total
+      {
         provider: "gemini-direct",
         model: GEMINI_DIRECT_MODEL,
-        maxAttempts: FALLBACK_GEMINI_RETRIES,
-        label: "fallback-gemini-direct",
+        maxAttempts: GEMINI_MAIN_ATTEMPTS,
+        label: "gemini-main",
+        contentGateEnabled: true, // Has fallback phases
+      },
+      {
+        provider: "gemini-direct",
+        model: GEMMA_DIRECT_MODEL,
+        maxAttempts: GEMMA_MAIN_ATTEMPTS,
+        label: "gemma-main",
         handoffReason: "fallback_2_of_3",
-        // Gemini is last-resort — no content gate to prevent item loss
-      });
-      phases.push({ provider: "openrouter", model: fallback, maxAttempts: FALLBACK_TAIL_RETRIES, label: "fallback-openrouter-tail" });
-      return phases;
-    }
-
-    if (!this.geminiMissingKeyWarned) {
-      this.geminiMissingKeyWarned = true;
-      console.warn("[NarrativeWorker] GEMINI_API_KEY missing. Gemini direct handoff disabled; using OpenRouter fallback only.");
-    }
-    phases.push({ provider: "openrouter", model: fallback, maxAttempts: FALLBACK_RETRIES - FALLBACK_HEAD_RETRIES, label: "fallback" });
-    return phases;
+        contentGateEnabled: true, // Has fallback phases
+      },
+      // Round 2 (Fallback): OpenRouter custom or free — 3 attempts
+      {
+        provider: "openrouter",
+        model: round2Model,
+        maxAttempts: OPENROUTER_MODEL_ATTEMPTS,
+        label: customModel ? "openrouter-model" : "openrouter-free-head",
+        handoffReason: "fallback_2_of_3",
+        contentGateEnabled: true, // Has more fallback
+      },
+      // Round 3 (Final Fallback): openrouter/free — 3 attempts
+      // Last resort — no content gate to prevent item loss
+      {
+        provider: "openrouter",
+        model: fallback,
+        maxAttempts: OPENROUTER_FREE_ATTEMPTS,
+        label: "openrouter-free",
+      },
+    ];
   }
 
   private getGeminiClient(): GeminiDirectClient | null {
@@ -667,7 +657,11 @@ export class NarrativeWorker {
       return this.geminiClient;
     }
 
-    this.geminiClient = new GeminiDirectClient(apiKey, 30_000);
+    // [v0.4.29c QW-1] Pass temperature/maxTokens from config to GeminiDirectClient
+    const temperature = this.config.narrativeTemperature ?? 0.4;
+    const maxTokens = this.config.openrouterMaxTokens;
+    const timeoutMs = this.config.openrouterTimeoutMs ?? 30_000;
+    this.geminiClient = new GeminiDirectClient(apiKey, timeoutMs, { temperature, maxTokens });
     this.geminiClientKey = apiKey;
     return this.geminiClient;
   }
@@ -1051,6 +1045,74 @@ export class NarrativeWorker {
     return null;
   }
 
+  /** [v0.4.29c] Map reasoning.effort → thinkingLevel, reasoning.maxTokens → thinkingBudget
+   *  for Google API models. Gemini 3/Gemma 4: thinkingLevel only (thinkingBudget deprecated).
+   *  Gemini 2.5: both thinkingLevel and thinkingBudget.
+   *  xhigh effort maps to high (Gemini has no xhigh level).
+   *  "none" effort → minimal for Gemini 3/Gemma 4 (closest to off), thinkingBudget=0 for Gemini 2.5.
+   */
+  private mapThinkingConfig(model: string, label: string): { thinkingLevel?: string; thinkingBudget?: number } {
+    const reasoning = this.config.openrouterReasoning;
+    if (!reasoning || !reasoning.enabled) return {};
+
+    const isGemini25 = model.includes("2.5");
+    // [v0.4.29c] When effort is undefined (dropped by normalizeOpenRouterReasoning Rule B
+    // because maxTokens takes precedence for OpenRouter), Gemini 3/Gemma 4 still needs
+    // a thinkingLevel. Default to "high" — user set a token cap, so they want deep thinking with a limit.
+    let thinkingLevel = this.effortToThinkingLevel(reasoning.effort, isGemini25);
+    if (!thinkingLevel && !isGemini25 && reasoning.maxTokens) {
+      thinkingLevel = "high";
+      console.warn(
+        `[NarrativeWorker] Phase "${label}": reasoning.effort dropped by maxTokens precedence. ` +
+        `Defaulting thinkingLevel="high" for Gemini 3/Gemma 4 model=${model}`
+      );
+    }
+    const result: { thinkingLevel?: string; thinkingBudget?: number } = {};
+
+    if (thinkingLevel) {
+      result.thinkingLevel = thinkingLevel;
+    }
+    // Gemini 2.5 only: also send thinkingBudget from reasoning.maxTokens
+    // When effort=none, send thinkingBudget=0 to fully disable thinking
+    if (isGemini25 && reasoning.effort === "none") {
+      result.thinkingBudget = 0;
+    } else if (isGemini25 && reasoning.maxTokens) {
+      result.thinkingBudget = reasoning.maxTokens;
+    }
+    // [v0.4.29c] Observability: log the mapping for production debugging
+    // Skip if fallback warn was already emitted (avoid redundant double-log)
+    const fallbackWarned = !this.effortToThinkingLevel(reasoning.effort, isGemini25) && !isGemini25 && reasoning.maxTokens;
+    if (Object.keys(result).length > 0 && !fallbackWarned) {
+      console.log(
+        `[NarrativeWorker] Phase "${label}": mapped reasoning.effort="${reasoning.effort ?? "(unset)"}" → ` +
+        `thinkingLevel=${result.thinkingLevel ?? "(unset)"}, thinkingBudget=${result.thinkingBudget ?? "(unset)"} for model=${model}`
+      );
+    }
+    return result;
+  }
+
+  /** [v0.4.29c] Map OpenRouter effort level to Gemini thinkingLevel.
+   *  xhigh → high (Gemini has no xhigh).
+   *  none → minimal for Gemini 3/Gemma 4 (closest to off; true off not supported),
+   *         undefined for Gemini 2.5 (thinkingBudget=0 handles full disable).
+   *  minimal/low/medium/high pass through directly.
+   */
+  private effortToThinkingLevel(effort?: string, isGemini25?: boolean): string | undefined {
+    if (!effort) return undefined;
+    if (effort === "none") {
+      // Gemini 2.5: thinkingBudget=0 fully disables thinking; no thinkingLevel needed
+      // Gemini 3/Gemma 4: no true off; "minimal" is closest to no-thinking
+      return isGemini25 ? undefined : "minimal";
+    }
+    if (effort === "xhigh") return "high";
+    // minimal/low/medium/high pass through directly
+    if (["minimal", "low", "medium", "high"].includes(effort)) return effort;
+    return undefined;
+  }
+
+  // [v0.4.29c Fix C5] One-time warn when Gemini client is unavailable (replaces removed geminiMissingKeyWarned)
+  private geminiClientUnavailableWarned = false;
+
   private async narrativizeWithGeminiModel(
     item: CacheItem,
     model: string,
@@ -1060,6 +1122,15 @@ export class NarrativeWorker {
   ): Promise<NarrativeResult | null> {
     const geminiClient = this.getGeminiClient();
     if (!geminiClient) {
+      // [v0.4.29c] Observability: one-time warn instead of silent null return
+      if (!this.geminiClientUnavailableWarned) {
+        this.geminiClientUnavailableWarned = true;
+        console.warn(
+          `[NarrativeWorker] Gemini client unavailable — GEMINI_API_KEY missing or empty. ` +
+          `Google phases (gemini-main, gemma-main) will be skipped. ` +
+          `Falling through to OpenRouter fallback phases.`
+        );
+      }
       return null;
     }
 
@@ -1069,30 +1140,98 @@ export class NarrativeWorker {
       : undefined;
     const conversationText = item.rawText;
     const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
+    // [v0.4.29c Fix C4] Map reasoning config to Gemini thinkingConfig
+    const thinkingOpts = this.mapThinkingConfig(model, label);
+    // [v0.4.29c BUG-FIX] Gemini is now primary — add language gate routing + content gate early bailout
+    // Previously Gemini was last-resort (no reask/handoff needed). Now it's primary (6/6/3/3), so:
+    // - reask: append language hint and retry with same model
+    // - handoff: return null → phase handoff to next model
+    // - content-gate early bailout: 3 consecutive content rejects → handoff (same as OpenRouter)
+    let contentRejectCount = 0;
+    let languageReaskCount = 0;
+    let currentUserMessage = userMessage;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const rawText = await geminiClient.generateNarrative(
-          { systemPrompt, userMessage },
-          { modelOverride: model },
+          { systemPrompt, userMessage: currentUserMessage },
+          { modelOverride: model, ...thinkingOpts },
         );
         const text = sanitizeNarrativeOutput(rawText);
         const gateResult = await this.applyQualityGates(text, item, label, attempt, maxAttempts, conversationText, contentGateEnabled);
         if (!gateResult.pass) {
-          // [v0.4.28c] Defensive: Gemini phases have contentGateEnabled=false, so G0
-          // softwarn-fallbacks and never returns isLanguageGate=true. But if a user
-          // configures Gemini with content gates, log a warning instead of silently continuing.
+          // [v0.4.29c BUG-FIX] Language gate routing — mirrors narrativizeWithModel() logic
           if (gateResult.isLanguageGate) {
-            console.warn(
-              `[NarrativeWorker] ${label}: language-mismatch in Gemini phase for [${item.id}]. ` +
-              `Gemini is last-resort — no reask/handoff routing. Continuing normal retry.`
-            );
+            const onFail = this.config.narrativeLanguageOnFail ?? "softwarn";
+            const expectedLang = this.config.narrativeExpectedLanguage;
+
+            if (onFail === "handoff") {
+              console.log(JSON.stringify({
+                source: "episodic-claw",
+                event: "narrative-phase-handoff",
+                phaseHandoffReason: "language_mismatch",
+                provider: "gemini-direct",
+                geminiModel: model,
+                itemId: item.id,
+              }));
+              console.warn(
+                `[NarrativeWorker] ${label}: language-mismatch handoff for [${item.id}]. ` +
+                `Forcing early handoff to next phase (attempt ${attempt + 1}/${maxAttempts}).`
+              );
+              return null; // triggers phase handoff in narrativizeWithRetry
+            }
+
+            if (onFail === "reask") {
+              if (languageReaskCount < LANGUAGE_REASK_MAX && contentGateEnabled && attempt + 1 < maxAttempts) {
+                languageReaskCount++;
+                if (expectedLang && !currentUserMessage.includes(LANGUAGE_REASK_SUFFIX(expectedLang))) {
+                  currentUserMessage = currentUserMessage + LANGUAGE_REASK_SUFFIX(expectedLang);
+                }
+                console.warn(
+                  `[NarrativeWorker] ${label}: language-mismatch reask for [${item.id}]. ` +
+                  `Appending language hint, retrying (attempt ${attempt + 1}/${maxAttempts}, reask ${languageReaskCount}/${LANGUAGE_REASK_MAX}).`
+                );
+                await this.sleep(500);
+                continue; // retry with modified prompt
+              } else {
+                const reason = languageReaskCount >= LANGUAGE_REASK_MAX ? "reask limit reached"
+                  : !contentGateEnabled ? "no fallback phase (defensive)" : "no remaining attempts";
+                console.log(JSON.stringify({
+                  source: "episodic-claw",
+                  event: "narrative-phase-handoff",
+                  phaseHandoffReason: "language_reask_exhausted",
+                  detail: reason,
+                  provider: "gemini-direct",
+                  geminiModel: model,
+                  reaskCount: languageReaskCount,
+                  itemId: item.id,
+                }));
+                console.warn(
+                  `[NarrativeWorker] ${label}: language-mismatch reask exhausted for [${item.id}]. ` +
+                  `Escalating to handoff (${reason}, attempt ${attempt + 1}/${maxAttempts}, reaskCount=${languageReaskCount}/${LANGUAGE_REASK_MAX}, contentGateEnabled=${contentGateEnabled}).`
+                );
+                return null; // triggers phase handoff
+              }
+            }
+
+            // onFail=softwarn — unreachable (applyQualityGates never returns isLanguageGate:true for softwarn)
+            // but included defensively in case G0 logic changes. Same as narrativizeWithModel().
+            continue;
+          }
+
+          // [v0.4.29c BUG-FIX] Content gate early bailout — same as narrativizeWithModel()
+          if (gateResult.isContentGate) {
+            contentRejectCount++;
+            if (contentRejectCount >= CONTENT_GATE_REJECTS_BEFORE_FALLBACK) {
+              console.warn(
+                `[NarrativeWorker] ${label}: ${contentRejectCount} content-gate rejects for [${item.id}]. ` +
+                `Forcing early handoff to next phase (attempt ${attempt + 1}/${maxAttempts}).`
+              );
+              return null; // triggers phase handoff in narrativizeWithRetry
+            }
           }
           continue;
         }
-        // [v0.4.27b] Note: no content-gate early bailout here because Gemini phases
-        // have contentGateEnabled=false (last-resort, must save something). If that
-        // changes, add contentRejectCount tracking same as narrativizeWithModel.
 
         return {
           text,

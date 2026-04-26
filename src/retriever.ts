@@ -67,6 +67,27 @@ const ATTACHMENT_BOILERPLATE: RegExp[] = [
   /MEDIA:[^\s]+/gi,
 ];
 
+/**
+ * Returns true if `text` contains any media scaffold marker that should trigger
+ * caption rescue logic in normalizePromptAnchor().
+ *
+ * Covers all formats in ATTACHMENT_BOILERPLATE that are not caught by MEDIA_ONLY_SENTINEL
+ * alone (i.e., cases where isDominant=false because a valid caption exists alongside):
+ *   [media attached: ...]  <media:image>  media://inbound/<id>
+ *   bare "media:image"     MEDIA:<url>    (image/jpeg) MIME annotations
+ *
+ * NOTE: Keep this in sync with ATTACHMENT_BOILERPLATE when adding new patterns.
+ * [v0.4.29b] BS-29A-4 DRY unification + BS-29A-2 MIME annotation fix
+ */
+export function hasMediaScaffold(text: string): boolean {
+  return /\[media attached/i.test(text)
+    || /media:\/\/inbound/i.test(text)
+    || /<media:(image|document|audio|video)>/i.test(text)
+    || /^media:(image|document|audio|video)\s*$/im.test(text)  // bare Gateway WebUI format
+    || /MEDIA:[^\s]+/i.test(text)                              // BS-29B-8: removed ^ anchor, matches ATTACHMENT_BOILERPLATE
+    || /\(image\/\w+\)/i.test(text);                          // BS-29A-2: MIME annotations
+}
+
 // Patterns that indicate a message is attachment-dominant (no real user text)
 const ATTACHMENT_INDICATORS: RegExp[] = [
   // File extensions appearing as standalone tokens (no CJK context around them)

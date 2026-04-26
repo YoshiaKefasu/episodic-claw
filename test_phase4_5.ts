@@ -293,6 +293,8 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
     },
   };
 
+  const savedGeminiKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
   try {
     const pluginModule = require(path.join(runtimeDist, "index.js"));
     const plugin = pluginModule.default ?? pluginModule;
@@ -355,6 +357,7 @@ module.exports = { EpisodicCoreClient, FileEventDebouncer };
     process.argv.length = 0;
     process.argv.push(...previousArgv);
     delete (globalThis as any)[singletonKey];
+    if (savedGeminiKey !== undefined) process.env.GEMINI_API_KEY = savedGeminiKey; else delete process.env.GEMINI_API_KEY;
   }
 }
 
@@ -1434,6 +1437,8 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
   };
 
   const mockRpcClient = {
+    // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+    getNarrativeSaveHashes: async () => ({}),
     cacheLeaseNext: async (_workerId: string, _agentId: string, _leaseSec: number) => {
       leaseNextCallCount++;
       // Return a lease-success item on first call, then null (simulating queue drain)
@@ -1801,6 +1806,8 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
   let capturedAgentWs: string = "";
   let capturedSavedBy: string = "";
   const mockRpcClient = {
+    // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+    getNarrativeSaveHashes: async () => ({}),
     batchIngest: async (items: any[], agentWs: string, savedBy: string) => {
       capturedItems = items;
       capturedSurprise = items[0]?.surprise;
@@ -2026,6 +2033,8 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
     };
 
     const mockRpcClient = {
+      // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+      getNarrativeSaveHashes: async () => ({}),
       cacheLeaseNext: async () => {
         if (leaseCount > 0) return null;
         leaseCount++;
@@ -2070,6 +2079,8 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
     }
   };
 
+  const savedGeminiKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
   try {
     await runCase("", true);
     await runCase("   ", true);
@@ -2078,6 +2089,7 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
     await runCase("ユーザーがシステムの調子を尋ね、応答としてログの確認と解析結果を報告した。その後、修正コードを適用し動作確認を実施した。", false);
   } finally {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    if (savedGeminiKey !== undefined) process.env.GEMINI_API_KEY = savedGeminiKey; else delete process.env.GEMINI_API_KEY;
   }
 
   console.log("  empty rawText guard regression: empty/blank skip LLM and retry; normal text keeps success path");
@@ -2093,6 +2105,9 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
  */
 async function runLanguageGuardReaskHandoffRegression(): Promise<void> {
   const workerSource = fs.readFileSync(path.resolve("src", "narrative-worker.ts"), "utf8");
+  const savedGeminiKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  try {
 
   // ── Source verification (structural) ──────────────────────────────
   // 4a. QualityGateResult has isLanguageGate field
@@ -2134,14 +2149,12 @@ async function runLanguageGuardReaskHandoffRegression(): Promise<void> {
     workerSource.includes("gateResult.isLanguageGate"),
     "narrativizeWithModel should check gateResult.isLanguageGate"
   );
-  // 4h. Gemini defensive check for isLanguageGate
-  // The check is: gateResult.isLanguageGate branch inside narrativizeWithGeminiModel(),
-  // which logs "language-mismatch in Gemini phase" — that string proves the defensive routing.
+  // 4h. Gemini path has dedicated language-gate routing (v0.4.29c)
   assert.ok(
-    workerSource.includes("language-mismatch in Gemini phase"),
-    "Gemini path should have defensive isLanguageGate handling (language-mismatch in Gemini phase)"
+    workerSource.includes("[v0.4.29c BUG-FIX] Language gate routing") || workerSource.includes("language-mismatch in Gemini phase"),
+    "Gemini path should have dedicated language-gate handling (v0.4.29c BUG-FIX comment or legacy defensive log marker)"
   );
-  console.log("  language guard source verification: isLanguageGate, constants, routing, Gemini defensive — all present");
+  console.log("  language guard source verification: isLanguageGate, constants, routing, Gemini path — all present");
 
   // ── Integration test: onFail=reask ──────────────────────────────
   {
@@ -2188,6 +2201,8 @@ function detectLanguageDetailed(_text) { return { lang: "en", confidence: 0.95, 
     };
 
     const mockRpcClient = {
+      // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+      getNarrativeSaveHashes: async () => ({}),
       cacheLeaseNext: async () => {
         if (leaseCount > 0) return null;
         leaseCount++;
@@ -2288,6 +2303,8 @@ function detectLanguageDetailed(_text) { return { lang: "en", confidence: 0.95, 
     };
 
     const mockRpcClient = {
+      // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+      getNarrativeSaveHashes: async () => ({}),
       cacheLeaseNext: async () => {
         if (leaseCount > 0) return null;
         leaseCount++;
@@ -2390,6 +2407,8 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
     };
 
     const mockRpcClient = {
+      // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+      getNarrativeSaveHashes: async () => ({}),
       cacheLeaseNext: async () => {
         if (leaseCount > 0) return null;
         leaseCount++;
@@ -2478,6 +2497,8 @@ module.exports = { detectLanguage: () => "en", detectLanguageDetailed: () => ({ 
     };
 
     const mockRpcClient = {
+      // [v0.4.29c Fix] Mock added to satisfy NarrativeWorker.initContinuity()
+      getNarrativeSaveHashes: async () => ({}),
       cacheLeaseNext: async () => {
         if (ackCount > 0) return null;
         return {
@@ -2508,9 +2529,12 @@ module.exports = { detectLanguage: () => "en", detectLanguageDetailed: () => ({ 
       recallFeedback: async () => ({ updated: 0, skipped: 0 }),
     };
 
-    // Default model path (no openrouterModel) + no GEMINI_API_KEY → contentGateEnabled=false
-    // This triggers G0 softwarn-fallback instead of isLanguageGate routing.
-    const savedGeminiKey = process.env.GEMINI_API_KEY;
+    // Default model path (no openrouterModel) + no GEMINI_API_KEY:
+    // - Google phases are skipped
+    // - Round2 = openrouter-free-head (contentGateEnabled=true)
+    // - Round3 = openrouter-free (contentGateEnabled=false)
+    // So onFail=reask triggers reask in Round2, then hands off to Round3 for final save.
+    const savedGeminiKeySoftwarn = process.env.GEMINI_API_KEY;
     delete process.env.GEMINI_API_KEY;
     try {
       const mockConfig = {
@@ -2524,23 +2548,29 @@ module.exports = { detectLanguage: () => "en", detectLanguageDetailed: () => ({ 
       const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
       await (worker as any).processNextFromCache();
 
-      // Test 4: contentGateEnabled=false + onFail=reask should NOT block save
-      // G0 softwarn-fallbacks → narrative passes all gates → normal save
-      assert.equal(chatCallCount, 1, `contentGateEnabled=false + onFail=reask should call LLM once (softwarn, no reask) (actual: ${chatCallCount})`);
-      assert.equal(ackCount, 1, `contentGateEnabled=false + onFail=reask should save successfully (softwarn fallback) (actual ack: ${ackCount})`);
-      // No reask suffix should be appended — mismatch was softwarn, not reask
+      // Test 4: no custom model + onFail=reask should still save via Round3 fallback
+      // Expected flow (v0.4.29c):
+      //   openrouter-free-head attempt1 mismatch-reask
+      //   openrouter-free-head attempt2 mismatch-reask -> reask exhausted -> handoff
+      //   openrouter-free attempt1 softwarn-fallback -> save
+      assert.equal(chatCallCount, 3, `no-custom-model + onFail=reask should call LLM 3 times (reask + fallback save) (actual: ${chatCallCount})`);
+      assert.equal(ackCount, 1, `no-custom-model + onFail=reask should save successfully via fallback (actual ack: ${ackCount})`);
+      // Reask must append language suffix at least once in Round2
       const hasSuffix = userMessages.some(msg => msg.includes("Japanese language"));
-      assert.ok(!hasSuffix, `contentGateEnabled=false should NOT append reask suffix; got messages: ${JSON.stringify(userMessages)}`);
+      assert.ok(hasSuffix, `reask path should append language suffix before handoff; got messages: ${JSON.stringify(userMessages)}`);
 
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
-      console.log(`  language guard softwarn-fallback: ${chatCallCount} LLM call, ${ackCount} ack, suffix=${hasSuffix} — contentGateEnabled=false does not block save`);
+      console.log(`  language guard no-custom-model reask→fallback: ${chatCallCount} LLM calls, ${ackCount} ack, suffix=${hasSuffix} — handoff path verified`);
     } finally {
       // Restore GEMINI_API_KEY for subsequent tests (even if assertion throws)
-      if (savedGeminiKey) process.env.GEMINI_API_KEY = savedGeminiKey;
+      if (savedGeminiKeySoftwarn !== undefined) process.env.GEMINI_API_KEY = savedGeminiKeySoftwarn; else delete process.env.GEMINI_API_KEY;
     }
   }
 
   console.log("  language guard reask/handoff/unknown/softwarn regression: all 4 integration tests + source verification passed");
+  } finally {
+    if (savedGeminiKey !== undefined) process.env.GEMINI_API_KEY = savedGeminiKey; else delete process.env.GEMINI_API_KEY;
+  }
 
 }
 

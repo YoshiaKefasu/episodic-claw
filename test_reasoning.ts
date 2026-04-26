@@ -55,8 +55,8 @@ function testNormalizeDefaults() {
   assert.equal(result!.enabled, true);
   assert.equal(result!.effort, "high");
   assert.equal(result!.maxTokens, undefined);
-  assert.equal(result!.exclude, true);
-  console.log("  ✓ normalizeOpenRouterReasoning: defaults (enabled=true, effort=high, exclude=true)");
+  // [v0.4.29c Fix C3] exclude removed from return — always true downstream in OpenRouterClient
+  console.log("  ✓ normalizeOpenRouterReasoning: defaults (enabled=true, effort=high, exclude handled downstream)");
 }
 
 function testNormalizeDisabled() {
@@ -92,20 +92,15 @@ function testNormalizeEffortAndMaxTokens() {
   console.log("  ✓ normalizeOpenRouterReasoning: effort+maxTokens => maxTokens only");
 }
 
-function testNormalizeExclude() {
-  const raw: OpenRouterReasoningConfig = { exclude: true };
+// [v0.4.29c Fix C3] exclude removed from normalizeOpenRouterReasoning return type.
+// exclude is always true — handled downstream in OpenRouterClient.doCompletion().
+function testNormalizeExcludeRemoved() {
+  const raw: OpenRouterReasoningConfig = { enabled: true };
   const result = normalizeOpenRouterReasoning(raw);
   assert.ok(result);
-  assert.equal(result!.exclude, true);
-  console.log("  ✓ normalizeOpenRouterReasoning: exclude=true");
-}
-
-function testNormalizeExcludeFalse() {
-  const raw: OpenRouterReasoningConfig = { exclude: false };
-  const result = normalizeOpenRouterReasoning(raw);
-  assert.ok(result);
-  assert.equal(result!.exclude, undefined, "exclude=false should not be included");
-  console.log("  ✓ normalizeOpenRouterReasoning: exclude=false => undefined");
+  // exclude is no longer in the return object — always true downstream
+  assert.equal((result as any).exclude, undefined, "exclude should not be in normalizeOpenRouterReasoning return");
+  console.log("  ✓ normalizeOpenRouterReasoning: exclude removed from return (always true downstream)");
 }
 
 function testNormalizeInvalidMaxTokensZero() {
@@ -144,8 +139,8 @@ function testNormalizeEmptyObject() {
   assert.equal(result!.enabled, true);
   assert.equal(result!.effort, "high", "empty object should default effort to high");
   assert.equal(result!.maxTokens, undefined);
-  assert.equal(result!.exclude, true);
-  console.log("  ✓ normalizeOpenRouterReasoning: empty object => enabled=true, effort=high, exclude=true");
+  // [v0.4.29c Fix C3] exclude no longer in return — always true downstream
+  console.log("  ✓ normalizeOpenRouterReasoning: empty object => enabled=true, effort=high, exclude handled downstream");
 }
 
 function testNormalizeEnabledNoEffort() {
@@ -223,24 +218,14 @@ async function testBodyEffortAndMaxTokensPriority() {
   console.log("  ✓ body: effort+maxTokens => max_tokens only, no effort");
 }
 
-async function testBodyExclude() {
-  const raw: OpenRouterReasoningConfig = { exclude: true };
+// [v0.4.29c Fix C3] exclude is always sent as true in request body, regardless of input.
+async function testBodyExcludeAlwaysTrue() {
+  const raw: OpenRouterReasoningConfig = { enabled: true, effort: "high" };
   const normalized = normalizeOpenRouterReasoning(raw);
   const body = await captureRequestBody(normalized);
   assert.ok(body.reasoning);
-  assert.equal(body.reasoning.exclude, true);
-  console.log("  ✓ body: exclude=true => reasoning.exclude=true");
-}
-
-async function testBodyExcludeFalse() {
-  const raw: OpenRouterReasoningConfig = { exclude: false };
-  const normalized = normalizeOpenRouterReasoning(raw);
-  const body = await captureRequestBody(normalized);
-  // exclude=false should not be included; default effort=high still applies
-  assert.ok(body.reasoning);
-  assert.equal(body.reasoning.effort, "high");
-  assert.equal(body.reasoning.exclude, undefined, "exclude=false should not be in body");
-  console.log("  ✓ body: exclude=false => reasoning.effort=high, no exclude");
+  assert.equal(body.reasoning.exclude, true, "reasoning.exclude should always be true in request body");
+  console.log("  ✓ body: reasoning.exclude always true (Fix C3: internal fixed)");
 }
 
 async function testBackwardCompatibilityExistingFields() {
@@ -264,8 +249,7 @@ async function main() {
   testNormalizeEffortMedium();
   testNormalizeMaxTokens();
   testNormalizeEffortAndMaxTokens();
-  testNormalizeExclude();
-  testNormalizeExcludeFalse();
+  testNormalizeExcludeRemoved();
   testNormalizeInvalidMaxTokensZero();
   testNormalizeInvalidMaxTokensNegative();
   testNormalizeInvalidMaxTokensFloat();
@@ -281,8 +265,7 @@ async function main() {
   await testBodyEffortMedium();
   await testBodyMaxTokens();
   await testBodyEffortAndMaxTokensPriority();
-  await testBodyExclude();
-  await testBodyExcludeFalse();
+  await testBodyExcludeAlwaysTrue();
 
   console.log("\nBackward compatibility:");
   await testBackwardCompatibilityExistingFields();

@@ -51,18 +51,23 @@ type GeminiGenerateContentResponse = {
 export class GeminiDirectClient {
   private readonly apiKey: string;
   private readonly timeoutMs: number;
+  private readonly temperature: number;
+  private readonly maxTokens?: number;
 
   constructor(
     apiKey: string,
     timeoutMs: number = 30_000,
+    opts?: { temperature?: number; maxTokens?: number },
   ) {
     this.apiKey = apiKey.trim();
     this.timeoutMs = timeoutMs;
+    this.temperature = opts?.temperature ?? 0.4;
+    this.maxTokens = opts?.maxTokens;
   }
 
   async generateNarrative(
     params: { systemPrompt: string; userMessage: string },
-    opts?: { modelOverride?: string },
+    opts?: { modelOverride?: string; thinkingLevel?: string; thinkingBudget?: number },
   ): Promise<string> {
     if (!this.apiKey) {
       throw new GeminiDirectError({
@@ -79,6 +84,27 @@ export class GeminiDirectClient {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      // Build generationConfig with optional maxOutputTokens and thinkingConfig
+      const generationConfig: Record<string, any> = {
+        temperature: this.temperature,
+      };
+      // [v0.4.29c BUG-FIX] Only send maxOutputTokens when > 0.
+      // maxTokens=0 is invalid (would produce empty output) — treat as unset.
+      if (this.maxTokens !== undefined && this.maxTokens > 0) {
+        generationConfig.maxOutputTokens = this.maxTokens;
+      }
+      // [v0.4.29c] thinkingConfig: reasoning.effort → thinkingLevel, reasoning.maxTokens → thinkingBudget
+      const thinkingConfig: Record<string, any> = {};
+      if (opts?.thinkingLevel) {
+        thinkingConfig.thinkingLevel = opts.thinkingLevel;
+      }
+      if (opts?.thinkingBudget != null) {
+        thinkingConfig.thinkingBudget = opts.thinkingBudget;
+      }
+      if (Object.keys(thinkingConfig).length > 0) {
+        generationConfig.thinkingConfig = thinkingConfig;
+      }
+
       const response = await fetch(url, {
         method: "POST",
         headers: {
@@ -95,9 +121,7 @@ export class GeminiDirectClient {
               parts: [{ text: params.userMessage }],
             },
           ],
-          generationConfig: {
-            temperature: 0.4,
-          },
+          generationConfig,
         }),
         signal: controller.signal,
       });

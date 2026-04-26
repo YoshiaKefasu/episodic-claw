@@ -6,7 +6,7 @@ import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer, resolveSessionFile, ingestColdStartSession, ingestedSessions } from "./rpc-client";
 import { buildRecallCalibration, loadConfig } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
-import { EpisodicRetriever, RecallInjectionOutcome, invalidateTsRecallCache } from "./retriever";
+import { EpisodicRetriever, RecallInjectionOutcome, invalidateTsRecallCache, classifyAndStripAttachment, hasMediaScaffold } from "./retriever";
 import { EpisodicArchiver } from "./archiver";
 import { AnchorStore } from "./anchor-store";
 import { estimateTokens } from "./utils";
@@ -129,15 +129,55 @@ export function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizatio
       candidate = (match[2] || "").trim();
     }
   }
-  // [E3] raw_prompt_fallback: sanitize first, then extract meaningful tail lines.
-  // Avoids adopting metadata-only prompts as anchor.
+  // [v0.4.29a] raw_prompt_fallback: extract caption-only text first (media scaffold strip),
+  // then apply metadata sanitize. Avoids adopting media header as anchor when
+  // prompt is "[media attached: /path] + caption" without role-labeled blocks.
+  let captionRescueApplied = false;
   if (!candidate) {
-    const sanitizedRaw = stripUntrustedMetadataBlocks(raw);
-    if (sanitizedRaw.length >= 3) {
-      const tailLines = sanitizedRaw.split("\n").map(l => l.trim()).filter(l => l.length > 0);
-      candidate = tailLines.slice(-5).join("\n").trim();
+    // Phase 1: strip media scaffold to extract caption (classifyAndStripAttachment)
+    const { isDominant: mediaIsDominant, cleanedText: captionExtracted } = classifyAndStripAttachment(raw);
+    // [v0.4.29b] BS-29A-4: replaced inline regex with shared hasMediaScaffold() from retriever.
+    // [v0.4.29b] BS-29A-2: MIME annotations (image/jpeg) are now included in hasMediaScaffold.
+    const hadMediaScaffold = hasMediaScaffold(raw);
+    // captionRescueApplied = true when:
+    //   - input had media scaffold AND classifier extracted a valid caption
+    captionRescueApplied = hadMediaScaffold && captionExtracted.length >= 3;
+    // Phase 2: select base text for sanitize pass.
+    // - media + caption → use extracted caption only
+    // - media-only (no caption) → reject entirely (do not fall back to raw header)
+    // - clean text → proceed normally with raw
+    const baseText = captionRescueApplied
+      ? captionExtracted                           // media + caption: use caption
+      : (hadMediaScaffold || mediaIsDominant)
+        ? ""                                       // media-only: reject
+        : raw;                                     // clean text: proceed normally
+    if (baseText.length >= 3) {
+      const sanitizedRaw = stripUntrustedMetadataBlocks(baseText);
+      if (sanitizedRaw.length >= 3) {
+        const tailLines = sanitizedRaw.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+        candidate = tailLines.slice(-5).join("\n").trim();
+      }
     }
-    // If still empty after sanitize, candidate stays "" and will be rejected below
+    // If still empty after both passes, candidate stays "" and will be rejected below
+  }
+
+  // [BS-29A-3] Apply media scaffold strip to candidate regardless of extraction path.
+  // If the user: block itself contains "[media attached: /path]\ncaption", the candidate
+  // would include the media header since roleBlockRegex extracts raw block content.
+  // Stripping here covers both raw_prompt_fallback and last_user_block paths.
+  // [BS-29B-1] hasMediaScaffold guard first — skip classifyAndStripAttachment for clean text.
+  if (candidate) {
+    const hadMediaInCandidate = hasMediaScaffold(candidate);
+    if (hadMediaInCandidate) {
+      const { cleanedText: captionFromCandidate } = classifyAndStripAttachment(candidate);
+      if (captionFromCandidate.length >= 3) {
+        candidate = captionFromCandidate;
+        captionRescueApplied = true;
+      } else {
+        // media-only inside user: block → reject
+        candidate = "";
+      }
+    }
   }
 
   // [E2] Apply metadata sanitize to candidate regardless of path (belt-and-suspenders)
@@ -188,9 +228,15 @@ export function normalizePromptAnchor(prompt: unknown): PromptAnchorNormalizatio
     anchorRawPreview,
     anchorNormalizedPreview,
     // [E2] Suffix reason with _sanitized when metadata was actually stripped
+    // [v0.4.29a] Suffix with _caption_rescue when media scaffold was stripped to extract caption
+    // [BS-29B-2] role-labeled path also gets _caption_rescue suffix when rescue was applied
     anchorAcceptedReason: roleMatched
-      ? (anchorSanitizeDroppedMetadata ? "last_user_block_sanitized" : "last_user_block")
-      : (anchorSanitizeDroppedMetadata ? "raw_prompt_tail_sanitized" : "raw_prompt_fallback"),
+      ? captionRescueApplied
+        ? "last_user_block_caption_rescue"                                         // BS-29B-2
+        : (anchorSanitizeDroppedMetadata ? "last_user_block_sanitized" : "last_user_block")
+      : captionRescueApplied
+        ? "raw_prompt_caption_rescue"
+        : (anchorSanitizeDroppedMetadata ? "raw_prompt_tail_sanitized" : "raw_prompt_fallback"),
     anchorRejectedReason: "",
     anchorSanitizeApplied: anchorSanitizeApplied,
     anchorSanitizedLength: anchorSanitizedLength,
@@ -543,6 +589,31 @@ const PluginConfigSchema = Type.Object(
     enableBackgroundWorkers: Type.Optional(Type.Boolean({
       description: "Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery). Default: true. Does not affect narrative generation."
     })),
+    // [v0.4.29c Fix C6] narrativeConfig + openrouterConfig in schema — required because additionalProperties: false
+    narrativeConfig: Type.Optional(Type.Object({
+      model: Type.Optional(Type.String({ description: "Model ID for OpenRouter fallback phases (Round 2). Default: 'openrouter/free'." })),
+      maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768, description: "Max tokens cap for narrative generation." })),
+      temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Sampling temperature. Default: 0.4." })),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 30000, maximum: 300000, description: "HTTP request timeout in ms. Default: 30000." })),
+      maxRetries: Type.Optional(Type.Integer({ minimum: 0, maximum: 5, description: "Transport-level retries after transient failure. Default: 3." })),
+      reasoning: Type.Optional(Type.Object({
+        enabled: Type.Optional(Type.Boolean({ description: "Enable reasoning/thinking. Default: true." })),
+        effort: Type.Optional(Type.String({ description: "Reasoning effort level: none, minimal, low, medium, high, xhigh. Default: high." })),
+        maxTokens: Type.Optional(Type.Integer({ description: "Max tokens for reasoning chain. Drops effort when set (OpenRouter rule)." })),
+      }, { additionalProperties: false })),
+    }, { additionalProperties: false, description: "[v0.4.29c] Unified narrative generation configuration. Applies to both Google (Gemini/Gemma) and OpenRouter providers. Takes precedence over openrouterConfig (deprecated)." })),
+    openrouterConfig: Type.Optional(Type.Object({
+      model: Type.Optional(Type.String({ description: "Deprecated: use narrativeConfig.model instead." })),
+      maxTokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 32768, description: "Deprecated: use narrativeConfig.maxTokens instead." })),
+      temperature: Type.Optional(Type.Number({ minimum: 0, maximum: 1, description: "Deprecated: use narrativeConfig.temperature instead." })),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 30000, maximum: 300000, description: "Deprecated: use narrativeConfig.timeoutMs instead." })),
+      maxRetries: Type.Optional(Type.Integer({ minimum: 0, maximum: 5, description: "Deprecated: use narrativeConfig.maxRetries instead." })),
+      reasoning: Type.Optional(Type.Object({
+        enabled: Type.Optional(Type.Boolean({ description: "Deprecated: use narrativeConfig.reasoning instead." })),
+        effort: Type.Optional(Type.String({ description: "Deprecated: use narrativeConfig.reasoning.effort instead." })),
+        maxTokens: Type.Optional(Type.Integer({ description: "Deprecated: use narrativeConfig.reasoning.maxTokens instead." })),
+      }, { additionalProperties: false })),
+    }, { additionalProperties: false, description: "[DEPRECATED v0.4.29c] Use narrativeConfig instead. Retained for backward compatibility only." })),
   },
   { additionalProperties: false }
 );
@@ -647,7 +718,9 @@ const episodicClawPlugin = {
           `[Episodic Memory] Config loaded: recallQueryRecentMessageCount=${cfg.recallQueryRecentMessageCount}, ` +
           `narrativeSystemPrompt=${cfg.narrativeSystemPrompt ? `(custom, ${cfg.narrativeSystemPrompt.length} chars)` : "(default)"}, ` +
           `model=${cfg.openrouterModel}, ` +
-          `openrouterTimeoutMs=${cfg.openrouterTimeoutMs}, openrouterMaxRetries=${cfg.openrouterMaxRetries}`
+          `openrouterTimeoutMs=${cfg.openrouterTimeoutMs}, openrouterMaxRetries=${cfg.openrouterMaxRetries}, ` +
+          // [v0.4.29c Fix C6] narrativeConfigSource for observability
+          `narrativeConfigSource=${cfg.narrativeConfigSource ?? "(unknown)"}`
         );
 
         const rpcClient = new EpisodicCoreClient();

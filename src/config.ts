@@ -1,7 +1,14 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { EpisodicPluginConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
+import { EpisodicPluginConfig, NarrativeConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
+
+let warnedOpenrouterDeprecated = false;
+
+// [v0.4.29d] Test utility to reset the one-shot warning flag
+export function _resetWarnedOpenrouterDeprecatedForTest() {
+  warnedOpenrouterDeprecated = false;
+}
 
 function clampUnitInterval(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -44,12 +51,12 @@ function normalizeLanguageOnFail(value: unknown): "softwarn" | "reask" | "handof
  *  a. enabled===false => return undefined (do not send reasoning)
  *  b. if maxTokens and effort both present, prefer maxTokens and drop effort
  *  c. map maxTokens to normalized maxTokens (reject <=0 or non-integer)
- *  d. Default exclude=true for narrative path — prevents CoT token leakage into output. Only omit when user explicitly sets exclude: false
+ *  d. [v0.4.29c Fix C3] exclude is always true (internal fixed) — prevents CoT token leakage into output
  *  e. invalid maxTokens (<=0 or non-integer) treated as unset
  */
 export function normalizeOpenRouterReasoning(
   raw: OpenRouterReasoningConfig | undefined
-): { enabled: boolean; effort?: string; maxTokens?: number; exclude?: boolean } | undefined {
+): { enabled: boolean; effort?: string; maxTokens?: number } | undefined {
   if (!raw) return undefined;
 
   // Rule a: disabled entirely
@@ -58,7 +65,7 @@ export function normalizeOpenRouterReasoning(
   const enabled = true;
   let effort: string | undefined;
   let maxTokens: number | undefined;
-  let exclude: boolean | undefined;
+  // [v0.4.29c Fix C3] exclude always true — no longer a variable
 
   const validEfforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
   if (typeof raw.effort === "string" && validEfforts.has(raw.effort)) {
@@ -80,13 +87,10 @@ export function normalizeOpenRouterReasoning(
     effort = "high";
   }
 
-  // Rule d [v0.4.17]: Default exclude=true for narrative path — prevents CoT token leakage into output
-  // Only disable if user explicitly sets exclude: false
-  if (raw.exclude !== false) {
-    exclude = true;
-  }
-
-  return { enabled, effort, maxTokens, exclude };
+  // [v0.4.29c Fix C3] exclude removed from return — handled downstream:
+  // - OpenRouterClient always sends reasoning.exclude=true
+  // - GeminiDirectClient has no exclude concept (thinkingConfig replaces it)
+  return { enabled, effort, maxTokens };
 }
 
 /**
@@ -130,23 +134,48 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     queryExcludedKeywords: rawConfig?.queryExcludedKeywords ?? [],
     // Narrative architecture (v0.4.0)
     openrouterApiKey: rawConfig?.openrouterApiKey || process.env.OPENROUTER_API_KEY || "",
-    // openrouterConfig (nested) vs flat fields: nested takes precedence
-    openrouterModel: rawConfig?.openrouterConfig?.model ?? rawConfig?.openrouterModel ?? "openrouter/free",
-    // [v0.4.15] Max tokens for narrative generation — previously dropped by v0.4.14 Fix B
-    openrouterMaxTokens: rawConfig?.openrouterConfig?.maxTokens,
-    // [v0.4.28f] Transport timeout/retry control — configures OpenRouterClient directly
-    // clampFiniteInt guards against NaN/Infinity (same pattern as v0.4.28b narrativeGuard fields)
-    openrouterTimeoutMs: clampFiniteInt(rawConfig?.openrouterConfig?.timeoutMs, 30000, 300000, 30000),
-    openrouterMaxRetries: clampFiniteInt(rawConfig?.openrouterConfig?.maxRetries, 0, 5, 3),
-    narrativeTemperature: Math.max(0, Math.min(1, rawConfig?.openrouterConfig?.temperature ?? rawConfig?.narrativeTemperature ?? 0.4)),
+    // [v0.4.29c Fix C2] narrativeConfig (unified) > openrouterConfig (deprecated) > flat fields
+    // Resolve source priority: narrativeConfig → openrouterConfig → flat → default
+    ...(() => {
+      const nc = rawConfig?.narrativeConfig as NarrativeConfig | undefined;  // new unified config
+      const oc = rawConfig?.openrouterConfig as NarrativeConfig | undefined;  // deprecated compat
+      const hasNc = nc && Object.keys(nc).length > 0;
+      const hasOc = oc && Object.keys(oc).length > 0;
+      // [v0.4.29c] Distinguish "flat" (user set a flat field) vs "default" (nothing user-configured)
+      const hasFlatOverride = rawConfig?.openrouterModel != null || rawConfig?.narrativeTemperature != null;
+      const source: "narrativeConfig" | "openrouterConfig" | "flat" | "default" =
+        hasNc ? "narrativeConfig" : hasOc ? "openrouterConfig" : hasFlatOverride ? "flat" : "default";
+      // Emit deprecation warning if openrouterConfig is used (and narrativeConfig is not)
+      if (hasOc && !hasNc && !warnedOpenrouterDeprecated) {
+        console.warn(
+          "[Episodic Memory] openrouterConfig is deprecated (v0.4.29c) - using openrouterConfig fallback. " +
+          "Use narrativeConfig instead. openrouterConfig will be removed in a future release."
+        );
+        warnedOpenrouterDeprecated = true;
+      }
+      // Merge: narrativeConfig overrides openrouterConfig overrides flat fields
+      const model = nc?.model ?? oc?.model ?? rawConfig?.openrouterModel ?? "openrouter/free";
+      const maxTokens = nc?.maxTokens ?? oc?.maxTokens;
+      const temperature = nc?.temperature ?? oc?.temperature ?? rawConfig?.narrativeTemperature;
+      const timeoutMs = nc?.timeoutMs ?? oc?.timeoutMs;
+      const maxRetries = nc?.maxRetries ?? oc?.maxRetries;
+      const reasoning = nc?.reasoning ?? oc?.reasoning;
+      return {
+        openrouterModel: model,
+        openrouterMaxTokens: maxTokens,
+        openrouterTimeoutMs: clampFiniteInt(timeoutMs, 30000, 300000, 30000),
+        openrouterMaxRetries: clampFiniteInt(maxRetries, 0, 5, 3),
+        narrativeTemperature: Math.max(0, Math.min(1, temperature ?? 0.4)),
+        narrativeConfigSource: source,
+        openrouterReasoning: normalizeOpenRouterReasoning(
+          reasoning ?? { enabled: true, effort: "high" }
+        ),
+      };
+    })(),
     narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt, platform),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate, platform),
     maxPoolChars: Math.max(1000, rawConfig?.maxPoolChars ?? 15000),
     narrativePreviousEpisodeRef: rawConfig?.narrativePreviousEpisodeRef ?? true,
-    // Reasoning config: default enabled=true, effort=high when unset
-    openrouterReasoning: normalizeOpenRouterReasoning(
-      rawConfig?.openrouterConfig?.reasoning ?? { enabled: true, effort: "high" }
-    ),
     // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
     // narrativeExpectedLanguage: undefined = auto (no check). Only accept valid language codes.
     narrativeExpectedLanguage: normalizeLanguageCode(rawConfig?.narrativeExpectedLanguage),
