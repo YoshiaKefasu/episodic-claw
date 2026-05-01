@@ -280,6 +280,10 @@ type AgentRuntimeState = {
   lastInjectionMessageCount: number;
   /** Message count at the time before_prompt_build last ran recall. Used to skip duplicate recall in assemble(). */
   lastRecallTurnMessageCount: number;
+  /** [v0.4.30b] True once non-empty messages have been used to initialize the segmenter cursor.
+   *  Separated from lastRecallTurnMessageCount because empty before_prompt_build events
+   *  must NOT consume the warm-start lifecycle. */
+  segmenterCursorInitialized: boolean;
 };
 
 const WORKSPACE_CACHE_PREFIX = "episodic-claw-workspace";
@@ -828,6 +832,7 @@ const episodicClawPlugin = {
             lastInjectedResultHash: "",
             lastInjectionMessageCount: 0,
             lastRecallTurnMessageCount: -1,
+            segmenterCursorInitialized: false,
           };
         _singleton!.agentStates.set(agentId, state);
         return state;
@@ -886,6 +891,62 @@ const episodicClawPlugin = {
         const debouncer = new FileEventDebouncer(rpcClient, agentWs, 2000, invalidateRecallCacheForWorkspace);
         _singleton!.debouncers.set(agentWs, debouncer);
         return debouncer;
+      };
+
+      // [v0.4.30b] 非空メッセージ初回のみ segmenter cursor を初期化する。
+      // lastRecallTurnMessageCount === -1 に依存しない別フラグで管理することで、
+      // 空 before_prompt_build が warm-start ライフサイクルを消費する問題を防ぐ。
+      const ensureSegmenterCursorInitialized = async (
+        state: AgentRuntimeState,
+        msgs: Message[],
+        agentWs: string,
+        agentId: string,
+      ): Promise<void> => {
+        if (msgs.length === 0) return;
+        if (state.segmenterCursorInitialized) return;
+
+        const restoredCursor = await state.segmenter.restoreCursor(agentWs, agentId).catch(() => 0);
+        if (restoredCursor > 0) {
+          const clamped = Math.min(restoredCursor, msgs.length);
+          state.segmenter.bootstrapCursor(clamped, "warm-start", agentWs, agentId);
+          console.log(JSON.stringify({
+            source: "episodic-claw",
+            event: "segmenter-cursor-init",
+            agentId,
+            msgCount: msgs.length,
+            restoredCursor,
+            action: "restored",
+          }));
+          const walMessages = state.segmenter.walRestore(agentWs, agentId);
+          if (walMessages.length > 0) {
+            console.log(`[Episodic Memory] WAL restored ${walMessages.length} messages for ${agentId}. Injecting into buffer for idle flush.`);
+            state.segmenter.injectWalRestoredMessages(walMessages, agentWs, agentId);
+          }
+        } else {
+          const warmStartSkipMinMessages = cfg.warmStartSkipMinMessages ?? 50;
+          if (warmStartSkipMinMessages > 0 && state.segmenter.currentCursor === 0 && msgs.length >= warmStartSkipMinMessages) {
+            state.segmenter.bootstrapCursor(msgs.length, "warm-start", agentWs, agentId);
+            console.log(JSON.stringify({
+              source: "episodic-claw",
+              event: "segmenter-cursor-init",
+              agentId,
+              msgCount: msgs.length,
+              restoredCursor: 0,
+              action: "warm-start-skip",
+            }));
+          } else {
+            console.log(JSON.stringify({
+              source: "episodic-claw",
+              event: "segmenter-cursor-init",
+              agentId,
+              msgCount: msgs.length,
+              restoredCursor: 0,
+              action: "fresh-small-context",
+            }));
+          }
+        }
+
+        state.segmenterCursorInitialized = true;
       };
 
       // [v0.4.20] Watcher start constants — increased from 5s to 15s + 1 retry
@@ -1202,35 +1263,24 @@ const episodicClawPlugin = {
         const state = getAgentState(agentId);
         state.lastAgentWs = agentWs;
 
-        // ── [v0.4.21b] Cursor restoration from state DB ──
-        // 初回 before_prompt_build 時に永続化された cursor を復元（再起動後の再物語化防止）。
-        // restoreCursor はDB値を返すだけで内部状態は変更しない — bootstrapCursor で設定。
-        if (state.lastRecallTurnMessageCount === -1) {
-          const restoredCursor = await state.segmenter.restoreCursor(agentWs, agentId).catch(() => 0);
-          if (restoredCursor > 0) {
-            // Cursor restored from DB — always bootstrap (clamped to current message count)
-            const clamped = Math.min(restoredCursor, msgs.length); // safety clamp
-            // [v0.4.21d] Use "warm-start" reason so bootstrapCursor skips same-value write-back
-            // (changed from "manual" — manual implies user-explicit operation, not DB restore)
-            state.segmenter.bootstrapCursor(clamped, "warm-start", agentWs, agentId);
-            // [v0.4.22b] WAL: restore un-flushed messages from WAL after cursor bootstrap
-            const walMessages = state.segmenter.walRestore(agentWs, agentId);
-            if (walMessages.length > 0) {
-              console.log(`[Episodic Memory] WAL restored ${walMessages.length} messages for ${agentId}. Injecting into buffer for idle flush.`);
-              state.segmenter.injectWalRestoredMessages(walMessages, agentWs, agentId);
-            }
+        // ── [v0.4.30b] Empty event guard ──────────────────────────────────────
+        // Empty before_prompt_build (cron/hook) must not consume warm-start lifecycle,
+        // initialize cursor, run processTurn, recall, or decrement anchor window.
+        if (msgs.length === 0) {
+          if (process.env.DEBUG_EPISODIC_RECALL_FINGERPRINT) {
+            console.log(JSON.stringify({
+              source: "episodic-claw",
+              event: "empty-before-prompt-build-skip",
+              agentId,
+              agentWs,
+              reason: "no_messages",
+            }));
           }
+          return {};
         }
 
-        // ── [v0.4.21b] Warm-start 初回取り込みガード（セーフネット） ──
-        // cursor 復元が空の場合のフォールバック。
-        // 初回 before_prompt_build かつ大量メッセージ時は、再起動復帰とみなして cursor を同期。
-        // 閾値は pluginConfig の warmStartSkipMinMessages から読み取り（デフォルト50）。
-        // 0 に設定するとガードを無効化。通常の短い新規会話は従来挙動のまま。
-        const WARM_START_SKIP_MIN_MESSAGES = cfg.warmStartSkipMinMessages ?? 50;
-        if (WARM_START_SKIP_MIN_MESSAGES > 0 && state.lastRecallTurnMessageCount === -1 && state.segmenter.currentCursor === 0 && msgs.length >= WARM_START_SKIP_MIN_MESSAGES) {
-          state.segmenter.bootstrapCursor(msgs.length, "warm-start", agentWs, agentId);
-        }
+        // ── [v0.4.30b] Cursor initialization (separated from lastRecallTurnMessageCount) ──
+        await ensureSegmenterCursorInitialized(state, msgs, agentWs, agentId);
 
         // ── セグメンテーション（fire-and-forget）──
         state.segmenter.processTurn(msgs, agentWs, agentId).catch(err => {
@@ -1309,7 +1359,10 @@ const episodicClawPlugin = {
           const recallOutcome = await retriever.retrieveRelevantContext(msgs, agentWs, k, maxRecallTokens, { latestUserAnchor });
 
           // Mark this turn's message count so assemble() can skip duplicate recall
-          state.lastRecallTurnMessageCount = msgs.length;
+          // [v0.4.30b] Guard: no_messages reason must not update the recall count
+          if (recallOutcome.reason !== "no_messages") {
+            state.lastRecallTurnMessageCount = msgs.length;
+          }
 
           // ── 結果ベース再注入防止 (ターン数ベース) ──
           const episodeIds = recallOutcome.episodeIds || [];
@@ -1395,6 +1448,8 @@ const episodicClawPlugin = {
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
           try {
+            // [v0.4.30b] Non-empty ingest also initializes segmenter cursor
+            await ensureSegmenterCursorInitialized(state, msgs, agentWs, agentId);
             state.lastInjectedResultHash = "";
             state.lastInjectionMessageCount = 0;
             await state.segmenter.processTurn(msgs, agentWs, agentId);
@@ -1427,6 +1482,9 @@ const episodicClawPlugin = {
           await prepareWorkspaces(resolution);
           const state = getAgentState(agentId);
           state.lastAgentWs = agentWs;
+
+          // [v0.4.30b] assemble fallback also needs cursor init
+          await ensureSegmenterCursorInitialized(state, msgs, agentWs, agentId).catch(() => {});
 
           // セグメンテーションは before_prompt_build で既に実行済みだが、
           // assemble() が呼ばれる = before_prompt_build がブロックされている可能性もあるため、

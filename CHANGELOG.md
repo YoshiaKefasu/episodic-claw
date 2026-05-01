@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.30b] - 2026-05-01
+
+### Fixed
+- **Empty `before_prompt_build` consuming warm-start lifecycle (CRITICAL)**: Empty hook/cron events (msgCount=0) were treated as real first-turn events, consuming the segmenter cursor initialization and `lastRecallTurnMessageCount` guard. This caused the next real prompt with large history (616 messages) to bypass warm-start protection, re-narrativizing old context into ghost chunks (114,512 tokens enqueued as live-turn). Fix: empty events now return immediately without cursor restore, bootstrapCursor, processTurn, recall, or anchor window decrement.
+
+### Changed
+- **`segmenterCursorInitialized` flag added**: Separated from `lastRecallTurnMessageCount` — the duplicate-recall guard no longer doubles as the first-run marker.
+- **`ensureSegmenterCursorInitialized()` helper**: Unified cursor init logic across `before_prompt_build`, context engine `ingest()`, and `assemble()` fallback, ensuring all non-empty entry points share the same warm-start lifecycle.
+
+### Notes
+- This is a hotfix release (v0.4.30b) targeting the empty-hook ghost-chunk incident on KASOU (2026-05-01).
+- Production cleanup (ghost episode purge from vector.db/cache.db, quarantine of `ai-agent-development-log.md`) is documented in `docs/plans/v0.4.x/v0.4.30b_ghost_chunk_empty_hook_fix_and_kasou_purge.md`.
+
 ## [0.4.30a] - 2026-05-01
 
 ### Fixed
