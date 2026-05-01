@@ -49,13 +49,15 @@ Write narrative text only.`;
 
 // [v0.4.29c Fix C5] Phase attempt counts — Google-first 6/6/3/3
 const GEMINI_DIRECT_MODEL = "gemini-3.1-flash-lite-preview";
-const GEMMA_DIRECT_MODEL = "gemma-4-31B-it";
+const GEMMA_DIRECT_MODEL = "gemma-4-31b-it";
 const GEMINI_MAIN_ATTEMPTS = 6;
 const GEMMA_MAIN_ATTEMPTS = 6;
 const OPENROUTER_MODEL_ATTEMPTS = 3;
 const OPENROUTER_FREE_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 3000;
 const MAX_RETRY_DELAY_MS = 600_000; // 10min cap
+// [v0.4.30a] 品質ゲートリトライ間隔 — 全モデル共通。モデルに出力改善の猶予を与える。
+const GATE_RETRY_DELAY_MS = 60_000; // 60秒
 const SAVE_HASH_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_CACHE_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 1000;
@@ -761,7 +763,7 @@ export class NarrativeWorker {
         `(${tokens}/${item.estimatedTokens} = ${(tokens / item.estimatedTokens * 100).toFixed(2)}% < ${MIN_COMPRESSION_RATIO * 100}%). ` +
         `Retrying for [${item.id}]...`
       );
-      await this.sleep(500);
+      await this.sleep(GATE_RETRY_DELAY_MS);
       return { pass: false, reason: "compression-ratio", isContentGate: false, isLanguageGate: false };
     }
 
@@ -771,7 +773,7 @@ export class NarrativeWorker {
         `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: verbatim echo detected for [${item.id}]. ` +
         `First ${Math.min(text.replace(/\s+/g, "").length, ECHO_SAMPLE_LENGTH)} chars match input. Retrying...`
       );
-      await this.sleep(500);
+      await this.sleep(GATE_RETRY_DELAY_MS);
       return { pass: false, reason: "verbatim-echo", isContentGate: false, isLanguageGate: false };
     }
 
@@ -781,7 +783,7 @@ export class NarrativeWorker {
       console.warn(
         `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${formatCheck.reason} for [${item.id}]. Retrying...`
       );
-      await this.sleep(500);
+      await this.sleep(GATE_RETRY_DELAY_MS);
       return { pass: false, reason: formatCheck.reason, isContentGate: false, isLanguageGate: false };
     }
 
@@ -798,7 +800,7 @@ export class NarrativeWorker {
           console.warn(
             `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
           );
-          await this.sleep(500);
+          await this.sleep(GATE_RETRY_DELAY_MS);
           return { pass: false, reason, isContentGate: true, isLanguageGate: false };
         }
       }
@@ -816,7 +818,7 @@ export class NarrativeWorker {
           console.warn(
             `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
           );
-          await this.sleep(500);
+          await this.sleep(GATE_RETRY_DELAY_MS);
           return { pass: false, reason, isContentGate: true, isLanguageGate: false };
         }
         console.log(
@@ -849,7 +851,7 @@ export class NarrativeWorker {
           console.warn(
             `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
           );
-          await this.sleep(500);
+          await this.sleep(GATE_RETRY_DELAY_MS);
           return { pass: false, reason, isContentGate: true, isLanguageGate: false };
         } else {
           console.warn(
@@ -871,7 +873,7 @@ export class NarrativeWorker {
             console.warn(
               `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
             );
-            await this.sleep(500);
+            await this.sleep(GATE_RETRY_DELAY_MS);
             return { pass: false, reason, isContentGate: true, isLanguageGate: false };
           } else {
             console.warn(
@@ -888,7 +890,7 @@ export class NarrativeWorker {
             console.warn(
               `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts}: ${reason} for [${item.id}]. Retrying...`
             );
-            await this.sleep(500);
+            await this.sleep(GATE_RETRY_DELAY_MS);
             return { pass: false, reason, isContentGate: true, isLanguageGate: false };
           } else {
             console.warn(
@@ -979,7 +981,7 @@ export class NarrativeWorker {
                   `[NarrativeWorker] ${label}: language-mismatch reask for [${item.id}]. ` +
                   `Appending language hint, retrying (attempt ${attempt + 1}/${maxAttempts}, reask ${languageReaskCount}/${LANGUAGE_REASK_MAX}).`
                 );
-                await this.sleep(500); // [v0.4.28c] Rate-limit pause — consistent with other gate rejects
+                await this.sleep(GATE_RETRY_DELAY_MS); // [v0.4.30a] 60s backoff — same as quality gate rejects
                 continue; // retry with modified prompt
               } else {
                 // [C2-d/C3-c] Reask exhausted, no fallback, or no remaining attempts — auto-escalate to handoff
@@ -1191,7 +1193,7 @@ export class NarrativeWorker {
                   `[NarrativeWorker] ${label}: language-mismatch reask for [${item.id}]. ` +
                   `Appending language hint, retrying (attempt ${attempt + 1}/${maxAttempts}, reask ${languageReaskCount}/${LANGUAGE_REASK_MAX}).`
                 );
-                await this.sleep(500);
+                await this.sleep(GATE_RETRY_DELAY_MS);
                 continue; // retry with modified prompt
               } else {
                 const reason = languageReaskCount >= LANGUAGE_REASK_MAX ? "reask limit reached"
@@ -1239,6 +1241,13 @@ export class NarrativeWorker {
           model,
         };
       } catch (err) {
+        // [v0.4.30a BUG-FIX] retriable=false → 即座にhandoff。モデル名不正などで無駄リトライしない。
+        if (err instanceof GeminiDirectError && !err.retriable) {
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} non-retriable error [${err.geminiErrorClass}] for [${item.id}]: ${err.message}. Handing off to next phase.`
+          );
+          return null;
+        }
         const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
         const errorClass = err instanceof GeminiDirectError ? err.geminiErrorClass : "unknown";
         console.warn(

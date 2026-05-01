@@ -1,6 +1,17 @@
 # Changelog
 
-## [0.4.30] - 2026-04-27
+## [0.4.30a] - 2026-05-01
+
+### Fixed
+- **Gemma model name casing (CRITICAL)**: `GEMMA_DIRECT_MODEL` changed from `"gemma-4-31B-it"` (uppercase B) to `"gemma-4-31b-it"` (lowercase b). The Google Gemini API rejects uppercase model IDs with HTTP 400. This caused the `gemma-main` narrative phase to waste all 6 retries on `unexpected model name format` errors.
+- **Gemini catch-block missing retriable guard**: The Gemini catch block in `narrativizeWithGeminiModel()` did not check `err.retriable` — non-retriable errors (400-class, model name rejection) were retried with exponential backoff across all 6 attempts. Added guard: `retriable===false` now immediately returns `null` to trigger phase handoff, preventing wasted retries.
+- **Quality gate retry delay too short (CRITICAL)**: All 10 content-gate reject sleep sites (`applyQualityGates` + language reask paths) used `await this.sleep(500)`, causing rapid-fire retries (4 attempts in ~18s) that exhausted the `gemini-main` phase without giving the model sufficient time to vary output. Replaced with a shared `GATE_RETRY_DELAY_MS = 60_000` constant applied across both OpenRouter and Gemini paths.
+
+### Changed
+- **`GATE_RETRY_DELAY_MS` constant (60s)**: Centralized gate retry delay replacing 10 hardcoded `sleep(500)` calls across `applyQualityGates()` and both `narrativizeWithModel()` / `narrativizeWithGeminiModel()` language reask paths.
+
+### Notes
+- This is a hotfix release (v0.4.30a) targeting two production-incident regressions from the v0.4.29c Google-first narrative routing:
 
 ### Changed
 - **Phase4/5 test modular split (v0.4.29e)**: refactored monolithic `test_phase4_5.ts` into responsibility-scoped modules (`gateway_runtime`, `retriever_anchor`, `narrative_worker`, `cache_compaction_segmenter`) with a thin orchestrator entrypoint to preserve `npm test` workflow.
