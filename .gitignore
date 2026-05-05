@@ -32,8 +32,11 @@ go/episodic-core.exe
 go/episodic-core
 go/openclaw-go
 
-# GitNexus code intelligence index (developer tool)
+# Code intelligence indexes (developer tools)
 .gitnexus/
+graphify-out/
+.codesight/
+.graphifycache/
 
 # Claude Code developer configs — project-specific, not for end users
 CLAUDE.md

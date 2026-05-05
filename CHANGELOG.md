@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.30c] - 2026-05-05
+
+### Fixed
+- **Transport retry schedule too short for provider errors (CRITICAL)**: All provider-level errors (429, 5xx, timeout, network) previously used a 3-second base exponential backoff (`baseRetryDelayMs: 1000`, growing to ~12s) inside `NarrativeWorker`. This caused rapid-fire re-attempts against overloaded APIs. Replaced with a fixed stepped schedule: **60 / 120 / 240 / 480 / 960 / 1280 seconds** across all transport failure types (B-policy: uniform schedule for all provider errors).
+- **OpenRouter non-retriable errors retried on long schedule (NEW)**: Non-retriable OpenRouter errors (401, 403, provider policy 400) were being retried for up to 21 minutes on the new 60–1280s schedule. Added guard: `OpenRouterError && !err.retriable` now triggers immediate phase handoff (`return null`) without sleeping, symmetric with the existing Gemini non-retriable guard (added v0.4.30a).
+- **Retry-After / `Please retry in Xs` hints ignored**: Gemini API often returns `"Please retry in 32.2s"` in the error message. Previously ignored; now parsed and used as a lower bound — the larger of `scheduleDelayMs` and `retryAfterMs` is used as the actual wait. OpenRouter `Retry-After` header is also honored.
+
+### Changed
+- **`TRANSPORT_RETRY_SCHEDULE_SEC = [60, 120, 240, 480, 960, 1280]` constant**: Extracted to `src/transport-retry.ts` along with `computeTransportRetryDelayMs()` helper and `parseGeminiPleaseRetryInSeconds()` parser. NarrativeWorker imports from this module.
+- **`MAX_TRANSPORT_RETRY_DELAY_MS = 1_280_000` (21m20s cap)**: Hard cap matching the schedule maximum. Prevents Retry-After from extending waits beyond 21 minutes.
+
+### Notes
+- This is a hotfix release (v0.4.30c) targeting the retry-storm pattern observed in KASOU logs (2026-05-05) where Gemini 429s were triggering 3s/6s/12s re-attempts instead of respecting the server's 32s hint.
+- Plan: `docs/plans/v0.4.x/v0.4.30c_retry_after_honor_and_60s_floor_for_provider_429.md`
+
 ## [0.4.30b] - 2026-05-01
 
 ### Fixed

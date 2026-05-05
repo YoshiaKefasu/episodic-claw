@@ -9,6 +9,7 @@ import { OpenRouterClient, OpenRouterError } from "./openrouter-client";
 import { GeminiDirectClient, GeminiDirectError } from "./gemini-direct-client";
 import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
+import { TRANSPORT_RETRY_SCHEDULE_SEC, computeTransportRetryDelayMs, MAX_TRANSPORT_RETRY_DELAY_MS } from "./transport-retry";
 
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import { detectLanguageDetailed, detectLanguage } from "./lang-detect";
@@ -54,8 +55,7 @@ const GEMINI_MAIN_ATTEMPTS = 6;
 const GEMMA_MAIN_ATTEMPTS = 6;
 const OPENROUTER_MODEL_ATTEMPTS = 3;
 const OPENROUTER_FREE_ATTEMPTS = 3;
-const RETRY_BASE_DELAY_MS = 3000;
-const MAX_RETRY_DELAY_MS = 600_000; // 10min cap
+// [v0.4.30c] Transport retry schedule lives in src/transport-retry.ts
 // [v0.4.30a] 品質ゲートリトライ間隔 — 全モデル共通。モデルに出力改善の猶予を与える。
 const GATE_RETRY_DELAY_MS = 60_000; // 60秒
 const SAVE_HASH_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -84,6 +84,8 @@ const CJK_CHAR_PATTERN = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}\
 function hasCjkChars(text: string): boolean {
   return CJK_CHAR_PATTERN.test(text.substring(0, 200)); // check first 200 chars only (perf)
 }
+
+// (transport retry helpers moved to src/transport-retry.ts)
 
 // [v0.4.28c] Language reask constants — Gate Result Routing pattern
 // Reask appends a language hint to the user prompt; after LANGUAGE_REASK_MAX attempts,
@@ -1035,12 +1037,23 @@ export class NarrativeWorker {
           model,
         };
       } catch (err) {
-        const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        // [v0.4.30c] Non-retriable OpenRouter errors should not wait the transport schedule.
+        // Examples: 401/403, provider policy/mismatch 400. These won't succeed by waiting.
+        if (err instanceof OpenRouterError && !err.retriable) {
+          console.warn(
+            `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} non-retriable error ` +
+            `[${err.openRouterErrorClass}] for [${item.id}]: ${err.message}. Handing off to next phase.`
+          );
+          return null;
+        }
+        const { scheduleDelayMs, retryAfterMs, finalDelayMs } = computeTransportRetryDelayMs(attempt, err);
         const errorClass = err instanceof OpenRouterError ? err.openRouterErrorClass : "unknown";
         console.warn(
-          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
+          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ` +
+          `${err instanceof Error ? err.message : String(err)}. ` +
+          `Retrying in ${finalDelayMs}ms (schedule=${scheduleDelayMs}ms${retryAfterMs > 0 ? `, retryAfter=${retryAfterMs}ms` : ""})...`
         );
-        await this.sleep(delayMs);
+        await this.sleep(finalDelayMs);
       }
     }
 
@@ -1248,12 +1261,14 @@ export class NarrativeWorker {
           );
           return null;
         }
-        const delayMs = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        const { scheduleDelayMs, retryAfterMs, finalDelayMs } = computeTransportRetryDelayMs(attempt, err);
         const errorClass = err instanceof GeminiDirectError ? err.geminiErrorClass : "unknown";
         console.warn(
-          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms...`
+          `[NarrativeWorker] ${label} attempt ${attempt + 1}/${maxAttempts} failed [${errorClass}] for [${item.id}]: ` +
+          `${err instanceof Error ? err.message : String(err)}. ` +
+          `Retrying in ${finalDelayMs}ms (schedule=${scheduleDelayMs}ms${retryAfterMs > 0 ? `, retryAfter=${retryAfterMs}ms` : ""})...`
         );
-        await this.sleep(delayMs);
+        await this.sleep(finalDelayMs);
       }
     }
 

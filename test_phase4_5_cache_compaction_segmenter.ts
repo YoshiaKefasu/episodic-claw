@@ -1047,6 +1047,7 @@ export async function runIdleFlushRuntimeRegression(): Promise<void> {
 
 export async function runIdlePollLogStormRegression(): Promise<void> {
   const workerSource = fs.readFileSync(path.resolve("src", "narrative-worker.ts"), "utf8");
+  const transportRetrySource = fs.readFileSync(path.resolve("src", "transport-retry.ts"), "utf8");
   const segmenterSource = fs.readFileSync(path.resolve("src", "segmenter.ts"), "utf8");
   const goMainSource = fs.readFileSync(path.resolve("go", "main.go"), "utf8");
   const rpcSource = fs.readFileSync(path.resolve("src", "rpc-client.ts"), "utf8");
@@ -1101,6 +1102,16 @@ export async function runIdlePollLogStormRegression(): Promise<void> {
   assert.ok(rpcSource.includes('case "info"'), "rpc-client should route info to console.log");
   assert.ok(rpcSource.includes('case "warn"'), "rpc-client should route warn to console.warn");
   assert.ok(rpcSource.includes('case "error"'), "rpc-client should route error to console.error");
+
+  // 10. Verify transport retry schedule hardening (v0.4.30c)
+  assert.ok(workerSource.includes("./transport-retry"), "worker should import transport-retry module");
+  assert.ok(transportRetrySource.includes("TRANSPORT_RETRY_SCHEDULE_SEC"), "transport-retry should define schedule constant");
+  assert.ok(
+    transportRetrySource.includes("[60, 120, 240, 480, 960, 1280]"),
+    "transport-retry schedule should match 60/120/240/480/960/1280"
+  );
+  assert.ok(workerSource.includes("computeTransportRetryDelayMs"), "worker should compute transport retry delay via helper");
+  assert.ok(transportRetrySource.includes("parseGeminiPleaseRetryInSeconds"), "transport-retry should parse Gemini retry hints");
 
   console.log("  idle poll log storm: adaptive backoff, wake(), Go skip list, severity bridge all verified");
 }
