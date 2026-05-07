@@ -2010,7 +2010,7 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	}
 	defer vstore.IsRefining.Store(false)
 
-	gemmaProv := ai.NewGoogleStudioProvider(apiKey, "gemma-3-27b-it")
+	gemmaProv := ai.NewGoogleStudioProvider(apiKey, "gemma-4-31b-it")
 	embedProv := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 
 	// HIGH-1: Load heal429 state and apply TTL-based backoff for RPD exhaustion.

@@ -36,7 +36,7 @@ func RunConsolidation(ctx context.Context, agentWs string, apiKey string, vstore
 
 	logger.Info(logger.CatConsolidation, "Found %d unarchived D0 nodes to process.\n", len(d0Nodes))
 
-	llmRaw := ai.NewGoogleStudioProvider(apiKey, "gemma-3-27b-it")
+	llmRaw := ai.NewGoogleStudioProvider(apiKey, "gemma-4-31b-it")
 	embedRaw := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 
 	// Wrap providers with retry decorators that coordinate with rate limiters.

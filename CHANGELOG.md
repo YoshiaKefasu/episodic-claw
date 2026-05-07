@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.30d] - 2026-05-08
+
+### Fixed
+- **Go sidecar Gemma model name regression (CRITICAL)**: Three Go source files (`go/main.go`, `go/internal/vector/replay.go`, `go/internal/vector/consolidation.go`) still hardcoded `gemma-3-27b-it`, which Google Gemini API now returns 404 NOT_FOUND for. This caused Replay Scheduler, D1 Consolidation, and Async Healing Worker background tasks to silently fail with 404 errors. Updated all three to `gemma-4-31b-it`, matching the TS-side fix from v0.4.30a.
+
+### Changed
+- **Model name unified across TS + Go**: TS-side `GEMMA_DIRECT_MODEL = "gemma-4-31b-it"` (v0.4.30a) and Go-side `NewGoogleStudioProvider(apiKey, "gemma-4-31b-it")` now use identical model identifiers.
+
+### Notes
+- This is a hotfix release (v0.4.30d) targeting the Go sidecar model name regression discovered on KASOU Debian 13 after migration. Only Go source changed — TS plugin code is identical to v0.4.30c.
+- Plan: `docs/plans/v0.4.x/v0.4.30d_go_sidecar_model_name_fix.md`
+
 ## [0.4.30c] - 2026-05-05
 
 ### Fixed

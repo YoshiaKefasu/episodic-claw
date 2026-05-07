@@ -657,7 +657,7 @@ func RunReplayScheduler(ctx context.Context, agentWs string, apiKey string, vsto
 
 	logger.Info(logger.CatBackground, "Starting replay scheduler for %s\n", agentWs)
 
-	rawLLM := ai.NewGoogleStudioProvider(apiKey, "gemma-3-27b-it")
+	rawLLM := ai.NewGoogleStudioProvider(apiKey, "gemma-4-31b-it")
 	llm := &ai.RetryLLM{
 		Inner:      rawLLM,
 		Limiter:    limiter,
