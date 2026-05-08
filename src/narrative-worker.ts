@@ -554,7 +554,13 @@ export class NarrativeWorker {
       this.consecutiveEmptyPolls++;
       this.nextPollDelayMs = Math.min(this.MAX_POLL_DELAY_MS, this.nextPollDelayMs * 2);
 
-      if (this.consecutiveEmptyPolls > 0 && this.consecutiveEmptyPolls % 20 === 0) {
+      // [v0.4.30e] Suppress idle poll logging: gated + progressive threshold
+      // Gate: DEBUG_EPISODIC_IDLE_POLL env var (follows existing pattern: DEBUG_EPISODIC_WAL, DEBUG_EPISODIC_RECALL_FINGERPRINT)
+      // A: 100+ polls → log every 100 instead of 20
+      if (this.consecutiveEmptyPolls > 0 && process.env.DEBUG_EPISODIC_IDLE_POLL && (
+        (this.consecutiveEmptyPolls <= 100 && this.consecutiveEmptyPolls % 20 === 0) ||
+        (this.consecutiveEmptyPolls > 100 && this.consecutiveEmptyPolls % 100 === 0)
+      )) {
         console.log(`[NarrativeWorker] Idle backoff: ${this.consecutiveEmptyPolls} empty polls, next in ${this.nextPollDelayMs}ms`);
       }
     } catch (err) {

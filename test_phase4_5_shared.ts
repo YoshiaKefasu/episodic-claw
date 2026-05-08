@@ -78,6 +78,7 @@ export function loadCompactorCtor(): typeof import("./src/compactor.ts").Compact
     "gemini-direct-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
+    "transport-retry.js",
     "types.js",
     "utils.js",
   ]) {
@@ -102,6 +103,7 @@ export function loadCompactorModule(): typeof import("./src/compactor.ts") {
     "gemini-direct-client.js",
     "summary-escalation.js",
     "transcript-repair.js",
+    "transport-retry.js",
     "types.js",
     "utils.js",
   ]) {

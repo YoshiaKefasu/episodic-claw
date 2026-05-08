@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.30e] - 2026-05-08
+
+### Fixed
+- **Idle poll log flooding (`console.log` every 20 polls → gated)**: `NarrativeWorker.Idle backoff` logs were emitted as `console.log` every 5 minutes (288×/day on idle KASOU). Changed to `process.env.DEBUG_EPISODIC_IDLE_POLL` gate — zero noise in production unless the env var is set. Also added progressive threshold: log every 100 polls (≈25min) once past 100 consecutive empty polls instead of every 20. (Plan: `docs/plans/v0.4.x/v0.4.30e_idle_poll_log_reduction.md`)
+- **`transport-retry.js` missing from 5 test runtime copy lists (REGRESSION)**: v0.4.30c extracted `src/transport-retry.ts` but 5 test files (`test_phase4_5_gateway_runtime.ts`, `test_phase4_5_retriever_anchor.ts`, `test_phase4_5_cache_compaction_segmenter.ts`, `test_phase4_5_shared.ts`, `test_anchor_sanitize.ts`) hardcode dist file lists for CJS require() contexts and omitted `transport-retry.js`, causing `MODULE_NOT_FOUND` failures when the test runtime loaded `narrative-worker.js`. Added to all 7 list instances across 6 locations. All test suites now pass without module-not-found errors.
+
+### Changed
+- **Idle backoff log**: `console.log` replaced with `process.env.DEBUG_EPISODIC_IDLE_POLL` gated log, following the existing `DEBUG_EPISODIC_WAL` / `DEBUG_EPISODIC_RECALL_FINGERPRINT` convention in the codebase. The gate uses truthy check (`!!process.env.DEBUG_EPISODIC_IDLE_POLL`), compatible with `export DEBUG_EPISODIC_IDLE_POLL=1` and `set DEBUG_EPISODIC_IDLE_POLL=1`.
+
+### Notes
+- This is a hotfix release (v0.4.30e) targeting idle poll log noise and the transport-retry test regression. TS-only change — Go sidecar unchanged from v0.4.30d.
+- Plan: `docs/plans/v0.4.x/v0.4.30e_idle_poll_log_reduction.md`
+
 ## [0.4.30d] - 2026-05-08
 
 ### Fixed

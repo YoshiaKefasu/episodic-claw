@@ -52,6 +52,7 @@ export async function runGatewayStartSmoke(): Promise<void> {
     "summary-escalation.js",
     "segmenter.js",
     "transcript-repair.js",
+    "transport-retry.js",
     "types.js",
     "utils.js",
     "runtime-mode.js"

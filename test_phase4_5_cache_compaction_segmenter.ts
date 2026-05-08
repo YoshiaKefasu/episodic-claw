@@ -151,6 +151,7 @@ export async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
     "narrative-queue.js",
     "summary-escalation.js",
     "transcript-repair.js",
+    "transport-retry.js",
     "types.js",
     "utils.js",
   ]) {

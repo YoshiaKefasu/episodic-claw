@@ -33,7 +33,7 @@ function loadModules(): {
     "anchor-store.js","archiver.js","compactor.js","cjk-tokenizer.js","lang-detect.js",
     "narrative-worker.js","gemini-direct-client.js","narrative-pool.js","narrative-queue.js",
     "openrouter-client.js","reasoning-tags.js","rpc-client.js","runtime-mode.js",
-    "segmenter.js","summary-escalation.js","transcript-repair.js","types.js","utils.js",
+    "segmenter.js","summary-escalation.js","transcript-repair.js","transport-retry.js","types.js","utils.js",
   ];
   for (const file of allFiles) {
     const src = path.resolve("dist", file);
