@@ -139,7 +139,6 @@ func quarantineConsolidationRecord(vstore *Store, rec EpisodeRecord, reason stri
 		return
 	}
 	doc.Metadata.Tags = appendUniqueTags(doc.Metadata.Tags, quarantineTags...)
-	doc.Metadata.RefineFailed = true
 	if err := frontmatter.Serialize(sourcePath, doc); err != nil {
 		logger.Info(logger.CatConsolidation, "Failed to serialize quarantined D0 %s: %v\n", rec.ID, err)
 	}

@@ -1588,11 +1588,13 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 
 	ctx := context.Background()
 
-	// Safe Phase 1: Skip Gemma generation, immediately use MD5 slug for safe queueing
-	// Fix CRITICAL-1: Use full 128-bit MD5 to avoid birthday paradox collisions
+	// Safe Phase 1: Skip Gemma generation, immediately use timestamp slug for safe queueing
+	// v0.4.30f: Use microsecond-precision UTC timestamp for human-readable filenames.
+	// Store key (recordID) stays MD5-based for dedup and backward compat.
 	hash := md5.Sum([]byte(params.Summary))
-	slug := fmt.Sprintf("episode-%x", hash)
-	EmitLog("Quality Guard (Ingest): using MD5 safe-queue slug: %s", slug)
+	recordID := fmt.Sprintf("episode-%x", hash)
+	slug := fmt.Sprintf("episode-%s", time.Now().UTC().Format("2006-01-02T15-04-05.000000"))
+	EmitLog("Quality Guard (Ingest): using timestamp slug: %s (recordID: %s)", slug, recordID)
 
 	// [v0.4.21b] Duplicate guard: skip if a record with this slug already exists in the DB.
 	// This mirrors the handleBatchIngest duplicate guard (v0.4.21) for the single-item path.
@@ -1605,20 +1607,20 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 
 	// [v0.4.21c] Duplicate guard: only when vstore is available
 	if vstore != nil {
-		existingRec, getErr := vstore.Get(slug)
+		existingRec, getErr := vstore.Get(recordID)
 		if getErr == nil {
 			ingestDbDuplicateSkips.Add(1)
-			EmitLog("Ingest: duplicate slug already exists in DB, skipping: %s (total_skips=%d)", slug, ingestDbDuplicateSkips.Load())
+			EmitLog("Ingest: duplicate slug already exists in DB, skipping: %s (recordID: %s, total_skips=%d)", slug, recordID, ingestDbDuplicateSkips.Load())
 			// [v0.4.21c] Return existing record's path instead of empty string
 			existingPath := ""
 			if existingRec != nil {
 				existingPath = existingRec.SourcePath
 			}
-			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": existingPath, "slug": slug}, ID: req.ID})
+			sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": existingPath, "slug": recordID}, ID: req.ID})
 			return
 		} else {
 			if !strings.Contains(getErr.Error(), "not found") {
-				EmitLog("Ingest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", slug, getErr)
+				EmitLog("Ingest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", recordID, getErr)
 			}
 		}
 	}
@@ -1719,7 +1721,7 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 		// Only add to vector store if embedding was successful
 		if embedErr == nil && emb != nil {
 			vstore.Add(ctx, vector.EpisodeRecord{
-				ID:         slug,
+				ID:         recordID,
 				Title:      slug,
 				Tags:       params.Tags,
 				Topics:     topics,
@@ -1748,40 +1750,12 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 		EmitLog("Ingest: Episode saved to disk but NOT indexed (vstore unavailable). unindexed_total=%d. Run rebuild when store recovers.", unindexedSaves.Load())
 	}
 
-	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": filePath, "slug": slug}, ID: req.ID})
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]string{"path": filePath, "slug": recordID}, ID: req.ID})
 }
 
-func auditEpisodeQuality(slug string) error {
-	if len(slug) < 3 || len(slug) > 80 {
-		return fmt.Errorf("slug length out of range: %d", len(slug))
-	}
+// auditEpisodeQuality was removed in v0.4.30f (Pass 2 slug rename deleted).
 
-	banned := []string{
-		// English
-		"here-are", "sure-i-can", "as-an-ai", "i-d-be-happy", "certainly", "of-course",
-		// Japanese
-		"承知", "了解", "わかり", "はい", "aiとして", "回答", "ここ",
-		// Chinese
-		"好的", "没问题", "当然", "作为一个", "答案",
-		// Korean
-		"알겠습니다", "네", "당연하죠", "ai로서", "대답",
-	}
 
-	lowerSlug := strings.ToLower(slug)
-	for _, b := range banned {
-		if strings.Contains(lowerSlug, b) {
-			return fmt.Errorf("slug contains banned pattern: %s", b)
-		}
-	}
-
-	// ✅ Strict kebab-case validation: only lowercase ASCII letters, digits, and hyphens.
-	// ^[a-z0-9-]+$ also rejects: spaces, Japanese/Chinese/Korean, and any special chars (!, ?, @, etc.)
-	kebabRe := regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$`)
-	if !kebabRe.MatchString(slug) {
-		return fmt.Errorf("slug is not valid kebab-case (must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$): %s", slug)
-	}
-	return nil
-}
 
 type BatchIngestItem struct {
 	Summary  string             `json:"summary"`
@@ -1861,37 +1835,39 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Safe Phase 1: Skip Gemma generation, immediately use MD5 slug for safe queueing
-			// Fix CRITICAL-1: Use full 128-bit MD5 to avoid birthday paradox collisions
+			// Safe Phase 1: Skip Gemma generation, immediately use timestamp slug for safe queueing
+			// v0.4.30f: Use microsecond-precision UTC timestamp for human-readable filenames.
+			// Store key (recordID) stays MD5-based for dedup and backward compat.
 			hash := md5.Sum([]byte(it.Summary))
-			slug := fmt.Sprintf("episode-%x", hash)
-			EmitLog("Quality Guard (BatchIngest): using MD5 safe-queue slug: %s", slug)
+			recordID := fmt.Sprintf("episode-%x", hash)
+			slug := fmt.Sprintf("episode-%s", time.Now().UTC().Format("2006-01-02T15-04-05.000000"))
+			EmitLog("Quality Guard (BatchIngest): using timestamp slug: %s (recordID: %s)", slug, recordID)
 
 			// [v0.4.21] Duplicate guard 1: skip duplicate slugs within the same batch request
 			seenMu.Lock()
-			if _, exists := seenSlugs[slug]; exists {
+			if _, exists := seenSlugs[recordID]; exists {
 				seenMu.Unlock()
 				batchIngestSameRequestSkips.Add(1)
-				EmitLog("BatchIngest: duplicate slug in same request, skipping: %s (total_skips=%d)", slug, batchIngestSameRequestSkips.Load())
+				EmitLog("BatchIngest: duplicate slug in same request, skipping: %s (recordID: %s, total_skips=%d)", slug, recordID, batchIngestSameRequestSkips.Load())
 				return
 			}
-			seenSlugs[slug] = struct{}{}
+			seenSlugs[recordID] = struct{}{}
 			seenMu.Unlock()
 
 			// [v0.4.21] Duplicate guard 2: skip if a record with this slug already exists in the DB
 			// [v0.4.21d] Only when vstore is available (best-effort: dedup skipped if store init failed)
 			if vstore != nil {
-				if _, getErr := vstore.Get(slug); getErr == nil {
+				if _, getErr := vstore.Get(recordID); getErr == nil {
 					batchIngestDbDuplicateSkips.Add(1)
-					EmitLog("BatchIngest: duplicate slug already exists in DB, skipping: %s (total_skips=%d)", slug, batchIngestDbDuplicateSkips.Load())
+					EmitLog("BatchIngest: duplicate slug already exists in DB, skipping: %s (recordID: %s, total_skips=%d)", slug, recordID, batchIngestDbDuplicateSkips.Load())
 					mu.Lock()
-					slugs = append(slugs, slug) // still report the slug so the caller doesn't retry
+					slugs = append(slugs, recordID) // still report the slug so the caller doesn't retry
 					mu.Unlock()
 					return
 				} else {
 					// Log non-"not found" errors for DB health observability.
 					if !strings.Contains(getErr.Error(), "not found") {
-						EmitLog("BatchIngest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", slug, getErr)
+						EmitLog("BatchIngest: vstore.Get(%s) returned unexpected error (proceeding anyway): %v", recordID, getErr)
 					}
 				}
 			}
@@ -1926,7 +1902,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			fm := frontmatter.EpisodeMetadata{
 				ID:        slug,
 				Title:     slug,
-				Created:   now,
+				Created:   time.Now(),
 				Tags:      it.Tags,
 				Topics:    topics,
 				SavedBy:   savedBy,
@@ -1948,7 +1924,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 
 			if embErr == nil && emb != nil && vstore != nil {
 				rec := vector.EpisodeRecord{
-					ID:         slug,
+					ID:         recordID,
 					Title:      slug,
 					Tags:       it.Tags,
 					Topics:     topics,
@@ -1972,7 +1948,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			}
 
 			mu.Lock()
-			slugs = append(slugs, slug)
+			slugs = append(slugs, recordID)
 			mu.Unlock()
 		}(item)
 	}
@@ -1996,9 +1972,9 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: slugs, ID: req.ID})
 }
 
-// RunAsyncHealingWorker scans for episode-[md5].md files and safely heals/refines them.
-// Pass 1: Uses healEmbedLimiter (10% capacity) to embed DB-missing orphan MD5 files.
-// Pass 2: Uses gemmaLimiter to rename MD5 files to beautiful kebab-case slugs.
+// RunAsyncHealingWorker scans for orphan episode files and heals them.
+// v0.4.30f: Pass 2 (AI slug rename) removed — filenames are now timestamp-based.
+// Pass 1: Uses healEmbedLimiter (10% capacity) to embed DB-missing orphan files.
 //
 // HIGH-1: heal429State tracks consecutive 429s with a 2h TTL to backoff when RPD is exhausted.
 // This prevents the Ghost files from being retried every Tick (30min) against a dead quota,
@@ -2010,7 +1986,6 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	}
 	defer vstore.IsRefining.Store(false)
 
-	gemmaProv := ai.NewGoogleStudioProvider(apiKey, "gemma-4-31b-it")
 	embedProv := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 
 	// HIGH-1: Load heal429 state and apply TTL-based backoff for RPD exhaustion.
@@ -2111,12 +2086,7 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 			return nil
 		}
 
-		if doc.Metadata.RefineFailed {
-			return nil // Skip this poison pill
-		}
-
 		existingRec, vErr := vstore.Get(slug)
-		isHealed := false
 
 		// ----------------------------------------------------
 		// Pass 1: Healing (Embedding Generation for Ghost Files)
@@ -2196,102 +2166,9 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 			}
 			EmitLog("HealingWorker: Successfully healed (Pass 1) for %s", slug)
 			existingRec = &newRec
-			isHealed = true
 		}
 
-		// ----------------------------------------------------
-		// Pass 2: Refining (Gemma Rename for valid MD5 files)
-		// ----------------------------------------------------
-		// If we just healed it and wait limits apply, or it was already in DB.
-		EmitLog("HealingWorker: [Pass 2] Refining slug for %s", slug)
-
-		gemmaCtx, gemmaCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if waitErr := gemmaLimiter.Wait(gemmaCtx); waitErr != nil {
-			gemmaCancel()
-			EmitLog("HealingWorker: gemmaLimiter wait timeout for Pass 2, skipping slug refine for %s", slug)
-			return nil
-		}
-		gemmaCancel()
-
-		bodyText := doc.Body
-		ru := []rune(bodyText)
-		if len(ru) > 4000 {
-			bodyText = string(ru[:4000]) + "\n... (truncated for slug generation)"
-		}
-
-		prompt := "You are a helpful assistant. Generate a 2 to 5 word lowercase kebab-case slug (using English words only, no Japanese or other non-ASCII characters) representing the topic of this context summary. IMPORTANT: Your response MUST be in English only. Output nothing but the slug itself (e.g., 'system-architecture-update').\n\nSummary: " + bodyText
-
-		var newSlug string
-		for attempt := 0; attempt < 3; attempt++ {
-			if attempt > 0 {
-				time.Sleep(10 * time.Second)
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if waitErr := gemmaLimiter.Wait(retryCtx); waitErr != nil {
-					retryCancel()
-					EmitLog("HealingWorker: gemmaLimiter retry timeout, aborting Pass 2 for %s", slug)
-					break
-				}
-				retryCancel()
-			}
-			slugGen, genErr := gemmaProv.GenerateText(context.Background(), prompt)
-			if genErr != nil {
-				continue
-			}
-			slugGen = strings.TrimSpace(strings.ToLower(strings.Trim(slugGen, "`")))
-			if auditEpisodeQuality(slugGen) == nil {
-				newSlug = slugGen
-				break
-			}
-		}
-
-		if newSlug == "" {
-			EmitLog("HealingWorker: Could not generate valid slug for %s (Poison Pill), marking as refine_failed.", slug)
-			doc.Metadata.RefineFailed = true
-			if writeErr := frontmatter.Serialize(path, doc); writeErr != nil {
-				EmitLog("HealingWorker: Failed to write refine_failed flag to %s: %v", path, writeErr)
-			}
-			return nil
-		}
-
-		// 1. Rewrite the file to a new path
-		dirPath := filepath.Dir(path)
-		newPath := filepath.Join(dirPath, newSlug+".md")
-
-		doc.Metadata.ID = newSlug
-		doc.Metadata.Title = newSlug
-		doc.Metadata.Topics = topicsForRecord(doc.Metadata.Topics, doc.Metadata.Tags)
-
-		if writeErr := frontmatter.Serialize(newPath, doc); writeErr != nil {
-			EmitLog("HealingWorker: Failed to write new file %s: %v", newPath, writeErr)
-			return nil
-		}
-
-		// 2. Add new record derived from existingRec (healed or original)
-		newRec := *existingRec
-		newRec.ID = newSlug
-		newRec.Title = newSlug
-		newRec.Topics = topicsForRecord(doc.Metadata.Topics, doc.Metadata.Tags)
-		newRec.SourcePath = newPath
-		newRec.Depth = doc.Metadata.Depth
-		newRec.Tokens = doc.Metadata.Tokens
-		newRec.Surprise = doc.Metadata.Surprise
-		if err := vstore.Add(context.Background(), newRec); err != nil {
-			EmitLog("HealingWorker: Failed to add renamed record %s: %v", newSlug, err)
-			os.Remove(newPath) // Rollback file
-			return nil
-		}
-
-		// 3. Delete old record
-		vstore.Delete(slug)
-
-		// 4. Delete old local file
-		os.Remove(path)
-		EmitLog("HealingWorker: Successfully refined (Pass 2) %s -> %s", slug, newSlug)
-
-		// Small breath if we did heavy work
-		if isHealed {
-			time.Sleep(1 * time.Second)
-		}
+		// v0.4.30f: Pass 2 (AI slug rename) removed. Filenames are now timestamp-based.
 		return nil
 	})
 

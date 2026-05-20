@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.30f] - 2026-05-21
+
+### Added
+- **Timestamp-based episode filenames (replaces opaque MD5 hashes)**: Episode files are now saved as `episode-{microsecond_utc_timestamp}.md` (e.g., `episode-2026-05-20T02-38-30.123456.md`) instead of `episode-{md5_hash}.md`. The timestamp is in UTC with microsecond precision, making collisions effectively impossible even with concurrent goroutines in batchIngest.
+
+### Changed
+- **HealingWorker Pass 2 (AI slug rename) removed entirely**: The Go sidecar's `HealingWorker` previously attempted to rename MD5-hash files to kebab-case slugs via gemma-4-31b-it, but consistently failed with "Poison Pill" errors. With timestamp filenames being human-readable at save time, the AI rename step is no longer needed. Removed: Pass 2 block (L2202-2270), `auditEpisodeQuality()` function, `RefineFailed` frontmatter field, `gemmaProv` local variable, and the `RefineFailed` skip guard. HealingWorker Pass 1/3/4 (embedding healing, score update, GC) are preserved.
+
+### Technical
+- **Store key (recordID) separated from filename (slug)**: The `slug` variable previously served as both filename and PebbleDB store key. Now `recordID` (MD5 hash) is the store key for backward-compatible dedup and TS-side DB lookups, while `slug` (timestamp) is the human-readable filename. RPC responses return `recordID` to keep existing TS client code working.
+- **Dead code cleanup**: `auditEpisodeQuality()`, `RefineFailed` (EpisodeMetadata + FooterMetadata), `gemmaProv` (local variable in RunAsyncHealingWorker), and the `isHealed` flag all removed.
+- Plan: `docs/plans/v0.4.x/v0.4.30f_timestamp_episode_filenames.md`
+
 ## [0.4.30e] - 2026-05-08
 
 ### Fixed

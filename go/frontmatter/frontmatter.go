@@ -26,7 +26,6 @@ type EpisodeMetadata struct {
 	Tokens           int       `yaml:"tokens,omitempty"`
 	Sources          []string  `yaml:"sources,omitempty"`
 	RelatedTo        []Edge    `yaml:"related_to,omitempty"`
-	RefineFailed     bool      `yaml:"refine_failed,omitempty"`
 }
 
 type Edge struct {
@@ -110,7 +109,6 @@ type FooterMetadata struct {
 	Tokens           int       `json:"tokens,omitempty"`
 	Sources          []string  `json:"sources,omitempty"`
 	RelatedTo        []Edge    `json:"related_to,omitempty"`
-	RefineFailed     bool      `json:"refine_failed,omitempty"`
 }
 
 const footerMarker = "<!-- episodic-meta"
@@ -150,7 +148,6 @@ func parseFooterMetadata(content []byte) (*EpisodeMetadata, string, bool) {
 		Tokens:           fm.Tokens,
 		Sources:          fm.Sources,
 		RelatedTo:        fm.RelatedTo,
-		RefineFailed:     fm.RefineFailed,
 	}, body, true
 }
 
@@ -171,7 +168,6 @@ func Serialize(filePath string, doc *MarkdownDocument) error {
 		Tokens:           doc.Metadata.Tokens,
 		Sources:          doc.Metadata.Sources,
 		RelatedTo:        doc.Metadata.RelatedTo,
-		RefineFailed:     doc.Metadata.RefineFailed,
 	}
 
 	metaJSON, err := json.Marshal(fm)
