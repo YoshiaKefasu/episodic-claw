@@ -49,7 +49,7 @@ ${conversationText}
 Write narrative text only.`;
 
 // [v0.4.29c Fix C5] Phase attempt counts — Google-first 6/6/3/3
-const GEMINI_DIRECT_MODEL = "gemini-3.1-flash-lite-preview";
+const GEMINI_DIRECT_MODEL = "gemini-3.1-flash-lite";
 const GEMMA_DIRECT_MODEL = "gemma-4-31b-it";
 const GEMINI_MAIN_ATTEMPTS = 6;
 const GEMMA_MAIN_ATTEMPTS = 6;

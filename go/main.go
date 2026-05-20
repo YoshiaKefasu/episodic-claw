@@ -1589,11 +1589,11 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 	ctx := context.Background()
 
 	// Safe Phase 1: Skip Gemma generation, immediately use timestamp slug for safe queueing
-	// v0.4.30f: Use microsecond-precision UTC timestamp for human-readable filenames.
+	// v0.4.30f: Use microsecond-precision local-time timestamp for human-readable filenames.
 	// Store key (recordID) stays MD5-based for dedup and backward compat.
 	hash := md5.Sum([]byte(params.Summary))
 	recordID := fmt.Sprintf("episode-%x", hash)
-	slug := fmt.Sprintf("episode-%s", time.Now().UTC().Format("2006-01-02T15-04-05.000000"))
+	slug := fmt.Sprintf("episode-%s", time.Now().Format("2006-01-02T15-04-05.000000"))
 	EmitLog("Quality Guard (Ingest): using timestamp slug: %s (recordID: %s)", slug, recordID)
 
 	// [v0.4.21b] Duplicate guard: skip if a record with this slug already exists in the DB.
@@ -1815,6 +1815,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 5)
+	var slugIdx atomic.Int64
 
 	// [v0.4.21] Duplicate guard: track slugs within this batch request to prevent
 	// same-content items from being processed multiple times in a single RPC call.
@@ -1836,11 +1837,12 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			defer func() { <-sem }()
 
 			// Safe Phase 1: Skip Gemma generation, immediately use timestamp slug for safe queueing
-			// v0.4.30f: Use microsecond-precision UTC timestamp for human-readable filenames.
+			// v0.4.30f: Use microsecond-precision local-time timestamp for human-readable filenames.
 			// Store key (recordID) stays MD5-based for dedup and backward compat.
 			hash := md5.Sum([]byte(it.Summary))
 			recordID := fmt.Sprintf("episode-%x", hash)
-			slug := fmt.Sprintf("episode-%s", time.Now().UTC().Format("2006-01-02T15-04-05.000000"))
+			idx := slugIdx.Add(1) - 1
+			slug := fmt.Sprintf("episode-%s-%06d", time.Now().Format("2006-01-02T15-04-05.000000"), idx)
 			EmitLog("Quality Guard (BatchIngest): using timestamp slug: %s (recordID: %s)", slug, recordID)
 
 			// [v0.4.21] Duplicate guard 1: skip duplicate slugs within the same batch request
@@ -1902,7 +1904,7 @@ func handleBatchIngest(conn net.Conn, req RPCRequest) {
 			fm := frontmatter.EpisodeMetadata{
 				ID:        slug,
 				Title:     slug,
-				Created:   time.Now(),
+				Created:   now,
 				Tags:      it.Tags,
 				Topics:    topics,
 				SavedBy:   savedBy,
@@ -2052,7 +2054,9 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 			return nil
 		}
 
-		// Expect `episode-[hex].md` where length is between 19 (for 8-char old truncated hashes) and 43 (true MD5)
+		// Expect `episode-[hex].md` (MD5-based filenames from pre-v0.4.30f).
+		// Timestamp-based files (v0.4.30f+) pass the length check but are rejected
+		// by the hex validation below, as they contain non-hex characters (dashes, T, dots).
 		if !strings.HasPrefix(name, "episode-") || !strings.HasSuffix(name, ".md") {
 			return nil
 		}

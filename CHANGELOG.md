@@ -1,9 +1,19 @@
 # Changelog
 
+## [0.4.30g] - 2026-05-21
+
+### Fixed
+- **BUG-1 lifecycle reuse log suppressed by default**: The repeated `Singleton reused (BUG-1 guard active).` message is now gated behind `DEBUG_EPISODIC_PLUGIN_LIFECYCLE`. Set `=1` to restore the reuse log or `=2` to print register call counts, stack traces, and API identity diagnostics.
+- **Episode filenames keep device-local timestamps**: Timestamp-based episode filenames now use the device's local time (`time.Now()`) with microsecond precision, keeping filenames human-readable without UTC drift.
+
+### Changed
+- **Gemini direct default model updated**: The direct Gemini fallback now defaults to `gemini-3.1-flash-lite`, matching the non-preview model ID.
+- **Model/timestamp release bundled with BUG-1 log gate**: This release rolls up the local-time episode filename adjustment, Gemini model name refresh, and BUG-1 log suppression into one hotfix.
+
 ## [0.4.30f] - 2026-05-21
 
 ### Added
-- **Timestamp-based episode filenames (replaces opaque MD5 hashes)**: Episode files are now saved as `episode-{microsecond_utc_timestamp}.md` (e.g., `episode-2026-05-20T02-38-30.123456.md`) instead of `episode-{md5_hash}.md`. The timestamp is in UTC with microsecond precision, making collisions effectively impossible even with concurrent goroutines in batchIngest.
+- **Timestamp-based episode filenames (replaces opaque MD5 hashes)**: Episode files are now saved as `episode-{microsecond_local_timestamp}.md` (e.g., `episode-2026-05-20T02-38-30.123456.md`) instead of `episode-{md5_hash}.md`. The timestamp uses the device's local time with microsecond precision, making collisions effectively impossible even with concurrent goroutines in batchIngest.
 
 ### Changed
 - **HealingWorker Pass 2 (AI slug rename) removed entirely**: The Go sidecar's `HealingWorker` previously attempted to rename MD5-hash files to kebab-case slugs via gemma-4-31b-it, but consistently failed with "Poison Pill" errors. With timestamp filenames being human-readable at save time, the AI rename step is no longer needed. Removed: Pass 2 block (L2202-2270), `auditEpisodeQuality()` function, `RefineFailed` frontmatter field, `gemmaProv` local variable, and the `RefineFailed` skip guard. HealingWorker Pass 1/3/4 (embedding healing, score update, GC) are preserved.

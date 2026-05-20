@@ -627,6 +627,7 @@ const PluginConfigSchema = Type.Object(
 // 毎回 null にリセットされる。global に保存することで同一 Node.js プロセス内の
 // 全モジュールインスタンスが同一オブジェクトを共有する。
 const SINGLETON_KEY = Symbol.for("__episodic_claw_singleton__");
+const BUG1_REGISTER_CALL_COUNT_KEY = Symbol.for("__episodic_claw_bug1_register_call_count__");
 type SingletonType = {
   rpcClient: EpisodicCoreClient;
   retriever: EpisodicRetriever;
@@ -690,10 +691,20 @@ const episodicClawPlugin = {
         (global as any)[CLI_REGISTER_FLAG] = true;
       }
 
+      const lifecycleDebugLevel = process.env.DEBUG_EPISODIC_PLUGIN_LIFECYCLE;
+      const bug1RegisterCallCount = ((global as any)[BUG1_REGISTER_CALL_COUNT_KEY] ?? 0) + 1;
+      (global as any)[BUG1_REGISTER_CALL_COUNT_KEY] = bug1RegisterCallCount;
+
       // ─── プロセスレベルシングルトン初期化（BUG-1 修正 v2: global 経由）──────────
       // モジュールキャッシュが無効化されている環境では let _singleton は毎回 null になる。
       // Symbol.for() キーで global に保存し、同一プロセス内全インスタンスで共有する。
       _singleton = (global as any)[SINGLETON_KEY] ?? null;
+      if (lifecycleDebugLevel === "2") {
+        const bug1Phase = _singleton ? "reuse" : "create";
+        console.log(`[BUG-1 DIAG] register() call #${bug1RegisterCallCount} (${bug1Phase})`);
+        console.log(`[BUG-1 DIAG] stack: ${new Error().stack?.split("\n").slice(2, 6).join(" → ")}`);
+        console.log(`[BUG-1 DIAG] api identity: ${Object.prototype.toString.call(api)}, keys: ${Object.keys(api).join(",")}`);
+      }
       if (!_singleton) {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
         // [v0.4.19a Fix 0] プラグイン個別設定を優先。api.pluginConfig は DennouAibou の loader が
@@ -777,7 +788,9 @@ const episodicClawPlugin = {
           }
         })();
       } else {
-        console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
+        if (lifecycleDebugLevel === "1") {
+          console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
+        }
       }
 
       const { rpcClient, retriever, cfg, narrativeWorker } = _singleton;

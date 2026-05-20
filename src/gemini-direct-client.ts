@@ -77,7 +77,7 @@ export class GeminiDirectClient {
       });
     }
 
-    const model = opts?.modelOverride ?? "gemini-3.1-flash-lite-preview";
+    const model = opts?.modelOverride ?? "gemini-3.1-flash-lite";
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
     const controller = new AbortController();
