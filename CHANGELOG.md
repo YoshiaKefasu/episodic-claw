@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.31] - 2026-05-22
+
+### Fixed
+- **BUG-1 root cause (root fix, Episodic-Claw only)**: OpenClaw calls `register()` up to 3× per gateway startup via web-fetch-snapshot / memory-runtime / embedded-runtime paths. Prior mitigation (v0.4.30g) only suppressed the log. This release adds two gates in `register()`:
+  1. **web-fetch-snapshot no-op**: When the stack trace classifies the caller as web-fetch or secrets snapshot, `register()` returns before any config loading, singleton creation, or hook registration. The runtime is created later when a real memory event fires.
+  2. **WeakSet duplicate-API guard**: Within the same process, if the same `api` object calls `register()` twice, the second call is silently skipped (or logged at `DEBUG_EPISODIC_PLUGIN_LIFECYCLE=1`).
+- **Tech debt: `modRequire` for ESM compatibility**: `src/rpc-client.ts` used bare `require()` in two locations that would fail if imported via ESM (tsx). Migrated to `createRequire(__filename)` lifted to module scope as `modRequire`.
+
+### Added
+- `src/bug1-registration-origin.ts`: Pure-function origin classifier (`classifyRegistrationOrigin`) that parses `Error.stack` for OpenClaw internal function names to identify the caller path.
+- `test_bug1_registration_origin.ts`: Tests the classifier (4 origin paths + undefined → "unknown"), web-fetch no-op (hooks.length === 0), and duplicate-API guard (same api → hooks unchanged).
+- `DEBUG_EPISODIC_PLUGIN_LIFECYCLE=2`: Enhanced diagnostics — outputs origin, call count, stack (4 frames), and api identity. At `=1` outputs `Singleton reused` on duplicate API hits.
+
+### Changed
+- **Version bump to 0.4.31** (minor from 0.4.30x hotfix series): This release addresses the root cause rather than masking the symptom, warranting a minor version step.
+
+### Technical
+- **3-layer defense-in-depth**: (1) stack-based origin classifier, (2) WeakSet per-API dedup, (3) existing global singleton guard. Each layer degrades gracefully — if the classifier returns `"unknown"`, the WeakSet and singleton guard still prevent double initialization.
+- Plan: `docs/plans/v0.4.x/v0.4.31_bug1_episodic_claw_root_fix.md`
+
 ## [0.4.30g] - 2026-05-21
 
 ### Fixed

@@ -7,6 +7,8 @@ import * as net from "net";
 import * as os from "os";
 import * as fs from "fs";
 import * as https from "https";
+import { createRequire } from "node:module";
+const modRequire = createRequire(__filename);
 import type { CacheQueueItem } from "./narrative-queue";
 
 import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult } from "./types";
@@ -22,8 +24,7 @@ const getEnvVal = (k: string) => {
 };
 const getSpawn = () => {
   const cpName = "node:child" + "_process";
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  return require(cpName).spawn as any;
+  return modRequire(cpName).spawn as any;
 };
 const spawn = getSpawn();
 
@@ -956,7 +957,7 @@ export async function ingestColdStartSession(
 
   if (hasApiKey) {
     // v0.4.2: Split into 64K chunks and enqueue to cache DB for narrativization
-    const { splitIntoChunks, enqueueNarrativeChunks } = require("./narrative-queue");
+    const { splitIntoChunks, enqueueNarrativeChunks } = modRequire("./narrative-queue");
     const chunks = splitIntoChunks(rawText, agentWs, agentId, "cold-start", "cold-start-import", 0);
     try {
       await enqueueNarrativeChunks(client, chunks, onWake);

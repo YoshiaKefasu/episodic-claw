@@ -177,6 +177,7 @@ export async function runAnchorInjectionSmoke(): Promise<void> {
     "segmenter.js",
     "types.js",
     "utils.js",
+    "bug1-registration-origin.js",
     "runtime-mode.js",
   ]) {
     fs.copyFileSync(path.join("dist", file), path.join(runtimeDist, file));

@@ -18,6 +18,7 @@ import { initLanguageDetector } from "./lang-detect";
 import { tokenize } from "kuromojin";
 import { resolveRuntimeMode } from "./runtime-mode";
 import { stripUntrustedMetadataBlocks } from "./untrusted-metadata";
+import { classifyRegistrationOrigin, type RegistrationOrigin } from "./bug1-registration-origin";
 
 export interface OpenClawPluginApi {
   // フック登録 — openclaw types.ts の PluginHookName に準拠
@@ -628,6 +629,7 @@ const PluginConfigSchema = Type.Object(
 // 全モジュールインスタンスが同一オブジェクトを共有する。
 const SINGLETON_KEY = Symbol.for("__episodic_claw_singleton__");
 const BUG1_REGISTER_CALL_COUNT_KEY = Symbol.for("__episodic_claw_bug1_register_call_count__");
+const REGISTERED_API_SET_KEY = Symbol.for("__episodic_claw_registered_api_set__");
 type SingletonType = {
   rpcClient: EpisodicCoreClient;
   retriever: EpisodicRetriever;
@@ -675,6 +677,40 @@ const episodicClawPlugin = {
         return;
       }
 
+      const lifecycleDebugLevel = process.env.DEBUG_EPISODIC_PLUGIN_LIFECYCLE;
+      const bug1RegisterCallCount = ((global as any)[BUG1_REGISTER_CALL_COUNT_KEY] ?? 0) + 1;
+      (global as any)[BUG1_REGISTER_CALL_COUNT_KEY] = bug1RegisterCallCount;
+      const registrationOrigin = classifyRegistrationOrigin(new Error().stack);
+
+      if (lifecycleDebugLevel === "2") {
+        console.log(`[BUG-1 DIAG] register() call #${bug1RegisterCallCount} origin=${registrationOrigin}`);
+        console.log(`[BUG-1 DIAG] stack: ${new Error().stack?.split("\n").slice(2, 6).join(" → ")}`);
+        console.log(`[BUG-1 DIAG] api identity: ${Object.prototype.toString.call(api)}, keys: ${Object.keys(api).join(",")}`);
+      }
+
+      if (registrationOrigin === "web-fetch-snapshot") {
+        if (lifecycleDebugLevel === "2") {
+          console.log("[BUG-1 DIAG] skipped web-fetch snapshot registration");
+        }
+        return;
+      }
+
+      const globalRegistry = globalThis as Record<symbol, unknown>;
+      let registeredApis = globalRegistry[REGISTERED_API_SET_KEY] as WeakSet<OpenClawPluginApi> | undefined;
+      if (!registeredApis) {
+        registeredApis = new WeakSet<OpenClawPluginApi>();
+        globalRegistry[REGISTERED_API_SET_KEY] = registeredApis;
+      }
+      if (registeredApis.has(api)) {
+        if (lifecycleDebugLevel === "2") {
+          console.log("[BUG-1 DIAG] duplicate api registration skipped");
+        } else if (lifecycleDebugLevel === "1") {
+          console.log("[Episodic Memory] Singleton reused (BUG-1 guard active).");
+        }
+        return;
+      }
+      registeredApis.add(api);
+
       // デーモンモード: 初回のみ登録ログを出力
       if (!(global as any)[CLI_REGISTER_FLAG]) {
         // [v0.4.28d][D3] Emit structured runtime-mode event for canary observability.
@@ -691,20 +727,10 @@ const episodicClawPlugin = {
         (global as any)[CLI_REGISTER_FLAG] = true;
       }
 
-      const lifecycleDebugLevel = process.env.DEBUG_EPISODIC_PLUGIN_LIFECYCLE;
-      const bug1RegisterCallCount = ((global as any)[BUG1_REGISTER_CALL_COUNT_KEY] ?? 0) + 1;
-      (global as any)[BUG1_REGISTER_CALL_COUNT_KEY] = bug1RegisterCallCount;
-
       // ─── プロセスレベルシングルトン初期化（BUG-1 修正 v2: global 経由）──────────
       // モジュールキャッシュが無効化されている環境では let _singleton は毎回 null になる。
       // Symbol.for() キーで global に保存し、同一プロセス内全インスタンスで共有する。
       _singleton = (global as any)[SINGLETON_KEY] ?? null;
-      if (lifecycleDebugLevel === "2") {
-        const bug1Phase = _singleton ? "reuse" : "create";
-        console.log(`[BUG-1 DIAG] register() call #${bug1RegisterCallCount} (${bug1Phase})`);
-        console.log(`[BUG-1 DIAG] stack: ${new Error().stack?.split("\n").slice(2, 6).join(" → ")}`);
-        console.log(`[BUG-1 DIAG] api identity: ${Object.prototype.toString.call(api)}, keys: ${Object.keys(api).join(",")}`);
-      }
       if (!_singleton) {
         const openClawGlobalConfig = api.runtime?.config?.loadConfig?.() || {};
         // [v0.4.19a Fix 0] プラグイン個別設定を優先。api.pluginConfig は DennouAibou の loader が

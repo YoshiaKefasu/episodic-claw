@@ -55,6 +55,7 @@ export async function runGatewayStartSmoke(): Promise<void> {
     "transport-retry.js",
     "types.js",
     "utils.js",
+    "bug1-registration-origin.js",
     "runtime-mode.js"
   ];
   for (const file of distJsFiles) {
