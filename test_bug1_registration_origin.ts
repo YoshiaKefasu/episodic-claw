@@ -76,6 +76,7 @@ const distJsFiles = [
   "reasoning-tags.js",
   "retriever.js",
   "rpc-client.js",
+  "env-var.js",
   "runtime-mode.js",
   "segmenter.js",
   "summary-escalation.js",

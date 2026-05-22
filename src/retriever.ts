@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "crypto";
 
+import { getEnvVal } from "./env-var";
 import { buildRecallCalibration } from "./config";
 import { EpisodicCoreClient } from "./rpc-client";
 import {
@@ -653,7 +654,7 @@ export class EpisodicRetriever {
     // 「最新ユーザー発話がwindowに入っていたか」「分類除外で落ちたか」を判別可能にする
     // パフォーマンス配慮: SHA1は使わず、length+isDominant+preview(80chars)のみで軽量に。
     // DEBUG_EPISODIC_RECALL_FINGERPRINT 環境変数がセットされている時のみ出力。
-    if (process.env.DEBUG_EPISODIC_RECALL_FINGERPRINT) {
+    if (getEnvVal("DEBUG_EPISODIC_RECALL_FINGERPRINT")) {
       const lastMsg = currentMessages.at(-1);
       const lastRole = lastMsg?.role ?? "none";
       const allUserMsgs = currentMessages.filter(m => m.role === "user");

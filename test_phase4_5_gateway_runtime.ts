@@ -47,6 +47,7 @@ export async function runGatewayStartSmoke(): Promise<void> {
     "narrative-pool.js",
     "narrative-queue.js",
     "rpc-client.js",
+    "env-var.js",
     "runner_hardcoded.js",
     "runner.js",
     "summary-escalation.js",

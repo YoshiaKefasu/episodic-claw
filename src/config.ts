@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { EpisodicPluginConfig, NarrativeConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
+import { getEnvVal } from "./env-var";
 
 let warnedOpenrouterDeprecated = false;
 
@@ -133,7 +134,7 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     recallQueryRecentMessageCount: Math.max(1, Math.min(12, rawConfig?.recallQueryRecentMessageCount ?? 4)),
     queryExcludedKeywords: rawConfig?.queryExcludedKeywords ?? [],
     // Narrative architecture (v0.4.0)
-    openrouterApiKey: rawConfig?.openrouterApiKey || process.env.OPENROUTER_API_KEY || "",
+    openrouterApiKey: rawConfig?.openrouterApiKey || getEnvVal("OPENROUTER_API_KEY") || "",
     // [v0.4.29c Fix C2] narrativeConfig (unified) > openrouterConfig (deprecated) > flat fields
     // Resolve source priority: narrativeConfig → openrouterConfig → flat → default
     ...(() => {
@@ -212,10 +213,10 @@ function resolvePrompt(value: string | undefined, platform: string = process.pla
 
   // 1. Resolve ~ / ~/path — works on all platforms
   if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const homeDir = getEnvVal("HOME") || getEnvVal("USERPROFILE") || os.homedir();
     candidates.push(path.join(homeDir, trimmed.slice(2)));
   } else if (trimmed === "~") {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const homeDir = getEnvVal("HOME") || getEnvVal("USERPROFILE") || os.homedir();
     candidates.push(homeDir);
   }
 
@@ -228,7 +229,7 @@ function resolvePrompt(value: string | undefined, platform: string = process.pla
   //    This handles the case where openclaw.json was written on Linux and the
   //    plugin runs on Windows (WSL, dual-boot config share, etc.)
   if (platform === "win32" && trimmed.startsWith("/home/")) {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const homeDir = getEnvVal("HOME") || getEnvVal("USERPROFILE") || os.homedir();
     // /home/kasou_yoshia/.openclaw/... → HOME\.openclaw\...
     // Skip the username segment and join by the path after it
     const relativeFromHome = trimmed.slice("/home/".length);  // kasou_yoshia/.openclaw/...

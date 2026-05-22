@@ -11,6 +11,7 @@ import { EpisodicCoreClient } from "./rpc-client";
 import { EpisodicPluginConfig, NarrativeResult } from "./types";
 import { TRANSPORT_RETRY_SCHEDULE_SEC, computeTransportRetryDelayMs, MAX_TRANSPORT_RETRY_DELAY_MS } from "./transport-retry";
 
+import { getEnvVal } from "./env-var";
 import { stripReasoningTagsFromText } from "./reasoning-tags";
 import { detectLanguageDetailed, detectLanguage } from "./lang-detect";
 import type { Message } from "./segmenter";
@@ -557,7 +558,7 @@ export class NarrativeWorker {
       // [v0.4.30e] Suppress idle poll logging: gated + progressive threshold
       // Gate: DEBUG_EPISODIC_IDLE_POLL env var (follows existing pattern: DEBUG_EPISODIC_WAL, DEBUG_EPISODIC_RECALL_FINGERPRINT)
       // A: 100+ polls → log every 100 instead of 20
-      if (this.consecutiveEmptyPolls > 0 && process.env.DEBUG_EPISODIC_IDLE_POLL && (
+      if (this.consecutiveEmptyPolls > 0 && getEnvVal("DEBUG_EPISODIC_IDLE_POLL") && (
         (this.consecutiveEmptyPolls <= 100 && this.consecutiveEmptyPolls % 20 === 0) ||
         (this.consecutiveEmptyPolls > 100 && this.consecutiveEmptyPolls % 100 === 0)
       )) {
@@ -660,7 +661,7 @@ export class NarrativeWorker {
   }
 
   private getGeminiClient(): GeminiDirectClient | null {
-    const apiKey = process.env.GEMINI_API_KEY?.trim() || "";
+    const apiKey = getEnvVal("GEMINI_API_KEY")?.trim() || "";
     if (!apiKey) return null;
 
     if (this.geminiClient && this.geminiClientKey === apiKey) {

@@ -142,6 +142,7 @@ export async function runPhase7EscalationAndRepairSmoke(): Promise<void> {
     "large-payload.js",
     "untrusted-metadata.js",
     "rpc-client.js",
+    "env-var.js",
     "segmenter.js",
     "reasoning-tags.js",
     "openrouter-client.js",
