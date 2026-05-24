@@ -533,6 +533,55 @@ function scoreOf(result: RecallRpcEpisodeResult): number {
   return 0;
 }
 
+function freshnessOf(result: RecallRpcEpisodeResult): number | null {
+  return typeof result?.freshnessScore === "number" && Number.isFinite(result.freshnessScore)
+    ? result.freshnessScore
+    : null;
+}
+
+function timestampOf(result: RecallRpcEpisodeResult): number | null {
+  const rawTimestamp = result?.Record?.timestamp;
+  if (typeof rawTimestamp === "string" || typeof rawTimestamp === "number") {
+    const parsed = new Date(rawTimestamp).getTime();
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function selectTemporalTop1(results: RecallRpcEpisodeResult[]): RecallRpcEpisodeResult | null {
+  if (results.length === 0) return null;
+
+  return results.reduce((best, candidate) => {
+    const bestFreshness = freshnessOf(best);
+    const candidateFreshness = freshnessOf(candidate);
+    if (bestFreshness !== null || candidateFreshness !== null) {
+      if (bestFreshness === null) return candidate;
+      if (candidateFreshness === null) return best;
+      if (candidateFreshness !== bestFreshness) {
+        return candidateFreshness > bestFreshness ? candidate : best;
+      }
+    }
+
+    const bestTimestamp = timestampOf(best);
+    const candidateTimestamp = timestampOf(candidate);
+    if (bestTimestamp !== null || candidateTimestamp !== null) {
+      if (bestTimestamp === null) return candidate;
+      if (candidateTimestamp === null) return best;
+      if (candidateTimestamp !== bestTimestamp) {
+        return candidateTimestamp > bestTimestamp ? candidate : best;
+      }
+    }
+
+    const bestScore = scoreOf(best);
+    const candidateScore = scoreOf(candidate);
+    if (candidateScore !== bestScore) {
+      return candidateScore > bestScore ? candidate : best;
+    }
+
+    return best;
+  });
+}
+
 function autoInjectGuardMinScore(config?: EpisodicPluginConfig): number {
   const value = config?.autoInjectGuardMinScore;
   if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_AUTO_INJECT_GUARD_MIN_SCORE;
@@ -788,58 +837,19 @@ export class EpisodicRetriever {
         .slice()
         .sort((a, b) => scoreOf(b.item) - scoreOf(a.item));
       const diagnostics = buildRecallDiagnostics(deduped.map((entry) => entry.item));
+      const topCandidates = deduped.slice(0, Math.max(0, Math.min(k, deduped.length)));
+      const eligibleCandidates: Array<{ ws: string; item: RecallRpcEpisodeResult }> = [];
       let degradedLowConfidenceCount = 0;
 
-      for (let index = 0; index < deduped.length; index += 1) {
-        const res = deduped[index].item;
-        if (shouldSkipDegradedFallbackInjection(res, minAutoInjectScore)) {
+      for (const candidate of topCandidates) {
+        if (shouldSkipDegradedFallbackInjection(candidate.item, minAutoInjectScore)) {
           degradedLowConfidenceCount += 1;
           continue;
         }
-        const recordTitle = typeof res.Record?.title === "string" ? res.Record.title : "";
-        const recordId = typeof res.Record?.id === "string" ? res.Record.id : "";
-        const recordTimestamp = typeof res.Record?.timestamp === "string" || typeof res.Record?.timestamp === "number"
-          ? res.Record.timestamp
-          : null;
-        const title = recordTitle || recordId || "Unknown";
-        const date = recordTimestamp ? new Date(recordTimestamp).toISOString().split("T")[0] : "unknown date";
-        const score = scoreOf(res) !== 0 ? scoreOf(res).toFixed(3) : "N/A";
-
-        const episodeId =
-          typeof res?.Record?.id === "string"
-            ? res.Record.id.trim()
-            : typeof res?.Record?.ID === "string"
-              ? res.Record.ID.trim()
-              : "";
-        const bodyText = res.Body ? res.Body.trim() : "(nothing stored here)";
-        const entryTokens = estimateTokens(bodyText);
-
-        if (tokenCount + entryTokens > maxTokens) {
-          const remainingIds = deduped.slice(index).map(r => r.item.Record?.id).filter(Boolean);
-          truncatedEpisodeCount = remainingIds.length;
-          assembled += `\n(${remainingIds.length} more matched but I hit my token limit. I can pull those up with ep-recall:)\n`;
-          assembled += remainingIds.map(id => `- ${id}`).join("\n") + "\n";
-          break;
-        }
-
-        assembled += `[${title} · ${date} · relevance: ${score}]\n`;
-        assembled += bodyText + "\n\n";
-        tokenCount += entryTokens;
-        injectedEpisodeCount += 1;
-        if (episodeId) {
-          injectedEpisodeIds.push(episodeId);
-        }
-        if (!firstEpisodeId && episodeId) {
-          firstEpisodeId = episodeId;
-        }
-        if (episodeId) {
-          const bucket = injectedIdsByWs.get(agentWs) ?? [];
-          bucket.push(episodeId);
-          injectedIdsByWs.set(agentWs, bucket);
-        }
+        eligibleCandidates.push(candidate);
       }
 
-      if (injectedEpisodeCount === 0) {
+      if (eligibleCandidates.length === 0) {
         if (degradedLowConfidenceCount > 0) {
           console.warn(
             `[Episodic Memory] auto inject guard skipped degraded semantic fallback results (count=${degradedLowConfidenceCount}, threshold=${minAutoInjectScore}, queryHash=${queryHash})`
@@ -856,8 +866,66 @@ export class EpisodicRetriever {
             recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
           };
         }
-        return { text: "", episodeIds: [], reason: "recall_empty", queryHash, injectedEpisodeCount: 0, truncatedEpisodeCount: 0, firstEpisodeId: "", diagnostics,
-          recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query) };
+        return {
+          text: "",
+          episodeIds: [],
+          reason: "recall_empty",
+          queryHash,
+          injectedEpisodeCount: 0,
+          truncatedEpisodeCount: 0,
+          firstEpisodeId: "",
+          diagnostics,
+          recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
+        };
+      }
+
+      const selectedResult = selectTemporalTop1(eligibleCandidates.map((candidate) => candidate.item));
+      const selectedEntry = eligibleCandidates.find((candidate) => candidate.item === selectedResult) ?? eligibleCandidates[0];
+      const res = selectedEntry.item;
+      const recordTitle = typeof res.Record?.title === "string" ? res.Record.title : "";
+      const recordId = typeof res.Record?.id === "string" ? res.Record.id : "";
+      const recordTimestamp = typeof res.Record?.timestamp === "string" || typeof res.Record?.timestamp === "number"
+        ? res.Record.timestamp
+        : null;
+      const title = recordTitle || recordId || "Unknown";
+      const date = recordTimestamp ? new Date(recordTimestamp).toISOString().split("T")[0] : "unknown date";
+      const score = scoreOf(res) !== 0 ? scoreOf(res).toFixed(3) : "N/A";
+
+      const episodeId =
+        typeof res?.Record?.id === "string"
+          ? res.Record.id.trim()
+          : typeof res?.Record?.ID === "string"
+            ? res.Record.ID.trim()
+            : "";
+      const bodyText = res.Body ? res.Body.trim() : "(nothing stored here)";
+      const entryTokens = estimateTokens(bodyText);
+
+      if (entryTokens > maxTokens) {
+        return {
+          text: "",
+          episodeIds: [],
+          reason: "recall_empty",
+          queryHash,
+          injectedEpisodeCount: 0,
+          truncatedEpisodeCount: 0,
+          firstEpisodeId: "",
+          diagnostics,
+          recallQueryDebug: buildRecallQueryDebug(recentMessageCount, eligibleCount, skippedCount, dominantScript, query),
+        };
+      }
+
+      assembled += `[${title} · ${date} · relevance: ${score}]\n`;
+      assembled += bodyText + "\n\n";
+      tokenCount += entryTokens;
+      injectedEpisodeCount = 1;
+      if (episodeId) {
+        injectedEpisodeIds.push(episodeId);
+      }
+      if (episodeId) {
+        firstEpisodeId = episodeId;
+        const bucket = injectedIdsByWs.get(selectedEntry.ws) ?? [];
+        bucket.push(episodeId);
+        injectedIdsByWs.set(selectedEntry.ws, bucket);
       }
 
       assembled += "--- End of Memory ---\n";

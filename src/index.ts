@@ -493,19 +493,9 @@ const PluginConfigSchema = Type.Object(
       minimum: 0,
       description: "Warm-start cursor bootstrap threshold. Messages >= this on first before_prompt_build trigger cursor sync. Default: 50. Set 0 to disable."
     })),
-    maxBufferChars: Type.Optional(Type.Integer({
-      minimum: 500,
-      description: "Deprecated (v0.4.22c): No longer used. 64K token hard cap (HARD_TOKEN_CAP) replaces this. Retained for backward compatibility only."
-    })),
     maxCharsPerChunk: Type.Optional(Type.Integer({
       minimum: 500,
-      description: "Deprecated (legacy-only): max characters per chunk for the old batchIngest path. No longer used in the v0.4.x narrative cache path. Retained for backward compatibility only. Default: 9000."
-    })),
-    sharedEpisodesDir: Type.Optional(Type.String({
-      description: "Disabled and ignored. Shared episodes directories are no longer used at runtime."
-    })),
-    allowCrossAgentRecall: Type.Optional(Type.Boolean({
-      description: "Disabled and ignored. Cross-agent recall is no longer used at runtime."
+      description: "Legacy batchIngest chunk size for the old batchIngest path. Retained for backward compatibility only. Default: 9000."
     })),
     segmentationLambda: Type.Optional(Type.Number({
       description: "Adaptive segmentation: threshold = mean + lambda * std."
@@ -579,10 +569,6 @@ const PluginConfigSchema = Type.Object(
     })),
     narrativeUserPromptTemplate: Type.Optional(Type.String({
       description: "Custom user prompt template for narrative generation. Variables: {previousEpisode}, {conversationText}"
-    })),
-    maxPoolChars: Type.Optional(Type.Integer({
-      minimum: 1000,
-      description: "Deprecated (v0.4.22c): No longer used. Pool is a passive accumulator; boundary is decided by segmenter (surprise / 64K hard cap / idle / time-gap / force-flush). Retained for backward compatibility only."
     })),
     narrativePreviousEpisodeRef: Type.Optional(Type.Boolean({
       description: "Pass the full previous episode to the LLM for context continuity. Default: true."
@@ -840,12 +826,11 @@ const episodicClawPlugin = {
         if (existing) return existing;
 
         // Narrative architecture (v0.4.0) — pool is per-agent, worker is shared
-        const pool = narrativeWorker ? new NarrativePool(cfg.maxPoolChars ?? 15000) : null;
+        const pool = narrativeWorker ? new NarrativePool() : null;
 
         const segmenter = new EventSegmenter(
           rpcClient,
           cfg.dedupWindow,
-          // [v0.4.22c] cfg.maxBufferChars removed — replaced by HARD_TOKEN_CAP
           cfg.maxCharsPerChunk,
           {
             lambda: cfg.segmentationLambda,
@@ -1329,7 +1314,7 @@ const episodicClawPlugin = {
         // ── メモリ注入（tokenBudget なし → 固定上限）──
         // before_prompt_build は tokenBudget を受け取らないため、安全側の固定値を使う。
         const ESTIMATED_MAX_EPISODIC_TOKENS = 1024;
-        const k = 5;
+        const k = 7;
 
         // アンカー注入（after_compaction でセットされた状態があれば）
         let anchorPrependText = "";
@@ -1537,7 +1522,7 @@ const episodicClawPlugin = {
             : 0;
           const reserveTokens = cfg.reserveTokens ?? 2048;
           const maxEpisodicTokens = Math.max(0, totalBudget - reserveTokens);
-          const k = 5;
+          const k = 7;
 
           if (maxEpisodicTokens <= 0) {
             return { messages: msgs, prependSystemContext: "", estimatedTokens: 0 };

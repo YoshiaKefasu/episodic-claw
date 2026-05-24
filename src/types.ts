@@ -84,12 +84,7 @@ export interface EpisodicPluginConfig {
    *  0 に設定すると warm-start ガードを無効化。
    *  デフォルト: 50 */
   warmStartSkipMinMessages?: number;
-  /** buffer サイズ上限 flush トリガー（文字数、デフォルト 7200）。
-   *  Advanced: live flush guard for the segmenter. Forces flush regardless of surprise/time-gap.
-   *  この値を超えると Surprise に関わらず強制 flush される。500 未満は非推奨。 */
-  maxBufferChars?: number;
-  /** Deprecated (legacy-only): batchIngest に送る 1 チャンクの最大文字数（デフォルト 9000）。
-   *  v0.4.x の narrative cache path では使用されない。後方互換のために残存。500 未満は非推奨。 */
+  /** Legacy batchIngest chunk size (Default: 9000). Retained for backward compatibility. */
   maxCharsPerChunk?: number;
   /** 動的セグメンテーション: 閾値 = mean + lambda * std */
   segmentationLambda?: number;
@@ -149,8 +144,6 @@ export interface EpisodicPluginConfig {
   narrativeSystemPrompt?: string;
   /** Narrative user prompt template (inline text). */
   narrativeUserPromptTemplate?: string;
-  /** Advanced: maximum characters to pool before forcing a flush to the cache queue. Default: 15000. */
-  maxPoolChars?: number;
   /** Pass the full previous episode to the LLM for context continuity. */
   narrativePreviousEpisodeRef?: boolean;
   /** Deprecated: legacy alias for openrouterConfig.temperature. Use openrouterConfig.temperature instead. */

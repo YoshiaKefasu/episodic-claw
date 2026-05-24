@@ -147,14 +147,11 @@ openclaw plugins install clawhub:episodic-claw
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> 调参指南 (openclaw.plugin.json)
 
 默认参数已经是我们测试过最完美的黄金比例了。
-*注意：像 `maxBufferChars` 或 `maxPoolChars` 这种旧设定的硬参数在引擎盖底下确实还留着（为了兼容性），但它们已经被降级为“进阶/旧版专用（Advanced/Legacy）”了。日常玩家根本不用碰它们。*
 
 | 键值名 | 默认值 | 炸膛风险（乱改会怎样？） |
 |---|---|---|
 | `reserveTokens` | `2048` | **设太大:** AI 满脑子全是祖传记忆，直接被当前的聊天内容卡死。**设太小:** AI 退化成七秒记忆的残障儿童。 |
 | `dedupWindow` | `5` | **设太大:** 你重复叫 AI 干一件事，它可能会擅自忽视。**设太小:** 弱网段重发两句，数据库就多出两条垃圾。 |
-| `maxBufferChars` | `7200` | **[Advanced]** 现场实时处理时，不等话题自然偏移就强行把缓存截断塞进 Cache 的封顶大闸。 |
-| `maxPoolChars` | `15000` | **[Advanced]** 连续剧情节池的狂暴泄洪阀门。只要池子文字超过这个数，强子就立刻发车去干活编剧本。 |
 | `maxCharsPerChunk` | `9000` | **[Legacy]** 上个世纪遗留的 `chunkAndIngest` 旧版老古董兼容参数，新版连续剧系统鸟都不鸟它。 |
 | `segmentationLambda` | `2.0` | 切割话题的下刀敏锐度。**设太大:** 从来不切记忆，滚成一团大泥巴。**设太小:** 稍微换个体面借口打个招呼，它就给你咔嚓硬生生切一段新记忆。 |
 | `recallSemanticFloor` | `(空)` | **设太大:** 有极度重度强迫症的 AI 觉得毫无完美记忆可用，最后什么都想不起来。**设太小:** 把两万年前不相干的垃圾带出来，骗人胡说八道。 |

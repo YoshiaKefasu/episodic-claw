@@ -10,11 +10,8 @@ import { PoolFlushItem } from "./types";
 export class NarrativePool {
   private buffer: Message[] = [];
   private charCount: number = 0;
-  private maxPoolChars: number;
 
-  constructor(maxPoolChars: number) {
-    this.maxPoolChars = Math.max(1000, maxPoolChars);
-  }
+  constructor() {}
 
   /**
    * Add messages to the pool (passive accumulator — always returns null).
@@ -29,7 +26,6 @@ export class NarrativePool {
       this.charCount += text.length;
     }
 
-    // [v0.4.22c] maxPoolChars check removed — pool no longer auto-flushes by size.
     // Flush is triggered by segmenter boundaries only (surprise/64K/idle/time-gap/force-flush).
     return null;
   }

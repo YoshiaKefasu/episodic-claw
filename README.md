@@ -193,15 +193,12 @@ The AI can use these automatically, or you can explicitly tell it to use them.
 
 ## <img src="./assets/icons/cog.svg" width="24" align="center" alt="" /> Configuration (openclaw.plugin.json)
 
-The defaults are already heavily tuned. 
-*Note: Old limits like `maxBufferChars` or `maxPoolChars` still exist under the hood for runtime compatibility, but they have been downgraded to "Advanced/Legacy" knobs. You don't need to touch them anymore.*
+The defaults are already heavily tuned.
 
 | Key | Default | Blast Radius (What happens if you tweak it?) |
 |---|---|---|
 | `reserveTokens` | `2048` | **Too high:** The AI's brain gets too crowded and crashes on your current question. **Too low:** It becomes a forgetful goldfish. |
 | `dedupWindow` | `5` | **Too high:** The AI might wrongly ignore repeated commands. **Too low:** Your DB floods with double-posts when the network lags. |
-| `maxBufferChars` | `7200` | **[Advanced]** Serves as an upper limit in the live path to forcefully flush the buffer into the Cache DB before a natural topic shift occurs. |
-| `maxPoolChars` | `15000` | **[Advanced]** Serves as the threshold trigger for the narrative pool. Exceeding this forcefully executes the sequential episode generation. |
 | `maxCharsPerChunk` | `9000` | **[Legacy]** Compatibility parameter strictly for the legacy `chunkAndIngest` path. Purely irrelevant for modern narrative users. |
 | `segmentationLambda` | `2.0` | Topic sensitivity. **Too high:** It never cuts the memory, creating huge blobs. **Too low:** The AI snaps memories in half just because you used a new fancy word. |
 | `recallSemanticFloor` | `(unset)` | **Too high:** Perfectionist AI refuses to recall *anything*. **Too low:** It drags up totally unrelated garbage and starts lying (hallucination). |

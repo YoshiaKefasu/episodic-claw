@@ -68,7 +68,6 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "anchorInjectionAssembles",
     "dedupWindow",
     "warmStartSkipMinMessages",
-    "maxBufferChars",
     "maxCharsPerChunk",
     "segmentationLambda",
     "segmentationWarmupCount",
@@ -96,7 +95,6 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "openrouterMaxRetries",
     "narrativeSystemPrompt",
     "narrativeUserPromptTemplate",
-    "maxPoolChars",
     "narrativePreviousEpisodeRef",
     "narrativeTemperature",
     "openrouterReasoning",
@@ -133,7 +131,6 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "anchorInjectionAssembles",
     "dedupWindow",
     "warmStartSkipMinMessages",
-    "maxBufferChars",
     "maxCharsPerChunk",
     "segmentationLambda",
     "segmentationWarmupCount",
@@ -161,7 +158,6 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "openrouterMaxRetries",
     "narrativeSystemPrompt",
     "narrativeUserPromptTemplate",
-    "maxPoolChars",
     "narrativePreviousEpisodeRef",
     "narrativeTemperature",
     "openrouterReasoning",
@@ -240,7 +236,6 @@ test("loadConfig({}) returns correct defaults for all fields", () => {
   assert.equal(cfg.anchorInjectionAssembles, 1);
   assert.equal(cfg.dedupWindow, 5);
   assert.equal(cfg.warmStartSkipMinMessages, 50);
-  assert.equal(cfg.maxBufferChars, 7200);
   assert.equal(cfg.maxCharsPerChunk, 9000);
   assert.equal(cfg.segmentationLambda, 2.0);
   assert.equal(cfg.segmentationWarmupCount, 10);  // Phase 3: was 20
@@ -265,7 +260,6 @@ test("loadConfig({}) returns correct defaults for all fields", () => {
   assert.equal(cfg.openrouterTimeoutMs, 30000, "default timeoutMs should be 30000");
   assert.equal(cfg.openrouterMaxRetries, 3, "default maxRetries should be 3");
   assert.equal(cfg.narrativeTemperature, 0.4);
-  assert.equal(cfg.maxPoolChars, 15000);
   assert.equal(cfg.narrativePreviousEpisodeRef, true);
 });
 

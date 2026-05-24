@@ -596,6 +596,128 @@ async function tokenizeCjk(text, lang) {
   );
   assert.equal(anchorAwareOutcome.reason, "injected", "anchor-aware recall should still inject when recall returns results");
   assert.match(capturedQuery, /最新|手書き|習慣/, "latestUserAnchor keywords should be reflected in final recall query");
+
+  // v0.4.32: auto recall should keep Top-7 candidates but inject only the freshest Top-1
+  const temporalTop1Client = {
+    async recall() {
+      return [
+        {
+          Record: { id: "episode-1", title: "Episode 1", timestamp: "2026-04-01T00:00:00Z" },
+          Body: "Body 1",
+          matchedBy: "semantic",
+          Score: 0.97,
+          freshnessScore: 0.10,
+        },
+        {
+          Record: { id: "episode-2", title: "Episode 2", timestamp: "2026-04-02T00:00:00Z" },
+          Body: "Body 2",
+          matchedBy: "semantic",
+          Score: 0.96,
+          freshnessScore: 0.20,
+        },
+        {
+          Record: { id: "episode-3", title: "Episode 3", timestamp: "2026-04-03T00:00:00Z" },
+          Body: "Body 3",
+          matchedBy: "semantic",
+          Score: 0.95,
+          freshnessScore: 0.30,
+        },
+        {
+          Record: { id: "episode-4", title: "Episode 4", timestamp: "2026-04-04T00:00:00Z" },
+          Body: "Body 4",
+          matchedBy: "semantic",
+          Score: 0.94,
+          freshnessScore: 0.40,
+        },
+        {
+          Record: { id: "episode-5", title: "Episode 5", timestamp: "2026-04-05T00:00:00Z" },
+          Body: "Body 5 — should win by freshness",
+          matchedBy: "semantic",
+          Score: 0.93,
+          freshnessScore: 0.99,
+        },
+        {
+          Record: { id: "episode-6", title: "Episode 6", timestamp: "2026-04-06T00:00:00Z" },
+          Body: "Body 6",
+          matchedBy: "semantic",
+          Score: 0.92,
+          freshnessScore: 0.50,
+        },
+        {
+          Record: { id: "episode-7", title: "Episode 7", timestamp: "2026-04-07T00:00:00Z" },
+          Body: "Body 7",
+          matchedBy: "semantic",
+          Score: 0.91,
+          freshnessScore: 0.60,
+        },
+        {
+          Record: { id: "episode-8", title: "Episode 8", timestamp: "2026-04-08T00:00:00Z" },
+          Body: "Body 8 — freshest overall but outside Top-7 score window",
+          matchedBy: "semantic",
+          Score: 0.01,
+          freshnessScore: 1.00,
+        },
+      ];
+    },
+    async recallFeedback() {
+      return "ok";
+    },
+  };
+
+  const temporalTop1Retriever = new EpisodicRetriever(temporalTop1Client as any, undefined);
+  const temporalTop1Outcome = await temporalTop1Retriever.retrieveRelevantContext(
+    [{ role: "user", content: "temporal top one selection freshness timestamp verification request" } as any],
+    "/tmp/episodes",
+    7,
+    2048
+  );
+  assert.equal(temporalTop1Outcome.reason, "injected", "temporal Top-1 recall should inject exactly one result");
+  assert.equal(temporalTop1Outcome.injectedEpisodeCount, 1, "temporal Top-1 should inject exactly one episode");
+  assert.deepEqual(temporalTop1Outcome.episodeIds, ["episode-5"], "freshnessScore should choose the freshest candidate within Top-7");
+  assert.equal(temporalTop1Outcome.firstEpisodeId, "episode-5", "firstEpisodeId should match the selected Top-1 episode");
+  assert.match(temporalTop1Outcome.text, /Body 5 — should win by freshness/, "selected episode body should be injected");
+  assert.doesNotMatch(temporalTop1Outcome.text, /Body 8 — freshest overall/, "Top-8 candidate must not be selected when outside Top-7");
+
+  const timestampFallbackClient = {
+    async recall() {
+      return [
+        {
+          Record: { id: "ts-1", title: "TS 1", timestamp: "2026-04-01T00:00:00Z" },
+          Body: "TS Body 1",
+          matchedBy: "semantic",
+          Score: 0.80,
+        },
+        {
+          Record: { id: "ts-2", title: "TS 2", timestamp: "2026-04-03T00:00:00Z" },
+          Body: "TS Body 2",
+          matchedBy: "semantic",
+          Score: 0.79,
+        },
+        {
+          Record: { id: "ts-3", title: "TS 3", timestamp: "2026-04-05T00:00:00Z" },
+          Body: "TS Body 3 — should win by timestamp",
+          matchedBy: "semantic",
+          Score: 0.78,
+        },
+      ];
+    },
+    async recallFeedback() {
+      return "ok";
+    },
+  };
+
+  const timestampFallbackRetriever = new EpisodicRetriever(timestampFallbackClient as any, undefined);
+  const timestampFallbackOutcome = await timestampFallbackRetriever.retrieveRelevantContext(
+    [{ role: "user", content: "freshness score missing timestamp fallback verification request" } as any],
+    "/tmp/episodes",
+    7,
+    2048
+  );
+  assert.equal(timestampFallbackOutcome.reason, "injected", "timestamp fallback recall should inject exactly one result");
+  assert.equal(timestampFallbackOutcome.injectedEpisodeCount, 1, "timestamp fallback should inject exactly one episode");
+  assert.deepEqual(timestampFallbackOutcome.episodeIds, ["ts-3"], "timestamp fallback should choose the newest candidate when freshnessScore is absent");
+  assert.equal(timestampFallbackOutcome.firstEpisodeId, "ts-3", "firstEpisodeId should match the timestamp-selected episode");
+  assert.match(timestampFallbackOutcome.text, /TS Body 3 — should win by timestamp/, "timestamp-selected episode body should be injected");
 }
 
 export async function runRetrieverRuntimeRegression(): Promise<void> {

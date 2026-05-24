@@ -34,7 +34,6 @@ export class EventSegmenter {
   private lastProcessedLength = 0; // Track length to process only new messages
   private turnSeq = 0;
   private dedupWindow: number;
-  // [v0.4.22c] maxBufferChars removed — replaced by HARD_TOKEN_CAP (64K token hard cap)
   // [v0.4.22c-audit] Running token count — updated incrementally to avoid O(N) re-scan
   private bufferTokenCount = 0;
   private maxCharsPerChunk: number;
@@ -398,7 +397,6 @@ export class EventSegmenter {
   constructor(
     rpc: EpisodicCoreClient,
     dedupWindow = 5,
-    // [v0.4.22c] maxBufferChars removed — replaced by HARD_TOKEN_CAP
     maxCharsPerChunk = 9000,
     tuning?: {
       lambda?: number;
@@ -414,7 +412,6 @@ export class EventSegmenter {
   ) {
     this.rpc = rpc;
     this.dedupWindow = dedupWindow;
-    // [v0.4.22c] maxBufferChars assignment removed
     this.maxCharsPerChunk = maxCharsPerChunk;
     this.segmentationLambda = Math.max(0, tuning?.lambda ?? 2.0);
     this.segmentationWarmupCount = Math.max(0, tuning?.warmupCount ?? 10);  // Phase 3: was 20

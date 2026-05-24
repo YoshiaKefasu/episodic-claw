@@ -112,7 +112,6 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     dedupWindow: rawConfig?.dedupWindow ?? 5,
     // [v0.4.21b] Warm-start cursor bootstrap threshold (default 50, 0 to disable)
     warmStartSkipMinMessages: Math.max(0, rawConfig?.warmStartSkipMinMessages ?? 50),
-    maxBufferChars: Math.max(500, rawConfig?.maxBufferChars ?? 7200),
     maxCharsPerChunk: Math.max(500, rawConfig?.maxCharsPerChunk ?? 9000),
     segmentationLambda: rawConfig?.segmentationLambda ?? 2.0,
     segmentationWarmupCount: rawConfig?.segmentationWarmupCount ?? 10,  // Phase 3: was 20
@@ -175,7 +174,6 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     })(),
     narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt, platform),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate, platform),
-    maxPoolChars: Math.max(1000, rawConfig?.maxPoolChars ?? 15000),
     narrativePreviousEpisodeRef: rawConfig?.narrativePreviousEpisodeRef ?? true,
     // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
     // narrativeExpectedLanguage: undefined = auto (no check). Only accept valid language codes.

@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Deprecated config schema cleanup (v0.4.32 scope)**: removed schema-only dead keys `sharedEpisodesDir`, `allowCrossAgentRecall`, `maxBufferChars`, and `maxPoolChars` from `openclaw.plugin.json` / `src/index.ts` / docs. Kept `maxCharsPerChunk` and `openrouterConfig` intact because they still have live runtime compatibility paths. Existing configs that still mention the removed keys will now fail schema validation on load.
+
 ## [0.4.31b] - 2026-05-22
 
 ### Fixed
