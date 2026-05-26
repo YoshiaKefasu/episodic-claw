@@ -434,6 +434,7 @@ function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0
   assert.ok(goMainSource.includes('"cache.leaseNext"'), "Go should skip logging cache.leaseNext");
   assert.ok(rpcSource.includes("levelPattern"), "rpc-client should parse log level from stderr");
   assert.ok(rpcSource.includes('case "info"'), "rpc-client should route info to console.log");
+  assert.ok(rpcSource.includes("async parseJapaneseQuery"), "rpc-client should expose parseJapaneseQuery for Go parser fallback");
 
   console.log(`  Gate A (idle poll wake latency): real NarrativeWorker instance verified — full lease-success path exercised (lease=${leaseNextCallCount}, narrativize=${narrativizeCallCount}, batchIngest=${batchIngestCallCount}, ack=${ackCallCount}, retry=${retryCallCount}), 15s cap reset to 1s in <10ms, timer cleared, all 4 enqueue paths wired, no regression`);
 }

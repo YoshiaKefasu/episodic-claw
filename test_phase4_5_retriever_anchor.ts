@@ -764,6 +764,7 @@ export async function runRetrieverRuntimeRegression(): Promise<void> {
   assert.ok(retrieverSourceForSync.includes("export function classifyAndStripAttachment"), "retriever should export classifyAndStripAttachment (unified single-pass replacement)");
   assert.ok(retrieverSourceForSync.includes("export function detectDominantScript"), "retriever should export detectDominantScript");
   assert.ok(retrieverSourceForSync.includes("export async function instantDeterministicRewrite") || retrieverSourceForSync.includes("export function instantDeterministicRewrite"), "retriever should export instantDeterministicRewrite");
+  assert.ok(retrieverSourceForSync.includes("buildRecallQueryWithGoFallback"), "retriever should have Go fallback wrapper");
   assert.ok(retrieverSourceForSync.includes("export async function extractPolyglotKeywords") || retrieverSourceForSync.includes("export function extractPolyglotKeywords"), "retriever should export extractPolyglotKeywords");
 
   // Verify CJK keyword extraction scripts
@@ -963,6 +964,10 @@ export async function runPolyglotQueryMorphologicalTests(): Promise<void> {
     "instantDeterministicRewrite should be async (Promise<string>)"
   );
   assert.ok(
+    retrieverSource.includes("buildRecallQueryWithGoFallback"),
+    "retriever should add Go fallback wrapper for recall query construction"
+  );
+  assert.ok(
     retrieverSource.includes("export function splitByScript"),
     "retriever should export splitByScript for mixed-text handling"
   );
@@ -975,8 +980,14 @@ export async function runPolyglotQueryMorphologicalTests(): Promise<void> {
     "retriever should import tokenizeCjk from cjk-tokenizer"
   );
   assert.ok(
-    retrieverSource.includes("await instantDeterministicRewrite") || retrieverSource.includes("await instantDeterministicRewrite("),
-    "retrieveRelevantContext should await instantDeterministicRewrite"
+    retrieverSource.includes("await this.buildRecallQueryWithGoFallback(recentMessages)"),
+    "retrieveRelevantContext should await buildRecallQueryWithGoFallback"
+  );
+
+  const rpcClientSource = fs.readFileSync(path.resolve("src", "rpc-client.ts"), "utf8");
+  assert.ok(
+    rpcClientSource.includes("async parseJapaneseQuery"),
+    "rpc-client should expose parseJapaneseQuery for Go-side Japanese parsing"
   );
 
   // ── Verify lang-detect.ts exists and has correct exports ──

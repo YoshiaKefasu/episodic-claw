@@ -5,6 +5,7 @@ import { buildRecallCalibration } from "./config";
 import { EpisodicCoreClient } from "./rpc-client";
 import {
   EpisodicPluginConfig,
+  JapaneseQueryParseResult,
   RecallFallbackReason,
   RecallMatchedBy,
   RecallRpcEpisodeResult,
@@ -295,8 +296,7 @@ function getStopwords(config?: EpisodicPluginConfig): Set<string> {
   return stopwordsSet;
 }
 
-export async function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): Promise<string> {
-  // Phase 0: Filter out attachment-dominant messages and strip attachment noise
+function prepareRecallQueryTexts(messages: Message[]): { cleanedPerMessage: string[]; skippedCount: number } {
   const eligibleTexts: string[] = [];
   let skippedCount = 0;
 
@@ -316,7 +316,6 @@ export async function instantDeterministicRewrite(messages: Message[], config?: 
     }
   }
 
-  // Phase 1: Aggressive Noise Removal (per-message)
   const cleanedPerMessage = eligibleTexts
     .map(text => text
       .replace(/\[\[reply_to_current\]\]/g, "")
@@ -330,6 +329,12 @@ export async function instantDeterministicRewrite(messages: Message[], config?: 
       .replace(/\s+/g, " ")
       .trim())
     .filter(Boolean);
+
+  return { cleanedPerMessage, skippedCount };
+}
+
+export async function instantDeterministicRewrite(messages: Message[], config?: EpisodicPluginConfig): Promise<string> {
+  const { cleanedPerMessage } = prepareRecallQueryTexts(messages);
 
   if (cleanedPerMessage.length === 0) {
     return "";
@@ -668,6 +673,81 @@ export class EpisodicRetriever {
     private config?: EpisodicPluginConfig
   ) {}
 
+  private buildGoJapaneseQueryInput(recentMessages: Message[]): string {
+    const { cleanedPerMessage } = prepareRecallQueryTexts(recentMessages);
+    return cleanedPerMessage.join("\n");
+  }
+
+  private normalizeGoJapaneseKeywords(parsed: JapaneseQueryParseResult): string[] {
+    const excluded = new Set((this.config?.queryExcludedKeywords ?? []).map((w) => w.trim().toLowerCase()).filter(Boolean));
+    const keywords: string[] = [];
+    const seen = new Set<string>();
+
+    for (const raw of parsed.keywords ?? []) {
+      const keyword = raw.trim();
+      if (!keyword) continue;
+
+      const lowered = keyword.toLowerCase();
+      if (excluded.has(lowered)) continue;
+      if (seen.has(lowered)) continue;
+
+      seen.add(lowered);
+      keywords.push(keyword);
+      if (keywords.length >= 12) break;
+    }
+
+    return keywords;
+  }
+
+  private async tryGoJapaneseParserWithin150ms(text: string): Promise<JapaneseQueryParseResult> {
+    return this.rpcClient.parseJapaneseQuery(text, 150);
+  }
+
+  private async buildRecallQueryWithGoFallback(recentMessages: Message[]): Promise<string> {
+    if (getEnvVal("EPISODIC_DISABLE_GO_JA_QUERY_PARSER") === "1") {
+      return instantDeterministicRewrite(recentMessages, this.config);
+    }
+
+    const goInput = this.buildGoJapaneseQueryInput(recentMessages);
+    if (!goInput) {
+      return instantDeterministicRewrite(recentMessages, this.config);
+    }
+
+    try {
+      const parsed = await this.tryGoJapaneseParserWithin150ms(goInput);
+      const filteredKeywords = this.normalizeGoJapaneseKeywords(parsed);
+      const goQuery = filteredKeywords.join(" ");
+      const shouldUseGo =
+        parsed.timedOut === false &&
+        parsed.elapsedMs <= 150 &&
+        filteredKeywords.length >= 3 &&
+        goQuery.length <= 500;
+
+      if (getEnvVal("DEBUG_EPISODIC_JA_QUERY_PARSER")) {
+        console.log(JSON.stringify({
+          source: shouldUseGo ? "go" : "ts-fallback",
+          elapsedMs: parsed.elapsedMs,
+          timedOut: parsed.timedOut,
+          keywordCount: filteredKeywords.length,
+          queryPreview: goQuery.substring(0, 120),
+        }));
+      }
+
+      if (shouldUseGo) {
+        return goQuery;
+      }
+    } catch {
+      if (getEnvVal("DEBUG_EPISODIC_JA_QUERY_PARSER")) {
+        console.log(JSON.stringify({
+          source: "ts-fallback",
+          reason: "go-parser-error",
+        }));
+      }
+    }
+
+    return instantDeterministicRewrite(recentMessages, this.config);
+  }
+
   /**
    * Evaluates the active conversation context, builds a search query, 
    * and retrieves relevant past episodes via the Go sidecar.
@@ -773,7 +853,11 @@ export class EpisodicRetriever {
       }
     }
 
-    const query = await instantDeterministicRewrite(recentMessages, this.config);
+    // Recall query building currently tries the Go sidecar first because the
+    // new Japanese path lives there. `instantDeterministicRewrite()` is kept as
+    // the emergency fallback for sidecar timeout/error/kill-switch cases, not
+    // as the primary Japanese query path.
+    const query = await this.buildRecallQueryWithGoFallback(recentMessages);
     const dominantScript = query ? detectDominantScript(query) : "none";
 
     if (!query) {

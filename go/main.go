@@ -23,6 +23,7 @@ import (
 	"episodic-core/internal/ai"
 	"episodic-core/internal/cache"
 	"episodic-core/internal/logger"
+	"episodic-core/internal/queryparser"
 	"episodic-core/internal/state"
 	"episodic-core/internal/vector"
 	"episodic-core/watcher"
@@ -64,13 +65,13 @@ var (
 
 	// [v0.4.21b] Duplicate-skip counters for observability
 	batchIngestSameRequestSkips atomic.Uint64 // same-batch slug dedup
-	batchIngestDbDuplicateSkips  atomic.Uint64 // existing DB slug dedup (batch path)
-	ingestDbDuplicateSkips       atomic.Uint64 // existing DB slug dedup (single-item path)
-	unindexedSaves               atomic.Uint64 // [v0.4.21e] Episodes saved to disk but not indexed (vstore nil)
+	batchIngestDbDuplicateSkips atomic.Uint64 // existing DB slug dedup (batch path)
+	ingestDbDuplicateSkips      atomic.Uint64 // existing DB slug dedup (single-item path)
+	unindexedSaves              atomic.Uint64 // [v0.4.21e] Episodes saved to disk but not indexed (vstore nil)
 
 	// [v0.4.21b] Global state store for persistent control state (cursor, save hashes)
 	globalStateStore *state.Store
-	stateStoreMu      sync.Mutex
+	stateStoreMu     sync.Mutex
 
 	// Wakeup channel for instantaneous healing
 	healWorkerWakeup = make(chan struct{}, 1)
@@ -1755,8 +1756,6 @@ func handleIngest(conn net.Conn, req RPCRequest) {
 
 // auditEpisodeQuality was removed in v0.4.30f (Pass 2 slug rename deleted).
 
-
-
 type BatchIngestItem struct {
 	Summary  string             `json:"summary"`
 	Tags     []string           `json:"tags"`
@@ -2444,6 +2443,40 @@ func handleRecallFeedback(conn net.Conn, req RPCRequest) {
 	}, ID: req.ID})
 }
 
+func handleQueryParseJapanese(conn net.Conn, req RPCRequest) {
+	var params struct {
+		Text  string `json:"text"`
+		MaxMs int    `json:"maxMs"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	maxMs := params.MaxMs
+	if maxMs <= 0 {
+		maxMs = 150
+	}
+	if maxMs < 20 {
+		maxMs = 20
+	}
+	if maxMs > 150 {
+		maxMs = 150
+	}
+
+	text := strings.TrimSpace(params.Text)
+	if text == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: queryparser.Result{Source: "go-japanese-query-parser"}, ID: req.ID})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(maxMs)*time.Millisecond)
+	defer cancel()
+
+	result := queryparser.ParseJapaneseQuery(ctx, text)
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
+}
+
 func handleGetWatermark(conn net.Conn, req RPCRequest) {
 	var params struct {
 		AgentWs string `json:"agentWs"`
@@ -2933,6 +2966,7 @@ func main() {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	// [v0.4.26c] SleepTimer removed — D1 consolidation deprecated in v0.4.1+, idle monitoring unused
 	startReplayTimer(apiKey)
+	go queryparser.WarmUpKagomeTokenizer()
 
 	EmitLog("Starting Go Sidecar on socket %s", *socketPath)
 
@@ -2997,7 +3031,8 @@ func handleConnection(conn net.Conn) {
 		// This reduces log noise without losing observability: state changes
 		// (enqueue, ack, retry) and errors are still logged individually.
 		skippedLogMethods := map[string]bool{
-			"cache.leaseNext": true,
+			"cache.leaseNext":     true,
+			"query.parseJapanese": true,
 		}
 		if !skippedLogMethods[req.Method] {
 			EmitLog("Method: %s", req.Method)
@@ -3022,6 +3057,8 @@ func handleConnection(conn net.Conn) {
 			go handleRecall(conn, req)
 		case "ai.recallFeedback":
 			go handleRecallFeedback(conn, req)
+		case "query.parseJapanese":
+			go handleQueryParseJapanese(conn, req)
 		case "indexer.getWatermark":
 			go handleGetWatermark(conn, req)
 		case "indexer.setWatermark":

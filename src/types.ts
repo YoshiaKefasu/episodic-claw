@@ -223,6 +223,23 @@ export interface RecallRpcEpisodeResult extends RecallScoreBreakdown {
   fallbackReason?: RecallFallbackReason | "";
 }
 
+export interface JapaneseQueryParseSegment {
+  text: string;
+  reading?: string;
+  lemma?: string;
+  kind: "content" | "particle" | "aux" | "latin";
+  start: number;
+  end: number;
+}
+
+export interface JapaneseQueryParseResult {
+  segments: JapaneseQueryParseSegment[];
+  keywords: string[];
+  elapsedMs: number;
+  timedOut: boolean;
+  source: string;
+}
+
 export interface SegmentScoreResult {
   rawSurprise: number;
   mean: number;

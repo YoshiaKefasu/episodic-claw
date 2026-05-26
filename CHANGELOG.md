@@ -5,6 +5,17 @@
 ### Fixed
 - **Deprecated config schema cleanup (v0.4.32 scope)**: removed schema-only dead keys `sharedEpisodesDir`, `allowCrossAgentRecall`, `maxBufferChars`, and `maxPoolChars` from `openclaw.plugin.json` / `src/index.ts` / docs. Kept `maxCharsPerChunk` and `openrouterConfig` intact because they still have live runtime compatibility paths. Existing configs that still mention the removed keys will now fail schema validation on load.
 
+## [0.4.33] - 2026-05-27
+
+### Added
+- **Go Japanese query parser**: added `query.parseJapanese` in the Go sidecar and routed recall query building through a Go-first path. Kagome now handles the higher-quality Japanese path, with a lightweight Go fallback and the old TS rewrite path kept only as emergency fallback.
+
+### Changed
+- **Japanese recall path clarified**: old TS Japanese query building is no longer the primary path. It remains only as a safety fallback when the Go sidecar times out, errors, or is disabled.
+
+### Technical
+- **Fast-path benchmark**: lightweight Go parser is far below the 150ms ceiling in practice, so the release keeps the Go-first design and treats the TS path as a backstop.
+
 ## [0.4.31b] - 2026-05-22
 
 ### Fixed

@@ -11,7 +11,7 @@ import { createRequire } from "node:module";
 const modRequire = createRequire(__filename);
 import type { CacheQueueItem } from "./narrative-queue";
 
-import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult } from "./types";
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult } from "./types";
 import { agentWsHash } from "./utils";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
@@ -564,6 +564,10 @@ export class EpisodicCoreClient {
     calibration?: RecallCalibration
   ): Promise<RecallRpcEpisodeResult[]> {
     return this.request<RecallRpcEpisodeResult[]>("ai.recall", { query, k, agentWs, topics, strictTopics, calibration });
+  }
+
+  async parseJapaneseQuery(text: string, maxMs = 150): Promise<JapaneseQueryParseResult> {
+    return this.request<JapaneseQueryParseResult>("query.parseJapanese", { text, maxMs }, maxMs);
   }
 
   async recallFeedback(params: {

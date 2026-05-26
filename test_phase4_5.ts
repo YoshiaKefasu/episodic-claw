@@ -10,6 +10,7 @@ import {
   runNarrativeWorkerEmptyRawTextGuardRegression,
   runLanguageGuardReaskHandoffRegression
 } from "./test_phase4_5_narrative_worker.ts";
+import { runJapaneseQueryParserFallbackTests } from "./test_phase4_5_japanese_query_parser.ts";
 import {
   runCompactionModelSmoke,
   runPhase7EscalationAndRepairSmoke,
@@ -36,6 +37,7 @@ async function main() {
   await runRetrieverRuntimeRegression();
   await runRetrieverSourceSmoke();
   await runPolyglotQueryMorphologicalTests();
+  await runJapaneseQueryParserFallbackTests();
 
   // E4: Narrative Worker tests
   await runNarrativeWorkerEmptyRawTextGuardRegression();
