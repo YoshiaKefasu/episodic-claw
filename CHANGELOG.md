@@ -2,8 +2,16 @@
 
 ## [Unreleased]
 
+## [0.4.32] - 2026-05-24
+
+### Added
+- **Top-7 temporal Top-1 recall injection**: replaced raw vector-similarity Top-5 with a 2-stage filter. Recall candidates now go through vector Top-K(7) and then a temporal selector that prefers freshnessScore, then timestamp, then score.
+
 ### Fixed
-- **Deprecated config schema cleanup (v0.4.32 scope)**: removed schema-only dead keys `sharedEpisodesDir`, `allowCrossAgentRecall`, `maxBufferChars`, and `maxPoolChars` from `openclaw.plugin.json` / `src/index.ts` / docs. Kept `maxCharsPerChunk` and `openrouterConfig` intact because they still have live runtime compatibility paths. Existing configs that still mention the removed keys will now fail schema validation on load.
+- **Deprecated config schema cleanup**: removed schema-only dead keys `sharedEpisodesDir`, `allowCrossAgentRecall`, `maxBufferChars`, and `maxPoolChars` from `openclaw.plugin.json` / `src/index.ts` / docs. Kept `maxCharsPerChunk` and `openrouterConfig` intact because they still have live runtime compatibility paths. Existing configs that still mention the removed keys will now fail schema validation on load.
+
+### Changed
+- **Version bump to 0.4.32**: release metadata aligned with the shipped plugin and rebuilt Go sidecar binaries.
 
 ## [0.4.33] - 2026-05-27
 
