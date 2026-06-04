@@ -1639,6 +1639,10 @@ RPC レスポンス: `count=18, retentionDays=30, limit=500, elapsedMs=82`, ク�
 
 KASOU 運用データ (~1年) では 365 日閾値だと候補ゼロ近辺、30 日閾値だと 18 件出る。`enabled=true` のままだと次の日曜 03:00 に weekly sweep 候補になることは確認済み。実 Phase 5 起動前に「30 日だと reference 系が消える」「60 日 / 90 日に伸ばしたい」等の判断が要る。あるいは `enabled=false` に戻して design 凍結することもできる。
 
+### 24.3.1 365日 dry-run シミュレーション中止 (2026-06-04)
+
+ユーザー判断により、`retentionDays=365` での疑似シミュレーション (3件ないし18件の Timestamp を 2025年に書き換える → dry-run → 復元) は **実施しない** ことが決定。理由: PebbleDB の Timestamp 直接書き換えは「戻し忘れ」1点で被害甚大、検証価値がそれに見合わない。KASOU の実運用を続けたまま dry-run probe だけで挙動を観察する方針に統一。PreRelease (v0.4.34a-pre.release.2) 維持、`EPISODIC_DISABLE_SNAPSHOT_WORKER=1` 据え置き、Phase 5 起動はペンドリング。
+
 ### 24.4 Phase 5 起動の判断ポイント
 
 - 「reference 系 18 件は消していい」と判断 → `retentionDays` を 30-90 で確定 → `enabled=true` 維持 + env var `=0` → 次の日曜 03:00 に Phase 5 sweep。
