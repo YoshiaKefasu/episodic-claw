@@ -2752,6 +2752,82 @@ func handleListForgottenEpisodes(conn net.Conn, req RPCRequest) {
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"records": out, "count": len(out)}, ID: req.ID})
 }
 
+// handleSimulateMarkUnusedAsForgotten is a read-only dry-run RPC that exposes
+// the weekly unused-episode review for observability and manual pre-flight
+// checks. It does NOT mutate any record. Per-episode "would forgotten" log
+// lines are emitted by the underlying Store.SimulateMarkUnusedAsForgotten call
+// (one per candidate, with id / ageDays / source basename) and a single summary
+// log line is written when the scan completes. The RPC payload returns the
+// candidate count and the scan elapsed time only; the per-candidate detail is
+// available via the structured log stream. The retentionDays argument follows
+// the same semantic as MarkEpisodesForgotten (unused review window measured
+// from each candidate's narrative Timestamp, not a deletion deadline).
+func handleSimulateMarkUnusedAsForgotten(conn net.Conn, req RPCRequest) {
+	start := time.Now()
+	var params struct {
+		RetentionDays int `json:"retentionDays"`
+		Limit         int `json:"limit"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+	if params.RetentionDays <= 0 {
+		params.RetentionDays = 365
+	}
+	// [v0.4.34a] Upper-bound clamp: 5 years is more than any realistic
+	// forgetting window. Larger values would force a full Pebble prefix scan
+	// under the 30s context deadline.
+	if params.RetentionDays > 365*5 {
+		params.RetentionDays = 365 * 5
+	}
+	if params.Limit <= 0 {
+		params.Limit = 500
+	}
+	// [v0.4.34a] Upper-bound clamp on candidate cap so a hot dashboard poll
+	// cannot ask for 1M candidates in one shot.
+	if params.Limit > 5000 {
+		params.Limit = 5000
+	}
+
+	// All known stores share the same candidate set in single-agent setups, and
+	// the unused review is workspace-scoped (manual-save + notes/* are excluded
+	// by the candidate rule), so we run the dry-run against the first available
+	// store. If no store has been initialised yet, we still return zero — the
+	// scheduler path will lazy-init on first sweep. This keeps the RPC safe to
+	// call from CLI / dashboard / dry-run probes before any real episode is
+	// loaded.
+	storeMutex.Lock()
+	var firstStore *vector.Store
+	var firstAgentWs string
+	for ws, st := range vectorStores {
+		firstStore = st
+		firstAgentWs = ws
+		break
+	}
+	storeMutex.Unlock()
+
+	if firstStore == nil {
+		EmitLog("episode.simulateMarkUnusedAsForgotten: no store initialised; count=0 retentionDays=%d limit=%d elapsedMs=%d", params.RetentionDays, params.Limit, time.Since(start).Milliseconds())
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"count": 0, "retentionDays": params.RetentionDays, "limit": params.Limit, "elapsedMs": time.Since(start).Milliseconds()}, ID: req.ID})
+		return
+	}
+	_ = firstAgentWs // available for future per-agentWs scoping
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	count, err := firstStore.SimulateMarkUnusedAsForgotten(ctx, time.Now(), params.RetentionDays, params.Limit)
+	if err != nil {
+		EmitLog("episode.simulateMarkUnusedAsForgotten: SimulateMarkUnusedAsForgotten failed: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	EmitLog("episode.simulateMarkUnusedAsForgotten: count=%d retentionDays=%d limit=%d elapsedMs=%d", count, params.RetentionDays, params.Limit, time.Since(start).Milliseconds())
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"count": count, "retentionDays": params.RetentionDays, "limit": params.Limit, "elapsedMs": time.Since(start).Milliseconds()}, ID: req.ID})
+}
+
 // snapshotModelGeminiMain is the primary LLM used by the forgotten semantic
 // snapshot worker. Chosen for low cost + low latency per episode summary.
 const snapshotModelGeminiMain = "gemini-3.1-flash-lite"
@@ -3311,6 +3387,8 @@ func handleConnection(conn net.Conn) {
 			go handleSnapshotCounterIncrement(conn, req)
 		case "episode.listForgottenEpisodes":
 			go handleListForgottenEpisodes(conn, req)
+		case "episode.simulateMarkUnusedAsForgotten":
+			go handleSimulateMarkUnusedAsForgotten(conn, req)
 		case "llm.generate":
 			go handleLLMGenerate(conn, req)
 		case "ai.triggerBackgroundIndex":

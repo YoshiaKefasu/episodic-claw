@@ -795,6 +795,26 @@ export class EpisodicCoreClient {
   }
 
   /**
+   * Read-only dry-run of the weekly unused-episode review. Returns the
+   * candidate count and scan elapsed time. Per-candidate "would forgotten"
+   * log lines are emitted by the Go sidecar to the episodic-claw log file
+   * (id, ageDays, source basename). This is the manual pre-flight probe
+   * used in Phase 4 dry-run; it never mutates any record. Bounded by a
+   * 30s Go-side timeout plus this client's per-RPC timeout.
+   */
+  async simulateMarkUnusedAsForgotten(
+    retentionDays = 365,
+    limit = 500,
+    timeoutMs = 35000
+  ): Promise<{ count: number; retentionDays: number; limit: number; elapsedMs: number }> {
+    return this.request<{ count: number; retentionDays: number; limit: number; elapsedMs: number }>(
+      "episode.simulateMarkUnusedAsForgotten",
+      { retentionDays, limit },
+      timeoutMs
+    );
+  }
+
+  /**
    * Thin pass-through to Google Generative Language API. Used by the
    * snapshot worker; chain is gemini-main → gemma-main with 1-2 attempts
    * per phase, decided in TypeScript.

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.34a-pre.release.2] - 2026-06-04
+
+### Added
+- **`episode.simulateMarkUnusedAsForgotten` JSON-RPC**: read-only dry-run probe for Phase 4 observability and manual pre-flight checks. Accepts `{retentionDays, limit}` (defaults 365 / 500, both upper-clamped to 5 years / 5000). Returns `{count, retentionDays, limit, elapsedMs}`. Per-candidate "would forgotten" detail is emitted to the episodic-claw log file by the Go sidecar (id, ageDays, source basename). Never mutates any record. Bounded by 30s Go-side context and 35s TS-side per-RPC timeout.
+
+### Hardening
+- **Upper-bound clamps** on `retentionDays` (5 years max) and `limit` (5000 max) to prevent unbounded Pebble prefix scans or large candidate slices under repeated probe calls.
+- **Empty-store handling**: returns `{count: 0, ...}` with a single log line instead of erroring. Allows pre-init probes (e.g. dashboard, CLI) before any episode is loaded.
+
+### Logging
+- **Removed duplicate summary log** at `SimulateMarkUnusedAsForgotten` store-level. The handler in `main.go` is the authoritative boundary; per-candidate "would forgotten" lines remain.
+
 ## [0.4.34a-pre.release] - 2026-06-04
 
 ### Added

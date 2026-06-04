@@ -2469,7 +2469,6 @@ func (s *Store) SimulateMarkUnusedAsForgotten(ctx context.Context, now time.Time
 	if limit <= 0 {
 		limit = 500
 	}
-	start := time.Now()
 	candidates, err := s.ListUnusedMDEpisodes(ctx, now, retentionDays, limit)
 	if err != nil {
 		return 0, err
@@ -2484,7 +2483,9 @@ func (s *Store) SimulateMarkUnusedAsForgotten(ctx context.Context, now time.Time
 		ageDays := int(now.Sub(rec.Timestamp).Hours() / 24)
 		logger.Info(logger.CatStore, "dry-run: would forgotten id=%s ageDays=%d retentionDays=%d source=%s", rec.ID, ageDays, retentionDays, filepath.Base(rec.SourcePath))
 	}
-	logger.Info(logger.CatStore, "dry-run: SimulateMarkUnusedAsForgotten count=%d retentionDays=%d limit=%d scanMs=%d", len(candidates), retentionDays, limit, time.Since(start).Milliseconds())
+	// [v0.4.34a] The handler in main.go emits the authoritative summary log
+	// line at the RPC boundary. Avoid a duplicate summary here to keep the log
+	// stream clean for repeated dry-run probes.
 	return len(candidates), nil
 }
 

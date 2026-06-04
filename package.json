@@ -1,6 +1,6 @@
 {
   "name": "episodic-claw",
-  "version": "0.4.34a-pre.release",
+  "version": "0.4.34a-pre.release.2",
   "description": "Episodic Memory Engine for OpenClaw",
   "license": "MPL-2.0",
   "main": "./index.ts",
