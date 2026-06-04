@@ -82,6 +82,11 @@ export function loadCompactorCtor(): typeof import("./src/compactor.ts").Compact
     "transport-retry.js",
     "types.js",
     "utils.js",
+    "episode-extract.js",
+    "snapshot-guardrail.js",
+    "snapshot-file-writer.js",
+    "snapshot-worker.js",
+    "snapshot-scheduler.js",
   ]) {
     fs.copyFileSync(path.join("dist", file), path.join(tempDir, file));
   }
@@ -108,6 +113,11 @@ export function loadCompactorModule(): typeof import("./src/compactor.ts") {
     "transport-retry.js",
     "types.js",
     "utils.js",
+    "episode-extract.js",
+    "snapshot-guardrail.js",
+    "snapshot-file-writer.js",
+    "snapshot-worker.js",
+    "snapshot-scheduler.js",
   ]) {
     fs.copyFileSync(path.join("dist", file), path.join(tempDir, file));
   }

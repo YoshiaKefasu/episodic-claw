@@ -154,7 +154,7 @@ func (s *Store) lexicalWorker(ctx context.Context) {
 					}
 
 					// Pollution control
-					if rec.PruneState == "merged" || rec.PruneState == "tombstone" {
+					if rec.PruneState == "merged" || rec.PruneState == "forgotten" {
 						bleveBatch.Delete(task.id)
 						continue
 					}

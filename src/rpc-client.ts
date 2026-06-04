@@ -11,7 +11,7 @@ import { createRequire } from "node:module";
 const modRequire = createRequire(__filename);
 import type { CacheQueueItem } from "./narrative-queue";
 
-import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult } from "./types";
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult, ForgottenSummary } from "./types";
 import { agentWsHash } from "./utils";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
@@ -194,7 +194,7 @@ export class EpisodicCoreClient {
     
     const args = ["-socket", actualAddr, "-ppid", process.pid.toString()];
     if (cfg) {
-      if (typeof cfg.tombstoneRetentionDays === "number") args.push("-tombstone-ttl", cfg.tombstoneRetentionDays.toString());
+      if (typeof cfg.forgettingEpisodic?.physicalDeleteTtlDays === "number") args.push("-delete-ttl", cfg.forgettingEpisodic.physicalDeleteTtlDays.toString());
       if (cfg.enableBackgroundWorkers === false) args.push("-disable-workers");
       if (typeof cfg.lexicalPreFilterLimit === "number") args.push("-lexical-limit", cfg.lexicalPreFilterLimit.toString());
       if (typeof cfg.lexicalRebuildIntervalDays === "number") args.push("-lexical-rebuild-interval", cfg.lexicalRebuildIntervalDays.toString());
@@ -768,6 +768,43 @@ export class EpisodicCoreClient {
 
   async cacheGetLatestNarrative(agentWs: string, agentId: string): Promise<{ episodeId: string; body: string; found: boolean }> {
     return this.request("cache.getLatestNarrative", { agentWs, agentId });
+  }
+
+  // --- Forgotten-episode semantic snapshot (v0.4.34 Phase 3.2) ---
+
+  /**
+   * Returns forgotten records for the given agentWs. Used by the weekly
+   * snapshot worker to drive the per-item summary+delete loop.
+   */
+  async listForgottenEpisodes(
+    agentWs: string,
+    limit = 500
+  ): Promise<{ records: ForgottenSummary[]; count: number }> {
+    return this.request<{ records: ForgottenSummary[]; count: number }>(
+      "episode.listForgottenEpisodes",
+      { agentWs, limit }
+    );
+  }
+
+  /**
+   * Atomically increments the per-year forgotten snapshot counter and
+   * returns the new value. Counter key is meta:forgotten_snapshot_counter:YYYY.
+   */
+  async snapshotCounterIncrement(year: string): Promise<{ number: number }> {
+    return this.request<{ number: number }>("episode.snapshotCounterIncrement", { year });
+  }
+
+  /**
+   * Thin pass-through to Google Generative Language API. Used by the
+   * snapshot worker; chain is gemini-main → gemma-main with 1-2 attempts
+   * per phase, decided in TypeScript.
+   */
+  async llmGenerate(model: "gemini-main" | "gemma-main", prompt: string, timeoutMs = 30000): Promise<{ text: string; model: string }> {
+    return this.request<{ text: string; model: string }>(
+      "llm.generate",
+      { model, prompt },
+      timeoutMs
+    );
   }
 }
 

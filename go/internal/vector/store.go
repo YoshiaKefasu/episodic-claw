@@ -47,10 +47,12 @@ type EpisodeRecord struct {
 	RecallShownCount     int                `json:"recall_shown_count,omitempty" msgpack:"recall_shown_count,omitempty"`
 	RecallTopRankBest    int                `json:"recall_top_rank_best,omitempty" msgpack:"recall_top_rank_best,omitempty"`
 	ExpandCount          int                `json:"expand_count,omitempty" msgpack:"expand_count,omitempty"`
+	InjectedCount        int                `json:"injected_count,omitempty" msgpack:"injected_count,omitempty"`
 	DirectGoodCount      int                `json:"direct_good_count,omitempty" msgpack:"direct_good_count,omitempty"`
 	MissCount            int                `json:"miss_count,omitempty" msgpack:"miss_count,omitempty"`
 	LastRecalledAt       time.Time          `json:"last_recalled_at,omitempty" msgpack:"last_recalled_at,omitempty"`
 	LastExpandedAt       time.Time          `json:"last_expanded_at,omitempty" msgpack:"last_expanded_at,omitempty"`
+	LastInjectedAt       time.Time          `json:"last_injected_at,omitempty" msgpack:"last_injected_at,omitempty"`
 	ReplaySelectedCount  int                `json:"replay_selected_count,omitempty" msgpack:"replay_selected_count,omitempty"`
 	ReplayReviewedCount  int                `json:"replay_reviewed_count,omitempty" msgpack:"replay_reviewed_count,omitempty"`
 	ReplayNoReviewCount  int                `json:"replay_no_review_count,omitempty" msgpack:"replay_no_review_count,omitempty"`
@@ -66,7 +68,7 @@ type EpisodeRecord struct {
 	PruneState      string    `json:"prune_state,omitempty" msgpack:"prune_state,omitempty"`
 	CanonicalParent string    `json:"canonical_parent,omitempty" msgpack:"canonical_parent,omitempty"`
 	LastScoredAt    time.Time `json:"last_scored_at,omitempty" msgpack:"last_scored_at,omitempty"`
-	TombstonedAt    time.Time `json:"tombstoned_at,omitempty" msgpack:"tombstoned_at,omitempty"`
+	ForgottenAt    time.Time `json:"forgotten_at,omitempty" msgpack:"forgotten_at,omitempty"`
 
 	// ContentHash is the first 16 hex chars of SHA-256 over the MD body.
 	// Used by Smart Dedup to skip re-embedding when the body has not changed.
@@ -118,7 +120,7 @@ type Watermark struct {
 }
 
 type StoreConfig struct {
-	TombstoneTTL       int  // days
+		DeleteTTL           int  // days
 	LexicalFilterLimit int  // max items from bleve
 	Stage2TwoPhase     bool // [v0.4.26g] enable 2-phase lock optimization for Stage2 scoring
 }
@@ -938,8 +940,10 @@ func (s *Store) RecordRecall(id string, at time.Time, rank int) error {
 	})
 }
 
-// RecordHit records a stronger positive signal, typically when a recalled
-// episode is explicitly expanded by the user.
+// RecordHit records the strongest positive signal, typically when a recalled
+// episode is explicitly expanded by the user. It intentionally mirrors the old
+// ep-expand field updates: Retrievals++, Hits += 2, LastRetrievedAt/LastHitAt,
+// ExpandCount++, DirectGoodCount++, and LastExpandedAt.
 func (s *Store) RecordHit(id string, at time.Time) error {
 	if strings.TrimSpace(id) == "" {
 		return nil
@@ -948,11 +952,31 @@ func (s *Store) RecordHit(id string, at time.Time) error {
 		at = time.Now()
 	}
 	return s.UpdateRecord(id, func(rec *EpisodeRecord) error {
-		rec.Hits++
+		rec.Retrievals++
+		rec.Hits += 2
+		rec.LastRetrievedAt = at
 		rec.LastHitAt = at
 		rec.ExpandCount++
 		rec.DirectGoodCount++
 		rec.LastExpandedAt = at
+		return nil
+	})
+}
+
+// RecordInjected records that an episode was actually injected into model
+// context. This is stronger than being returned by recall, but weaker than an
+// explicit ep-expand. It protects useful auto-injected memories from weekly
+// unused-episode forgotten review.
+func (s *Store) RecordInjected(id string, at time.Time) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return s.UpdateRecord(id, func(rec *EpisodeRecord) error {
+		rec.InjectedCount++
+		rec.LastInjectedAt = at
 		return nil
 	})
 }
@@ -1646,7 +1670,9 @@ func legacyTopicsFromTags(tags []string) []string {
 }
 
 func isActiveD0Record(rec EpisodeRecord) bool {
-	if rec.PruneState == "tombstone" || rec.PruneState == "merged" {
+	// [v0.4.34] Back-compat: legacy "tombstone" PruneState (pre-rename) treated
+	// the same as "forgotten" so old DB records do not become active D0.
+	if rec.PruneState == "forgotten" || rec.PruneState == "tombstone" || rec.PruneState == "merged" {
 		return false
 	}
 	if len(rec.Tags) == 0 {
@@ -1702,21 +1728,21 @@ type Stage2RunSummary struct {
 	Eligible      int       `json:"eligible"`
 	SkippedRecent int       `json:"skipped_recent"`
 	Rescored      int       `json:"rescored"`
-	Tombstoned    int       `json:"tombstoned"`
+	Forgotten    int       `json:"forgotten"`
 	CommitCount   int       `json:"commit_count"`
 	Cancelled     bool      `json:"cancelled"`
 	CancelReason  string    `json:"cancel_reason,omitempty"`
 	CommitError   string    `json:"commit_error,omitempty"` // [v0.4.26e] non-empty when commitBatch fails
 
 	// [v0.4.26g] Lock granularity optimization metrics
-	LockWaitMs     int64  `json:"lock_wait_ms"`              // Time spent waiting for lock acquisition
-	LockHoldMs     int64  `json:"lock_hold_ms"`              // Time spent holding write/exclusive lock
-	ReadLockHoldMs int64  `json:"read_lock_hold_ms"`         // [2phase] Time spent holding read lock (Phase 1)
-	IterMs         int64  `json:"iter_ms"`                   // Time spent in Pebble iteration + unmarshal
-	ComputeMs      int64  `json:"compute_ms"`                // Time spent in score computation
-	CommitMs       int64  `json:"commit_ms"`                 // Cumulative time spent in batch commits
-	PhaseMode      string `json:"phase_mode,omitempty"`      // "legacy" or "2phase"
-	StalePatches   int    `json:"stale_patches"`             // [2phase] Records modified between Phase1 and Phase3
+	LockWaitMs     int64  `json:"lock_wait_ms"`         // Time spent waiting for lock acquisition
+	LockHoldMs     int64  `json:"lock_hold_ms"`         // Time spent holding write/exclusive lock
+	ReadLockHoldMs int64  `json:"read_lock_hold_ms"`    // [2phase] Time spent holding read lock (Phase 1)
+	IterMs         int64  `json:"iter_ms"`              // Time spent in Pebble iteration + unmarshal
+	ComputeMs      int64  `json:"compute_ms"`           // Time spent in score computation
+	CommitMs       int64  `json:"commit_ms"`            // Cumulative time spent in batch commits
+	PhaseMode      string `json:"phase_mode,omitempty"` // "legacy" or "2phase"
+	StalePatches   int    `json:"stale_patches"`        // [2phase] Records modified between Phase1 and Phase3
 }
 
 // stage2BatchCommitSize controls how many records are accumulated before a
@@ -1812,8 +1838,8 @@ func (s *Store) computeStage2Legacy(ctx context.Context, agentWs string) (Stage2
 			summary.IterMs = time.Since(iterStartedAt).Milliseconds() - computeMs - totalCommitMs // approximate
 			summary.ComputeMs = computeMs
 			summary.CommitMs = totalCommitMs
-			logger.Info(logger.CatStore, "ComputeStage2BatchScores: Cancelled after %d commits, %d rescored, %d tombstoned (reason: %s)",
-				summary.CommitCount, summary.Rescored, summary.Tombstoned, summary.CancelReason)
+			logger.Info(logger.CatStore, "ComputeStage2BatchScores: Cancelled after %d commits, %d rescored, %d Forgotten (reason: %s)",
+				summary.CommitCount, summary.Rescored, summary.Forgotten, summary.CancelReason)
 			return summary, ctx.Err()
 		default:
 		}
@@ -1896,10 +1922,10 @@ func (s *Store) computeStage2Legacy(ctx context.Context, agentWs string) (Stage2
 		summary.Rescored++
 
 		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
-			rec.PruneState = "tombstone"
-			rec.TombstonedAt = now
-			summary.Tombstoned++
-			logger.Info(logger.CatStore, "Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
+			rec.PruneState = "forgotten"
+			rec.ForgottenAt = now
+			summary.Forgotten++
+			logger.Info(logger.CatStore, "Marked %s as forgotten (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
 		}
 
 		// Write back to DB via batch
@@ -1928,9 +1954,9 @@ func (s *Store) computeStage2Legacy(ctx context.Context, agentWs string) (Stage2
 	summary.ComputeMs = computeMs
 	summary.CommitMs = totalCommitMs
 
-	if summary.Rescored > 0 || summary.Tombstoned > 0 {
-		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d tombstoned=%d commits=%d dur=%dms lockWait=%dms lockHold=%dms iter=%dms compute=%dms commit=%dms",
-			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Tombstoned, summary.CommitCount, summary.DurationMs,
+	if summary.Rescored > 0 || summary.Forgotten > 0 {
+		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d Forgotten=%d commits=%d dur=%dms lockWait=%dms lockHold=%dms iter=%dms compute=%dms commit=%dms",
+			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Forgotten, summary.CommitCount, summary.DurationMs,
 			summary.LockWaitMs, summary.LockHoldMs, summary.IterMs, summary.ComputeMs, summary.CommitMs)
 	}
 
@@ -1946,7 +1972,7 @@ type stage2ScorePatch struct {
 	ImportanceScore      float32
 	NoiseScore           float32
 	PruneState           string
-	TombstonedAt         time.Time
+	ForgottenAt         time.Time
 	LastScoredAt         time.Time
 	CanonicalParent      string
 	OriginalLastScoredAt time.Time // [v0.4.26g] Phase 1 snapshot's LastScoredAt for accurate stale detection
@@ -1960,7 +1986,7 @@ type stage2ScorePatch struct {
 // Phase 3 (Lock): Re-read current records, apply score-only patches, batch commit.
 //
 // Lost-update safety: Phase 3 re-reads each record under Lock and only patches the
-// 6 score fields (ImportanceScore, NoiseScore, PruneState, TombstonedAt, LastScoredAt,
+// 6 score fields (ImportanceScore, NoiseScore, PruneState, ForgottenAt, LastScoredAt,
 // CanonicalParent). Concurrent Add/UpdateRecord changes to other fields (Hits, Retrievals,
 // Tags, Topics, etc.) are preserved because we never overwrite the entire record.
 func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stage2RunSummary, error) {
@@ -2119,13 +2145,13 @@ func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stag
 		CalculateScoreStage2(&rec, cand.params)
 		summary.Rescored++
 
-		tombstonedAt := time.Time{}
+		ForgottenAt := time.Time{}
 		pruneState := rec.PruneState
 		if rec.ImportanceScore < 0.3 && rec.NoiseScore >= 0.8 {
-			pruneState = "tombstone"
-			tombstonedAt = now
-			summary.Tombstoned++
-			logger.Info(logger.CatStore, "Marked %s as tombstone (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
+			pruneState = "forgotten"
+			ForgottenAt = now
+			summary.Forgotten++
+			logger.Info(logger.CatStore, "Marked %s as forgotten (Imp:%.2f, Noise:%.2f)", rec.ID, rec.ImportanceScore, rec.NoiseScore)
 		}
 
 		patches = append(patches, stage2ScorePatch{
@@ -2133,7 +2159,7 @@ func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stag
 			ImportanceScore:      rec.ImportanceScore,
 			NoiseScore:           rec.NoiseScore,
 			PruneState:           pruneState,
-			TombstonedAt:         tombstonedAt,
+			ForgottenAt:         ForgottenAt,
 			LastScoredAt:         now,
 			CanonicalParent:      rec.CanonicalParent,
 			OriginalLastScoredAt: cand.rec.LastScoredAt, // [v0.4.26g] for accurate stale detection
@@ -2244,21 +2270,21 @@ func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stag
 			// [v0.4.26g] Stale record: PruneState decision is unreliable because
 			// the score was computed from Phase 1 snapshot data (old Hits/Retrievals/etc).
 			// Skip PruneState change entirely — the next Stage2 run will re-evaluate
-			// with fresh data. This prevents stale-data-driven tombstones.
+			// with fresh data. This prevents stale-data-driven forgottens.
 			//
 			// Note: LastScoredAt is still set to `now`, giving the record a 30-min
 			// scoring cooldown even though PruneState was not re-evaluated. This is
 			// intentional to avoid hot-loop re-scoring on every run.
 			summary.StalePatches++
-		} else if (current.PruneState == "tombstone" || current.PruneState == "merged") && patch.PruneState != current.PruneState {
+		} else if (current.PruneState == "forgotten" || current.PruneState == "tombstone" || current.PruneState == "merged") && patch.PruneState != current.PruneState {
 			// [v0.4.26g] Prune-state resurrection guard: once a record is in a
 			// terminal prune state, a later scoring pass must NOT undo that decision.
 			// Score fields are still updated for observability.
 			summary.StalePatches++
 		} else {
 			current.PruneState = patch.PruneState
-			if !patch.TombstonedAt.IsZero() {
-				current.TombstonedAt = patch.TombstonedAt
+			if !patch.ForgottenAt.IsZero() {
+				current.ForgottenAt = patch.ForgottenAt
 			}
 		}
 
@@ -2299,9 +2325,9 @@ func (s *Store) computeStage2TwoPhase(ctx context.Context, agentWs string) (Stag
 	summary.ComputeMs = computeMs
 	summary.CommitMs = totalCommitMs
 
-	if summary.Rescored > 0 || summary.Tombstoned > 0 {
-		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d tombstoned=%d commits=%d stale=%d dur=%dms lockWait=%dms rlockHold=%dms wlockHold=%dms iter=%dms compute=%dms commit=%dms",
-			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Tombstoned, summary.CommitCount, summary.StalePatches, summary.DurationMs,
+	if summary.Rescored > 0 || summary.Forgotten > 0 {
+		logger.Info(logger.CatStore, "ComputeStage2BatchScores: run=%s phase=%s scanned=%d eligible=%d skipped=%d rescored=%d Forgotten=%d commits=%d stale=%d dur=%dms lockWait=%dms rlockHold=%dms wlockHold=%dms iter=%dms compute=%dms commit=%dms",
+			runID, summary.PhaseMode, summary.Scanned, summary.Eligible, summary.SkippedRecent, summary.Rescored, summary.Forgotten, summary.CommitCount, summary.StalePatches, summary.DurationMs,
 			summary.LockWaitMs, summary.ReadLockHoldMs, summary.LockHoldMs, summary.IterMs, summary.ComputeMs, summary.CommitMs)
 	}
 
@@ -2334,13 +2360,242 @@ func (s *Store) CleanupLegacyStage2Summary() {
 	}
 }
 
-// RunGarbageCollector physically deletes files that have been marked as tombstone
-// for over 14 days, delegating DB Hard-Delete to the background FS Watcher.
-func (s *Store) RunGarbageCollector(ctx context.Context) error {
-	now := time.Now()
-	tombstoneTTL := time.Duration(s.config.TombstoneTTL) * 24 * time.Hour
-	if s.config.TombstoneTTL <= 0 {
-		tombstoneTTL = 14 * 24 * time.Hour
+// ListUnusedMDEpisodes returns old auto-generated Markdown episodes that have
+// never been recalled, expanded, hit, or injected. This is a dry-run friendly
+// candidate lister for the weekly forgotten review; it does not mutate records.
+// Manual ep-save memories are explicitly excluded by both tag and notes/ path.
+func (s *Store) ListUnusedMDEpisodes(ctx context.Context, now time.Time, retentionDays int, limit int) ([]EpisodeRecord, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if retentionDays <= 0 || limit <= 0 {
+		return nil, nil
+	}
+	cutoff := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
+
+	s.mutex.RLock()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("ep:"),
+		UpperBound: []byte("ep;"),
+	})
+	if err != nil {
+		s.mutex.RUnlock()
+		return nil, err
+	}
+	defer func() {
+		iter.Close()
+		s.mutex.RUnlock()
+	}()
+
+	candidates := make([]EpisodeRecord, 0, limit)
+	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-ctx.Done():
+			return candidates, ctx.Err()
+		default:
+		}
+
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		if !isUnusedMDEpisodeCandidate(rec, cutoff) {
+			continue
+		}
+		candidates = append(candidates, rec)
+		if len(candidates) >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return candidates, err
+	}
+	return candidates, nil
+}
+
+func isUnusedMDEpisodeCandidate(rec EpisodeRecord, cutoff time.Time) bool {
+	if rec.ID == "" || rec.SourcePath == "" || rec.PruneState != "" || rec.Timestamp.IsZero() || rec.Timestamp.After(cutoff) {
+		return false
+	}
+	if strings.ToLower(filepath.Ext(rec.SourcePath)) != ".md" {
+		return false
+	}
+	if hasTagFold(rec.Tags, "manual-save") || pathHasSegment(rec.SourcePath, "notes") {
+		return false
+	}
+	if rec.RecallShownCount > 0 || rec.ExpandCount > 0 || rec.Hits > 0 || rec.InjectedCount > 0 {
+		return false
+	}
+	if !rec.LastRecalledAt.IsZero() || !rec.LastExpandedAt.IsZero() || !rec.LastHitAt.IsZero() || !rec.LastInjectedAt.IsZero() {
+		return false
+	}
+	return true
+}
+
+func hasTagFold(tags []string, want string) bool {
+	for _, tag := range tags {
+		if strings.EqualFold(strings.TrimSpace(tag), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathHasSegment(pathValue string, want string) bool {
+	normalized := filepath.ToSlash(filepath.Clean(pathValue))
+	for _, part := range strings.Split(normalized, "/") {
+		if strings.EqualFold(strings.TrimSpace(part), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// SimulateMarkUnusedAsForgotten performs a read-only dry-run of the weekly
+// unused-episode review. It calls ListUnusedMDEpisodes and emits a structured
+// "would forgotten" log line per candidate, but never mutates any record.
+// The retentionDays argument is the unused review window measured from each
+// candidate's narrative Timestamp, not a deletion deadline. Records touched
+// by ep-recall, ep-expand, or auto-injection within that window, and any
+// manual-save or notes/* records, are already excluded by the candidate rule.
+// The function returns the candidate count for observability/tests.
+func (s *Store) SimulateMarkUnusedAsForgotten(ctx context.Context, now time.Time, retentionDays int, limit int) (int, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if retentionDays <= 0 {
+		retentionDays = 365
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	start := time.Now()
+	candidates, err := s.ListUnusedMDEpisodes(ctx, now, retentionDays, limit)
+	if err != nil {
+		return 0, err
+	}
+	for i := range candidates {
+		select {
+		case <-ctx.Done():
+			return i, ctx.Err()
+		default:
+		}
+		rec := candidates[i]
+		ageDays := int(now.Sub(rec.Timestamp).Hours() / 24)
+		logger.Info(logger.CatStore, "dry-run: would forgotten id=%s ageDays=%d retentionDays=%d source=%s", rec.ID, ageDays, retentionDays, filepath.Base(rec.SourcePath))
+	}
+	logger.Info(logger.CatStore, "dry-run: SimulateMarkUnusedAsForgotten count=%d retentionDays=%d limit=%d scanMs=%d", len(candidates), retentionDays, limit, time.Since(start).Milliseconds())
+	return len(candidates), nil
+}
+
+// MarkEpisodesForgotten is the write counterpart of SimulateMarkUnusedAsForgotten.
+// It calls ListUnusedMDEpisodes and rewrites each candidate with
+// PruneState="forgotten" and ForgottenAt=now, batched into a single Pebble
+// transaction. Re-check of the unused-eligibility rule happens under the
+// store's write lock to avoid racing with a recall/expand/inject that arrived
+// between the list and the write. The retentionDays argument follows the
+// same semantic as SimulateMarkUnusedAsForgotten (unused review window from
+// each record's narrative Timestamp). This function is not yet wired into
+// RunGarbageCollector; the weekly scheduler in Phase 5 will own the call site.
+func (s *Store) MarkEpisodesForgotten(ctx context.Context, now time.Time, retentionDays int, limit int) (int, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if retentionDays <= 0 {
+		retentionDays = 365
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	start := time.Now()
+	candidates, err := s.ListUnusedMDEpisodes(ctx, now, retentionDays, limit)
+	if err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		logger.Info(logger.CatStore, "MarkEpisodesForgotten count=0 retentionDays=%d limit=%d scanMs=%d", retentionDays, limit, time.Since(start).Milliseconds())
+		return 0, nil
+	}
+
+	cutoff := now.AddDate(0, 0, -retentionDays)
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	marked := 0
+
+	for i := range candidates {
+		select {
+		case <-ctx.Done():
+			if commitErr := batch.Commit(pebble.Sync); commitErr != nil {
+				return marked, fmt.Errorf("MarkEpisodesForgotten partial commit failed: %w", commitErr)
+			}
+			return marked, ctx.Err()
+		default:
+		}
+
+		rec := candidates[i]
+		epKey := append(append([]byte(nil), prefixEp...), []byte(rec.ID)...)
+		val, closer, err := s.db.Get(epKey)
+		if err != nil {
+			if err != pebble.ErrNotFound {
+				logger.Info(logger.CatStore, "MarkEpisodesForgotten: Get %s failed: %v", rec.ID, err)
+			}
+			continue
+		}
+		var current EpisodeRecord
+		unmarshalErr := msgpack.Unmarshal(val, &current)
+		closer.Close()
+		if unmarshalErr != nil {
+			logger.Info(logger.CatStore, "MarkEpisodesForgotten: Unmarshal %s failed: %v", rec.ID, unmarshalErr)
+			continue
+		}
+
+		// Re-check eligibility under the write lock. If anything mutated
+		// the record between the list snapshot and now (recall/expand/
+		// inject), the candidate is no longer eligible and must be left
+		// alone.
+		if !isUnusedMDEpisodeCandidate(current, cutoff) {
+			continue
+		}
+
+		current.PruneState = "forgotten"
+		current.ForgottenAt = now
+
+		data, marshalErr := msgpack.Marshal(&current)
+		if marshalErr != nil {
+			logger.Info(logger.CatStore, "MarkEpisodesForgotten: Marshal %s failed: %v", rec.ID, marshalErr)
+			continue
+		}
+		batch.Set(epKey, data, nil)
+		marked++
+		ageDays := int(now.Sub(current.Timestamp).Hours() / 24)
+		logger.Info(logger.CatStore, "forgotten id=%s ageDays=%d retentionDays=%d source=%s", current.ID, ageDays, retentionDays, filepath.Base(current.SourcePath))
+	}
+
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return marked, fmt.Errorf("MarkEpisodesForgotten commit failed: %w", err)
+	}
+	logger.Info(logger.CatStore, "MarkEpisodesForgotten count=%d retentionDays=%d limit=%d scanMs=%d", marked, retentionDays, limit, time.Since(start).Milliseconds())
+	return marked, nil
+}
+
+// ListBatchableForgotten returns forgotten records old enough for physical
+// deletion. It only lists candidates; file deletion and DB cleanup are handled
+// by DeleteForgottenFiles plus the existing background FS watcher path.
+func (s *Store) ListBatchableForgotten(ctx context.Context, now time.Time, limit int) ([]EpisodeRecord, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	forgottenTTL := time.Duration(s.config.DeleteTTL) * 24 * time.Hour
+	if s.config.DeleteTTL <= 0 {
+		forgottenTTL = 14 * 24 * time.Hour
 	}
 
 	s.mutex.RLock()
@@ -2350,33 +2605,136 @@ func (s *Store) RunGarbageCollector(ctx context.Context) error {
 	})
 	if err != nil {
 		s.mutex.RUnlock()
-		return err
+		return nil, err
 	}
+	defer func() {
+		iter.Close()
+		s.mutex.RUnlock()
+	}()
 
-	var deleteList []EpisodeRecord
+	deleteList := make([]EpisodeRecord, 0, limit)
 	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-ctx.Done():
+			return deleteList, ctx.Err()
+		default:
+		}
+
 		var rec EpisodeRecord
 		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
 			continue
 		}
-		if rec.PruneState == "tombstone" {
-			if !rec.TombstonedAt.IsZero() && now.Sub(rec.TombstonedAt) >= tombstoneTTL {
+		// [v0.4.34] Back-compat: legacy "tombstone" records from pre-rename DB
+		// are eligible for physical delete here. Their TombstonedAt field will
+		// not be deserialized into ForgottenAt (different JSON keys), so the TTL
+		// check below will skip them until a future migration fills ForgottenAt.
+		// At minimum they show up in ListAllForgottenEpisodes queries.
+		if rec.PruneState == "forgotten" || rec.PruneState == "tombstone" {
+			if !rec.ForgottenAt.IsZero() && now.Sub(rec.ForgottenAt) >= forgottenTTL {
 				deleteList = append(deleteList, rec)
+				if len(deleteList) >= limit {
+					break
+				}
 			}
 		}
 	}
-	iter.Close()
-	s.mutex.RUnlock()
+	if err := iter.Error(); err != nil {
+		return deleteList, err
+	}
+	return deleteList, nil
+}
 
-	for _, rec := range deleteList {
+// ListAllForgottenEpisodes returns all records currently in the "forgotten"
+// state, regardless of how long ago they were marked. This is the input for
+// the weekly semantic-snapshot worker: each entry will be summarised into a
+// one-line memory and then deleted.
+//
+// If agentWs is non-empty, the result is filtered to records whose SourcePath
+// starts with that prefix. Pass an empty string to include all workspaces
+// (used by tests and by admin tools).
+//
+// TTL is intentionally not applied here — ListBatchableForgotten owns that.
+// Caller (the TypeScript worker) is expected to drive the per-item summary
+// and physical delete loop directly off the returned slice.
+func (s *Store) ListAllForgottenEpisodes(ctx context.Context, agentWs string, limit int) ([]EpisodeRecord, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	s.mutex.RLock()
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("ep:"),
+		UpperBound: []byte("ep;"),
+	})
+	if err != nil {
+		s.mutex.RUnlock()
+		return nil, err
+	}
+	defer func() {
+		iter.Close()
+		s.mutex.RUnlock()
+	}()
+
+	list := make([]EpisodeRecord, 0, limit)
+	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-ctx.Done():
+			return list, ctx.Err()
+		default:
+		}
+
+		var rec EpisodeRecord
+		if err := msgpack.Unmarshal(iter.Value(), &rec); err != nil {
+			continue
+		}
+		if rec.PruneState != "forgotten" {
+			continue
+		}
+		if agentWs != "" && !strings.HasPrefix(rec.SourcePath, agentWs) {
+			continue
+		}
+		list = append(list, rec)
+		if len(list) >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return list, err
+	}
+	return list, nil
+}
+
+// DeleteForgottenFiles physically deletes forgotten candidate files. Missing
+// files count as deleted because the background orphan cleanup path handles DB
+// consistency later.
+func (s *Store) DeleteForgottenFiles(ctx context.Context, records []EpisodeRecord) (deleted int, failed int) {
+	for _, rec := range records {
+		select {
+		case <-ctx.Done():
+			return deleted, failed + len(records) - deleted - failed
+		default:
+		}
 		if rec.SourcePath != "" {
 			if err := os.Remove(rec.SourcePath); err == nil || os.IsNotExist(err) {
-				logger.Info(logger.CatStore, "Physically deleted tombstone memory file: %s", rec.SourcePath)
+				deleted++
+				logger.Info(logger.CatStore, "Physically deleted forgotten memory file: %s", rec.SourcePath)
 			} else {
-				logger.Info(logger.CatStore, "Failed to delete tombstone file %s: %v", rec.SourcePath, err)
+				failed++
+				logger.Info(logger.CatStore, "Failed to delete forgotten file %s: %v", rec.SourcePath, err)
 			}
 		}
 	}
+	return deleted, failed
+}
+
+// RunGarbageCollector physically deletes files that have been marked as forgotten
+// for over 14 days, delegating DB Hard-Delete to the background FS Watcher.
+func (s *Store) RunGarbageCollector(ctx context.Context) error {
+	deleteList, err := s.ListBatchableForgotten(ctx, time.Now(), 10_000)
+	if err != nil {
+		return err
+	}
+	s.DeleteForgottenFiles(ctx, deleteList)
 
 	return nil
 }

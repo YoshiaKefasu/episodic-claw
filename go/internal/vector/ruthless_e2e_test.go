@@ -10,7 +10,7 @@ import (
 )
 
 // TestRuthlessIntegration hits the store directly with 1000 items, forces garbage collection,
-// checks Lexical syncing, and confirms Tombstone and Archive states.
+// checks Lexical syncing, and confirms Forgotten and Archive states.
 func TestRuthlessIntegration(t *testing.T) {
 	// Setup test directory
 	testDir := t.TempDir()
@@ -53,7 +53,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	// Extract via raw get to ensure presence
 	_, testC, testErr := s.GetRawMeta([]byte("ep:test_rec_1"))
 	if testErr != nil {
-		t.Fatalf("test_rec_1 MISSING before tombstone warp! err: %v", testErr)
+		t.Fatalf("test_rec_1 MISSING before Forgotten warp! err: %v", testErr)
 	} else {
 		testC.Close()
 	}
@@ -96,10 +96,10 @@ func TestRuthlessIntegration(t *testing.T) {
 	}
 
 	// -----------------------------------------------------
-	// Scenario 3: Tombstone GC & Autonomic Pruning
+	// Scenario 3: Forgotten GC & Autonomic Pruning
 	// -----------------------------------------------------
-	t.Log("==> Scenario 3: Tombstone Pruning...")
-	// We force ComputeStage2BatchScores to mark them as tombstone (Imp: 0.1, Noise: 0.9)
+	t.Log("==> Scenario 3: Forgotten Pruning...")
+	// We force ComputeStage2BatchScores to mark them as Forgotten (Imp: 0.1, Noise: 0.9)
 	_, err = s.ComputeStage2BatchScores(ctx, "test_ws")
 	if err != nil {
 		t.Fatalf("Failed ComputeStage2 Batch Scores: %v", err)
@@ -113,7 +113,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	if err1 == nil && closer1 != nil {
 		closer1.Close()
 	} else {
-		t.Fatalf("Record test_rec_1 not found before tombstone warp: %v", err1)
+		t.Fatalf("Record test_rec_1 not found before Forgotten warp: %v", err1)
 	}
 
 	tempFilePath := filepath.Join(testDir, "test_1.md")
@@ -121,14 +121,14 @@ func TestRuthlessIntegration(t *testing.T) {
 
 	dummyRec := EpisodeRecord{
 		ID:           "test_rec_1",
-		PruneState:   "tombstone",
-		TombstonedAt: time.Now().Add(-15 * 24 * time.Hour), // 15 days ago
+		PruneState:   "forgotten",
+		ForgottenAt: time.Now().Add(-15 * 24 * time.Hour), // 15 days ago
 		SourcePath:   tempFilePath,
 	}
 	_ = dummyRec
 	s.UpdateRecord("test_rec_1", func(r *EpisodeRecord) error {
-		r.PruneState = "tombstone"
-		r.TombstonedAt = time.Now().Add(-15 * 24 * time.Hour)
+		r.PruneState = "forgotten"
+		r.ForgottenAt = time.Now().Add(-15 * 24 * time.Hour)
 		r.SourcePath = tempFilePath
 		return nil
 	})
@@ -143,7 +143,7 @@ func TestRuthlessIntegration(t *testing.T) {
 	if _, err := os.Stat(tempFilePath); !os.IsNotExist(err) {
 		t.Fatalf("Expected %s to be GC'd by RunGarbageCollector, but it survived.", tempFilePath)
 	} else {
-		t.Log("Tombstone successfully GC'd after 15 days simulation!")
+		t.Log("Forgotten successfully GC'd after 15 days simulation!")
 	}
 
 	// -----------------------------------------------------

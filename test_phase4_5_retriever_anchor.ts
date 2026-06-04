@@ -176,6 +176,11 @@ export async function runAnchorInjectionSmoke(): Promise<void> {
     "transcript-repair.js",
     "transport-retry.js",
     "segmenter.js",
+    "episode-extract.js",
+    "snapshot-guardrail.js",
+    "snapshot-file-writer.js",
+    "snapshot-worker.js",
+    "snapshot-scheduler.js",
     "types.js",
     "utils.js",
     "bug1-registration-origin.js",
@@ -417,6 +422,11 @@ export async function runDegradedFallbackGuardSmoke(): Promise<void> {
     "transcript-repair.js",
     "transport-retry.js",
     "segmenter.js",
+    "episode-extract.js",
+    "snapshot-guardrail.js",
+    "snapshot-file-writer.js",
+    "snapshot-worker.js",
+    "snapshot-scheduler.js",
     "types.js",
     "utils.js",
   ]) {
@@ -718,6 +728,38 @@ async function tokenizeCjk(text, lang) {
   assert.deepEqual(timestampFallbackOutcome.episodeIds, ["ts-3"], "timestamp fallback should choose the newest candidate when freshnessScore is absent");
   assert.equal(timestampFallbackOutcome.firstEpisodeId, "ts-3", "firstEpisodeId should match the timestamp-selected episode");
   assert.match(timestampFallbackOutcome.text, /TS Body 3 — should win by timestamp/, "timestamp-selected episode body should be injected");
+
+  // vTBD forgotten review prep: TS cache hits must still record injection feedback
+  // so cached injected memories are not later misclassified as unused.
+  let cacheHitRecallCount = 0;
+  const cacheHitFeedbackSources: string[] = [];
+  const cacheHitClient = {
+    async recall() {
+      cacheHitRecallCount += 1;
+      return [{
+        Record: { id: "cache-hit-injected", title: "Cache Hit Injected", timestamp: "2026-04-09T00:00:00Z" },
+        Body: "Cache hit body should be injected twice but recalled once.",
+        matchedBy: "semantic",
+        Score: 0.97,
+      }];
+    },
+    async recallFeedback(params: { source?: string }) {
+      cacheHitFeedbackSources.push(params.source ?? "");
+      return "ok";
+    },
+  };
+  const cacheHitRetriever = new EpisodicRetriever(cacheHitClient as any, undefined);
+  const cacheHitMessages = [{ role: "user", content: "cache hit injection feedback verification request" } as any];
+  const firstCacheOutcome = await cacheHitRetriever.retrieveRelevantContext(cacheHitMessages, "/tmp/episodes-cache-hit", 7, 2048);
+  const secondCacheOutcome = await cacheHitRetriever.retrieveRelevantContext(cacheHitMessages, "/tmp/episodes-cache-hit", 7, 2048);
+  assert.equal(firstCacheOutcome.reason, "injected", "first cache-hit setup call should inject");
+  assert.equal(secondCacheOutcome.reason, "injected", "cache-hit call should return cached injected outcome");
+  assert.equal(cacheHitRecallCount, 1, "second identical recall should use TS cache instead of recall RPC");
+  assert.deepEqual(
+    cacheHitFeedbackSources,
+    ["assemble", "assemble-cache-hit"],
+    "cache hit path should still send injection accounting feedback"
+  );
 }
 
 export async function runRetrieverRuntimeRegression(): Promise<void> {

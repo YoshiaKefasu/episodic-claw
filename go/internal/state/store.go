@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/cockroachdb/pebble"
@@ -76,6 +77,40 @@ func (s *Store) Set(key, value string) error {
 		return fmt.Errorf("state.Set(%s) failed: %w", key, err)
 	}
 	return nil
+}
+
+// IncrementCounter atomically increments a uint64 counter at the given key.
+// If the key does not exist, it starts from 0 and the returned value is 1.
+// The value is stored as an ASCII string so the counter survives an
+// unknown-value read in older code paths without losing precision.
+// All operations happen under the same mu lock acquisition to guarantee
+// read-modify-write atomicity on top of PebbleDB.
+func (s *Store) IncrementCounter(key string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, closer, err := s.db.Get([]byte(key))
+	if err != nil && err != pebble.ErrNotFound {
+		return 0, fmt.Errorf("state.IncrementCounter(%s) Get failed: %w", key, err)
+	}
+	if closer != nil {
+		closer.Close()
+	}
+
+	var n uint64
+	if err == nil && len(val) > 0 {
+		parsed, parseErr := strconv.ParseUint(string(val), 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("state.IncrementCounter(%s) parse %q failed: %w", key, string(val), parseErr)
+		}
+		n = parsed
+	}
+
+	n++
+	if err := s.db.Set([]byte(key), []byte(strconv.FormatUint(n, 10)), pebble.Sync); err != nil {
+		return 0, fmt.Errorf("state.IncrementCounter(%s) Set failed: %w", key, err)
+	}
+	return n, nil
 }
 
 // Close closes the underlying PebbleDB.

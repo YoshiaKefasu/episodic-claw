@@ -31,7 +31,7 @@ func TestLegacyNestedEpisodeTreeMigrationStartupE2E(t *testing.T) {
 		t.Fatalf("write nested file: %v", err)
 	}
 
-	seeded, err := vector.NewStore(agentWs, vector.StoreConfig{TombstoneTTL: 14, LexicalFilterLimit: 1000})
+	seeded, err := vector.NewStore(agentWs, vector.StoreConfig{DeleteTTL: 14, LexicalFilterLimit: 1000})
 	if err != nil {
 		t.Fatalf("seed store failed: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestLegacyNestedEpisodeTreeRuntimeRollback(t *testing.T) {
 		t.Fatalf("write nested file: %v", err)
 	}
 
-	seeded, err := vector.NewStore(agentWs, vector.StoreConfig{TombstoneTTL: 14, LexicalFilterLimit: 1000})
+	seeded, err := vector.NewStore(agentWs, vector.StoreConfig{DeleteTTL: 14, LexicalFilterLimit: 1000})
 	if err != nil {
 		t.Fatalf("seed store failed: %v", err)
 	}

@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { EpisodicPluginConfig, NarrativeConfig, OpenRouterReasoningConfig, RecallCalibration } from "./types";
+import { EpisodicPluginConfig, NarrativeConfig, OpenRouterReasoningConfig, RecallCalibration, ForgettingConfig } from "./types";
 import { getEnvVal } from "./env-var";
 
 let warnedOpenrouterDeprecated = false;
@@ -95,13 +95,35 @@ export function normalizeOpenRouterReasoning(
 }
 
 /**
+ * Parse and normalize the forgettingEpisodic config.
+ * Priority: forgettingEpisodic.physicalDeleteTtlDays → 14.
+ */
+function normalizeForgettingConfig(rawConfig: any): ForgettingConfig {
+  const raw = rawConfig?.forgettingEpisodic as ForgettingConfig | undefined;
+  // [v0.4.34] Back-compat: top-level tombstoneRetentionDays (v0.4.32 and earlier)
+  // is migrated into forgettingEpisodic.physicalDeleteTtlDays when the latter is unset.
+  // This keeps existing KASOU configs working without manual edits.
+  const legacyTombstoneTTL = rawConfig?.tombstoneRetentionDays;
+  const effectivePhysicalDeleteTtlDays =
+    raw?.physicalDeleteTtlDays ?? legacyTombstoneTTL ?? 14;
+  return {
+    enabled: !!raw?.enabled,
+    retentionDays: clampFiniteInt(raw?.retentionDays, 1, 3650, 365),
+    physicalDeleteTtlDays: clampFiniteInt(
+      effectivePhysicalDeleteTtlDays, 1, 3650, 14
+    ),
+  };
+}
+
+/**
  * Parses and resolves default configuration for the plugin.
  * Handles the configSchema defined in openclaw.plugin.json.
  */
 export function loadConfig(rawConfig: any, opts?: { platform?: string }): EpisodicPluginConfig {
   const platform = opts?.platform;
   return {
-    tombstoneRetentionDays: rawConfig?.tombstoneRetentionDays ?? 14,
+    // [v0.4.34] forgettingEpisodic — user-facing config for weekly unused-episode sweep
+    forgettingEpisodic: normalizeForgettingConfig(rawConfig),
     enableBackgroundWorkers: rawConfig?.enableBackgroundWorkers ?? true,
     lexicalPreFilterLimit: rawConfig?.lexicalPreFilterLimit ?? 1000,
     reserveTokens: rawConfig?.reserveTokens ?? 2048,

@@ -673,6 +673,23 @@ export class EpisodicRetriever {
     private config?: EpisodicPluginConfig
   ) {}
 
+  private recordInjectedEpisodes(agentWs: string, queryHash: string, episodeIds: string[], source: string): void {
+    const injectedIds = episodeIds.map((id) => id.trim()).filter(Boolean);
+    if (injectedIds.length === 0) return;
+
+    this.rpcClient.recallFeedback({
+      agentWs,
+      feedbackId: randomUUID(),
+      queryHash,
+      shown: injectedIds,
+      used: [],
+      expanded: [],
+      source,
+    }).catch(feedbackErr => {
+      console.warn("[Episodic Memory] recall feedback failed:", feedbackErr);
+    });
+  }
+
   private buildGoJapaneseQueryInput(recentMessages: Message[]): string {
     const { cleanedPerMessage } = prepareRecallQueryTexts(recentMessages);
     return cleanedPerMessage.join("\n");
@@ -881,6 +898,7 @@ export class EpisodicRetriever {
       Date.now() - cachedEntry.cachedAt < RECALL_CACHE_TTL_MS
     ) {
       console.log(`[Episodic Recall] TS-cache hit for hash=${queryHash.substring(0, 8)}, skipping RPC.`);
+      this.recordInjectedEpisodes(agentWs, queryHash, cachedEntry.result.episodeIds, "assemble-cache-hit");
       return cachedEntry.result;
     }
 
@@ -1015,18 +1033,7 @@ export class EpisodicRetriever {
       assembled += "--- End of Memory ---\n";
 
       for (const [ws, injectedIds] of injectedIdsByWs.entries()) {
-        if (injectedIds.length === 0) continue;
-        this.rpcClient.recallFeedback({
-          agentWs: ws,
-          feedbackId: randomUUID(),
-          queryHash,
-          shown: injectedIds,
-          used: [],
-          expanded: [],
-          source: "assemble",
-        }).catch(feedbackErr => {
-          console.warn("[Episodic Memory] recall feedback failed:", feedbackErr);
-        });
+        this.recordInjectedEpisodes(ws, queryHash, injectedIds, "assemble");
       }
 
       const outcome: RecallInjectionOutcome = {

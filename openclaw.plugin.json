@@ -1,7 +1,7 @@
 {
   "id": "episodic-claw",
   "displayName": "Episodic Memory",
-  "version": "0.4.33",
+  "version": "0.4.34a-pre.release",
   "description": "Long-term episodic memory for OpenClaw agents. Uses a Sequential Cache-and-Drain architecture to safely split massive chat logs into 64K chunks, then narrativizes them into continuous episodes via OpenRouter — with per-agent continuity, adaptive idle backoff, wake() guarantees, crash-safe durability, and configurable reasoning/thinking control for higher output quality.",
   "kind": "memory",
   "keywords": ["memory", "episodic", "long-term", "rag", "vector-search", "recall"],
@@ -105,7 +105,32 @@
       "tombstoneRetentionDays": {
         "type": "integer",
         "minimum": 1,
-        "description": "How many days to wait before physically deleting forgotten (Tombstoned) memories from the disk. Default: 14.\n⚠️ [Blast Radius] If too short: You have zero time to salvage an important memory that got accidentally forgotten. If too long: You waste hard drive space endlessly."
+        "deprecated": true,
+        "description": "[DEPRECATED v0.4.34] Use forgettingEpisodic.physicalDeleteTtlDays instead. This top-level key is kept for backward compatibility — when present, it is migrated automatically into forgettingEpisodic.physicalDeleteTtlDays at load time. It is ignored when forgettingEpisodic.physicalDeleteTtlDays is already set."
+      },
+      "forgettingEpisodic": {
+        "type": "object",
+        "description": "Controls the weekly unused-episode forgetting sweep. Finds old Markdown episodes that have not been recalled, expanded, or auto-injected, writes a one-line memory-of-forgetting snapshot, then removes the original episode file. Default: disabled.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable the weekly forgetting sweep. Default: false. If false, the scheduler does not mark, summarize, or delete unused episodes."
+          },
+          "retentionDays": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 365,
+            "description": "How many days an ordinary Markdown episode must remain unused before it becomes eligible for forgetting. Default: 365. Manual saves (ep-save) and notes/ files are excluded."
+          },
+          "physicalDeleteTtlDays": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 14,
+            "description": "TTL for records in the forgotten state before their source files are physically removed. Default: 14."
+          }
+        }
       },
       "enableBackgroundWorkers": {
         "type": "boolean",

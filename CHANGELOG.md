@@ -1,6 +1,36 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.34a-pre.release] - 2026-06-04
+
+### Added
+- **Forgetting sweep weekly worker (Phase 3.0 + 3.2)**: weekly Sunday 03:00 JST scan that finds unused MD episodes older than `forgettingEpisodic.retentionDays` (default 365), marks them forgotten, and physically deletes each candidate regardless of LLM snapshot success. The scheduler uses 5-minute ticks with a 7-day age gate, run-lock, and 1-hour cooldown to prevent re-entry.
+- **Per-episode pre-delete semantic snapshot**: before physical deletion, each candidate is summarized into one sentence via gemini-main → gemma-main 2-phase LLM chain with a 5-rule guardrail (non_empty, no_cot_prefix, no_refusal, single_line, language_match). Failures are logged and the episode is still deleted — the snapshot is a courtesy semantic log, not a blocker.
+- **Memory-that-ive-forgotten-*.md semantic log**: weekly scans write one file per scan at `{agentWs}/{year}/{month}/memory-that-ive-forgotten-NNNN.md`, where N is a per-year counter. Empty buffers produce no file.
+- **Forgetting config schema**: new nested `forgettingEpisodic` config object in `openclaw.plugin.json` with `enabled` (default false), `retentionDays` (default 365), `physicalDeleteTtlDays` (default 14).
+- **Injection tracking (Phase 1)**: `EpisodeRecord.InjectedCount` and `LastInjectedAt` fields added. Recall cache hits and `ep-expand` usage now feed into these fields. The TS recall path sends a "hit" callback to the Go sidecar on cache hits, and `RecordHit` in the Go sidecar is reused to write `Hits`/`LastHitAt`.
+- **Tombstone GC split (Phase 2A+2B)**: `RunGarbageCollector()` delegates to `ListBatchableForgotten()` and `DeleteForgottenFiles()`. Runtime behavior unchanged.
+- **Unused-review dry-run helper (Phase 2C)**: `SimulateMarkUnusedAsForgotten()` in the Go sidecar is a read-only dry-run; never mutates `PruneState`. The review period is measured from each candidate's narrative timestamp, not a deletion deadline.
+- **TS snapshot module**: new `src/snapshot-{scheduler,worker,guardrail,file-writer}.ts` and `src/episode-extract.ts` modules.
+- **Go RPC surface**: `episode.listForgottenEpisodes`, `episode.snapshotCounterIncrement`, `llm.generate` (with optional `apiKey` and `timeoutMs` params). New `vector.ListAllForgottenEpisodes` and `vector.ListBatchableForgotten` helpers.
+- **Tests**: `test_snapshot_pipeline.ts` (6 categories, 33 assertions) and `go/snapshot_year_test.go` (10 range-check cases) for the new sweep path. `go/internal/vector/unused_review_test.go` for the mark / list / dry-run path.
+
+### Changed
+- **User-facing rename `tombstone` → `forgetting`**: the user-facing config namespace is now `forgettingEpisodic` instead of `tombstoneRetentionDays`. Internal `PruneState="forgotten"` value replaces `"tombstone"`. JSON field `forgottenAt` replaces `tombstoned_at`. CLI flag `-delete-ttl` replaces `-tombstone-ttl`. Meta keys `meta:forgotten_snapshot_*` replace `meta:tombstone_snapshot_*`.
+- **Back-compat for KASOU v0.4.32 configs**: top-level `tombstoneRetentionDays` is accepted by both the JSON Schema and TypeBox schema as a deprecated property. At load time, `normalizeForgettingConfig` migrates it into `forgettingEpisodic.physicalDeleteTtlDays` when the latter is unset. Existing KASOU configs (e.g. `tombstoneRetentionDays: 365`) continue to work without manual edits.
+- **Back-compat for old DB records**: `isActiveD0Record`, the resurrection guard, and `ListBatchableForgotten` now all accept the legacy `PruneState="tombstone"` value as equivalent to `"forgotten"`. Old `tombstoned_at` records (with their `TombstonedAt` field not deserialized into `ForgottenAt`) will not surface as active D0, will not be re-indexed, and will not be resurrected by the stage2 pipeline.
+- **Retention wording clarified**: `forgettingEpisodic.physicalDeleteTtlDays` is now the current physical deletion TTL for memories that are already forgotten. The weekly unused-episode review window (Phase 5) will be documented separately before it is enabled.
+- **Episodic-Claw docs/comments**: all documentation, comments, and test descriptions updated to use "forgetting" / "weekly sweep" terminology.
+
+### Tech debt
+- **Zero `tombstone` references remain** in source code (verified via grep). All historical plan documents retain the term as a record of the design phase.
+- **TypeBox schema** now describes `forgettingEpisodic` with the new `physicalDeleteTtlDays` field. `tombstoneRetentionDays` remains in the schema as a deprecated property for back-compat.
+- **Test data IDs**: `old-tomb` / `recent-tomb` / `only-tomb` in `unused_review_test.go` renamed to `old-forgotten` / `recent-forgotten` / `only-forgotten`. `TestMarkEpisodesForgottenoesNotDoubleMark` typo fixed to `DoesNot`.
+- **JSON tag fix**: `Stage2RunSummary.Forgotten` field now uses lowercase `json:"forgotten"` to match the rest of the struct.
+- **ENOENT unlink contract**: `snapshot-worker.ts` ENOENT path now returns `true` (counted as deleted) per the documented contract; only real errors return `false`.
+- **Debug logging**: `RecordInjected` failures in the recall-feedback path are now logged at debug level (was silently swallowed).
+- **State DB error messages**: RPC payload for state DB init failures now returns a generic `"State DB unavailable"` message; the full error is logged server-side. Prevents leaking filesystem paths.
+
+## [0.4.33] - 2026-05-27
 
 ## [0.4.32] - 2026-05-24
 

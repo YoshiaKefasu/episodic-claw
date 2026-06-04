@@ -34,6 +34,7 @@ function loadModules(): {
     "narrative-worker.js","gemini-direct-client.js","narrative-pool.js","narrative-queue.js",
     "openrouter-client.js","reasoning-tags.js","rpc-client.js","env-var.js","runtime-mode.js","bug1-registration-origin.js",
     "segmenter.js","summary-escalation.js","transcript-repair.js","transport-retry.js","types.js","utils.js",
+    "episode-extract.js","snapshot-guardrail.js","snapshot-file-writer.js","snapshot-worker.js","snapshot-scheduler.js",
   ];
   for (const file of allFiles) {
     const src = path.resolve("dist", file);

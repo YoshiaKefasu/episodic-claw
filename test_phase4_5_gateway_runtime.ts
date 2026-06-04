@@ -57,6 +57,11 @@ export async function runGatewayStartSmoke(): Promise<void> {
     "types.js",
     "utils.js",
     "bug1-registration-origin.js",
+    "episode-extract.js",
+    "snapshot-guardrail.js",
+    "snapshot-file-writer.js",
+    "snapshot-worker.js",
+    "snapshot-scheduler.js",
     "runtime-mode.js"
   ];
   for (const file of distJsFiles) {
@@ -192,7 +197,7 @@ async function tokenizeCjk(text, lang) {
       "Vector store is empty for",
       "Auto-Rebuild from Markdown",
       "HealingWorker: [Pass 3] Starting Stage 2 Batch Score update",
-      "HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)",
+      "HealingWorker: [Pass 4] Starting GC (forgotten older than 14 days)...",
     ], 90000);
 
     assert.ok(!fs.existsSync(nestedFile), "nested tree should be removed from the active workspace");

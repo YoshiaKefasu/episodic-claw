@@ -12,6 +12,7 @@ import { AnchorStore } from "./anchor-store";
 import { estimateTokens } from "./utils";
 import { OpenRouterClient } from "./openrouter-client";
 import { NarrativeWorker } from "./narrative-worker";
+import { SnapshotScheduler } from "./snapshot-scheduler";
 import { NarrativePool } from "./narrative-pool";
 import { RecallFallbackReason, RecallMatchedBy } from "./types";
 import { initLanguageDetector } from "./lang-detect";
@@ -606,6 +607,14 @@ const PluginConfigSchema = Type.Object(
         maxTokens: Type.Optional(Type.Integer({ description: "Deprecated: use narrativeConfig.reasoning.maxTokens instead." })),
       }, { additionalProperties: false })),
     }, { additionalProperties: false, description: "[DEPRECATED v0.4.29c] Use narrativeConfig instead. Retained for backward compatibility only." })),
+    // [v0.4.34] forgettingEpisodic — user-facing config for weekly unused-episode sweep
+    forgettingEpisodic: Type.Optional(Type.Object({
+      enabled: Type.Optional(Type.Boolean({ description: "Enable the weekly forgetting sweep. Default: false." })),
+      retentionDays: Type.Optional(Type.Integer({ minimum: 1, description: "Days an episode must remain unused before eligibility. Default: 365." })),
+      physicalDeleteTtlDays: Type.Optional(Type.Integer({ minimum: 1, description: "TTL for forgotten records before physical delete. Default: 14." })),
+    }, { additionalProperties: false, description: "Weekly unused-episode forgetting sweep. Default: disabled." })),
+    // [v0.4.34] tombstoneRetentionDays — DEPRECATED back-compat shim
+    tombstoneRetentionDays: Type.Optional(Type.Integer({ minimum: 1, description: "[DEPRECATED v0.4.34] Use forgettingEpisodic.physicalDeleteTtlDays instead. Migrated automatically at load time when forgettingEpisodic.physicalDeleteTtlDays is not set." })),
   },
   { additionalProperties: false }
 );
@@ -629,6 +638,9 @@ type SingletonType = {
   // Narrative architecture (v0.4.0)
   openRouterClient: OpenRouterClient | null;
   narrativeWorker: NarrativeWorker | null;
+  // Forgetting sweep scheduler (v0.4.34 Phase 3.2) — set per-workspace
+  // on first resolution, then re-used for subsequent sweeps.
+  snapshotScheduler?: SnapshotScheduler;
 };
 let _singleton: SingletonType | null = null;
 
@@ -1052,6 +1064,19 @@ const episodicClawPlugin = {
         await prepareWorkspaces(resolution);
         if (_singleton!.watcherDegradedWorkspaces.size > 0) {
           console.warn("[Episodic Memory] One or more watcher workspaces are degraded; rebuild fallback is active.");
+        }
+
+        // [v0.4.34 Phase 3.2] Start the forgetting sweep scheduler.
+        // Single timer per process; the agentWs is the default workspace
+        // (additional workspaces can be added by repeating setClient + start,
+        // but the current plan ships a single-workspace scheduler).
+        if (!_singleton!.snapshotScheduler) {
+          const sched = new SnapshotScheduler(resolution.agentWs, {
+            forgettingEnabled: !!_singleton!.cfg.forgettingEpisodic?.enabled,
+          });
+          sched.setClient(rpcClient);
+          sched.start();
+          _singleton!.snapshotScheduler = sched;
         }
 
         // Connect the onFileChange raw event to the Debouncer

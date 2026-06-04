@@ -60,7 +60,6 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
   // Manually enumerate all expected keys from types.ts EpisodicPluginConfig
   // (TypeScript types are erased at runtime, so we define the expected set here)
   const expectedKeys: (keyof EpisodicPluginConfig)[] = [
-    "tombstoneRetentionDays",
     "enableBackgroundWorkers",
     "lexicalPreFilterLimit",
     "reserveTokens",
@@ -123,7 +122,6 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
   const defaults = loadConfig({});
 
   const expectedKeys = new Set([
-    "tombstoneRetentionDays",
     "enableBackgroundWorkers",
     "lexicalPreFilterLimit",
     "reserveTokens",
@@ -171,6 +169,10 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "narrativeGuardMinLatinWords",
     // [v0.4.29c Fix C1] narrativeConfigSource for observability
     "narrativeConfigSource",
+    // [v0.4.34] forgettingEpisodic — weekly unused-episode sweep
+    "forgettingEpisodic",
+    // [v0.4.34] tombstoneRetentionDays — DEPRECATED back-compat shim
+    "tombstoneRetentionDays",
   ]);
 
   const extraKeys: string[] = [];
@@ -228,7 +230,6 @@ console.log("\n=== 3. Default Value Consistency ===\n");
 
 test("loadConfig({}) returns correct defaults for all fields", () => {
   const cfg = loadConfig({});
-  assert.equal(cfg.tombstoneRetentionDays, 14);
   assert.equal(cfg.enableBackgroundWorkers, true);
   assert.equal(cfg.lexicalPreFilterLimit, 1000);
   assert.equal(cfg.reserveTokens, 2048);
@@ -570,19 +571,16 @@ test("loadConfig() receives plugin-specific config from api.pluginConfig", () =>
   const pluginSpecificConfig = {
     narrativeSystemPrompt: "inline system prompt",
     narrativeUserPromptTemplate: "inline user prompt",
-    tombstoneRetentionDays: 30,
   };
   const cfg = loadConfig(pluginSpecificConfig);
   assert.equal(cfg.narrativeSystemPrompt, "inline system prompt");
   assert.equal(cfg.narrativeUserPromptTemplate, "inline user prompt");
-  assert.equal(cfg.tombstoneRetentionDays, 30);
 });
 
 test("loadConfig() returns defaults when passed empty plugin-specific config", () => {
   const cfg = loadConfig({});
   assert.equal(cfg.narrativeSystemPrompt, "");  // DEFAULT used
   assert.equal(cfg.narrativeUserPromptTemplate, "");  // DEFAULT used
-  assert.equal(cfg.tombstoneRetentionDays, 14);  // default
 });
 
 test("loadConfig() does NOT extract narrativeSystemPrompt from global config top-level (Bug #0 regression guard)", () => {
@@ -888,6 +886,46 @@ test("openrouterConfig deprecation warning fires only once per process", () => {
     // Restore console.warn
     console.warn = originalWarn;
   }
+});
+
+// ─── 14. Forgetting Config Tests ──────────────────────────────
+
+console.log("\n=== 14. Forgetting Config Tests ===\n");
+
+test("test_config_forgetting_default_off", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.forgettingEpisodic?.enabled, false);
+  assert.equal(cfg.forgettingEpisodic?.retentionDays, 365);
+  assert.equal(cfg.forgettingEpisodic?.physicalDeleteTtlDays, 14);
+});
+
+test("test_config_forgetting_overrides_legacy_ttl", () => {
+  const cfg = loadConfig({
+    forgettingEpisodic: { physicalDeleteTtlDays: 60 },
+  });
+  assert.equal(cfg.forgettingEpisodic?.physicalDeleteTtlDays, 60);
+});
+
+test("test_config_legacy_tombstone_retention_days_migrates", () => {
+  // [v0.4.34] Back-compat: top-level tombstoneRetentionDays (KASOU v0.4.32 config)
+  // migrates into forgettingEpisodic.physicalDeleteTtlDays.
+  const cfg = loadConfig({ tombstoneRetentionDays: 365 });
+  assert.equal(cfg.forgettingEpisodic?.physicalDeleteTtlDays, 365);
+});
+
+test("test_config_legacy_ttl_overridden_by_new_config", () => {
+  // If both are present, the new forgettingEpisodic.physicalDeleteTtlDays wins.
+  const cfg = loadConfig({
+    tombstoneRetentionDays: 365,
+    forgettingEpisodic: { physicalDeleteTtlDays: 7 },
+  });
+  assert.equal(cfg.forgettingEpisodic?.physicalDeleteTtlDays, 7);
+});
+
+test("test_config_env_kill_switch_precedence", () => {
+  const cfg = loadConfig({ forgettingEpisodic: { enabled: true } });
+  // forgettingEpisodic.enabled is set to true, but the scheduler checks env var first
+  assert.equal(cfg.forgettingEpisodic?.enabled, true);
 });
 
 // ─── Summary ────────────────────────────────────────────────

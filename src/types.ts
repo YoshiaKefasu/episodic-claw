@@ -29,6 +29,19 @@ export interface MarkdownDocument {
   Body: string;
 }
 
+/**
+ * Slim shape returned by Go's episode.listForgottenEpisodes RPC. The full
+ * EpisodeRecord carries a 3072-dim vector that the snapshot worker does not
+ * need; only identity, source path, and timestamps are kept.
+ */
+export interface ForgottenSummary {
+  id: string;
+  path: string;
+  title: string;
+  timestamp: string; // ISO 8601
+  forgottenAt: string; // ISO 8601
+}
+
 export interface FileEvent {
   Path: string;
   Operation: string;
@@ -65,7 +78,6 @@ export interface NarrativeConfig {
 }
 
 export interface EpisodicPluginConfig {
-  tombstoneRetentionDays?: number;
   /** Enables background maintenance workers (HealingWorker for index auto-rebuild, embedding 429 recovery).
    *  Default: true. Does not affect narrative generation. D1 consolidation is no longer used. */
   enableBackgroundWorkers?: boolean;
@@ -177,6 +189,8 @@ export interface EpisodicPluginConfig {
   narrativeGuardMinCjkChars?: number;
   /** Minimum Latin word count for narrative output (whitespace-split). Default: 80. */
   narrativeGuardMinLatinWords?: number;
+  /** Weekly unused-episode forgetting sweep config. Default: disabled. */
+  forgettingEpisodic?: ForgettingConfig;
 }
 
 export interface RecallCalibration {
@@ -280,5 +294,15 @@ export interface NarrativeResult {
   text: string;
   tokens: number;
   model: string;
+}
+
+/** Configuration for the weekly unused-episode forgetting sweep. */
+export interface ForgettingConfig {
+  /** Enable the weekly forgetting sweep. Default: false. */
+  enabled?: boolean;
+  /** Days an episode must remain unused before eligibility. Default: 365. */
+  retentionDays?: number;
+  /** TTL (days) for forgotten records before physical delete. Default: 14. */
+  physicalDeleteTtlDays?: number;
 }
 

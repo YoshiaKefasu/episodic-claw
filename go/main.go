@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	tombstoneTTL           *int
+	deleteTTL           *int
 	disableWorkers         *bool
 	lexicalLimit           *int
 	lexicalRebuildInterval *int
@@ -78,7 +78,7 @@ var (
 )
 
 func init() {
-	tombstoneTTL = flag.Int("tombstone-ttl", 14, "Days to keep tombstones before deleting")
+	deleteTTL = flag.Int("delete-ttl", 14, "Days to keep forgotten records before deleting")
 	disableWorkers = flag.Bool("disable-workers", false, "Disable background healing and consolidation workers")
 	lexicalLimit = flag.Int("lexical-limit", 1000, "Max lexical pre-filter limit")
 	lexicalRebuildInterval = flag.Int("lexical-rebuild-interval", 7, "Days between lexical index consistency checks")
@@ -168,7 +168,7 @@ func getStore(agentWs string) (*vector.Store, error) {
 	}
 
 	s, err := vector.NewStore(agentWs, vector.StoreConfig{
-		TombstoneTTL:       *tombstoneTTL,
+		DeleteTTL:       *deleteTTL,
 		LexicalFilterLimit: *lexicalLimit,
 		Stage2TwoPhase:     *stage2TwoPhase, // [v0.4.26g]
 	})
@@ -2194,9 +2194,9 @@ func RunAsyncHealingWorker(agentWs string, apiKey string, vstore *vector.Store) 
 	vstore.CleanupLegacyStage2Summary()
 
 	// ----------------------------------------------------
-	// Pass 4: Garbage Collection (Tombstone removal)
+	// Pass 4: Garbage Collection (forgotten removal)
 	// ----------------------------------------------------
-	EmitLog("HealingWorker: [Pass 4] Starting GC (Tombstone older than 14 days)...")
+	EmitLog("HealingWorker: [Pass 4] Starting GC (forgotten older than 14 days)...")
 	ctxPass4, cancelPass4 := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancelPass4()
 	if err := vstore.RunGarbageCollector(ctxPass4); err != nil {
@@ -2434,12 +2434,28 @@ func handleRecallFeedback(conn net.Conn, req RPCRequest) {
 		_ = vstore.SetMeta("recall_feedback:"+feedbackID, raw)
 	}
 
+	shownIDs, _ := stored["shown"].([]string)
+	usedIDs, _ := stored["used"].([]string)
+	expandedIDs, _ := stored["expanded"].([]string)
+	updatedInjected := 0
+	for _, id := range shownIDs {
+		if err := vstore.RecordInjected(id, now); err == nil {
+			updatedInjected++
+		} else {
+			// [v0.4.34] Surface silent failures at debug level. This path is
+			// fire-and-forget from TS so it must not block the RPC response,
+			// but we still want a breadcrumb for forensics.
+			EmitLog("[debug] RecordInjected failed id=%s err=%v", id, err)
+		}
+	}
+
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]int{
-		"updated":  1,
-		"skipped":  0,
-		"shown":    len(stored["shown"].([]string)),
-		"used":     len(stored["used"].([]string)),
-		"expanded": len(stored["expanded"].([]string)),
+		"updated":          1,
+		"skipped":          0,
+		"shown":            len(shownIDs),
+		"injected_updated": updatedInjected,
+		"used":             len(usedIDs),
+		"expanded":         len(expandedIDs),
 	}, ID: req.ID})
 }
 
@@ -2544,7 +2560,10 @@ func handleStateGet(conn net.Conn, req RPCRequest) {
 
 	stateStore, err := getGlobalStateStore()
 	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB init failed: " + err.Error()}, ID: req.ID})
+		// [v0.4.34] Log full error server-side; RPC payload uses generic message
+		// to avoid leaking filesystem paths.
+		EmitLog("[error] State DB init failed: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB unavailable"}, ID: req.ID})
 		return
 	}
 
@@ -2579,7 +2598,10 @@ func handleStateSet(conn net.Conn, req RPCRequest) {
 
 	stateStore, err := getGlobalStateStore()
 	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB init failed: " + err.Error()}, ID: req.ID})
+		// [v0.4.34] Log full error server-side; RPC payload uses generic message
+		// to avoid leaking filesystem paths.
+		EmitLog("[error] State DB init failed: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB unavailable"}, ID: req.ID})
 		return
 	}
 
@@ -2590,6 +2612,228 @@ func handleStateSet(conn net.Conn, req RPCRequest) {
 	}
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: true, ID: req.ID})
+}
+
+// handleSnapshotCounterIncrement atomically increments the per-year counter
+// used by the weekly forgotten semantic-snapshot worker. The counter key is
+// "meta:forgotten_snapshot_counter:<year>" inside the global state store. The
+// caller (TypeScript) supplies the year so the in-process counter logic stays
+// independent of clock skew between Go and TS.
+func handleSnapshotCounterIncrement(conn net.Conn, req RPCRequest) {
+	start := time.Now()
+	var params struct {
+		Year string `json:"year"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+	if params.Year == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'year'"}, ID: req.ID})
+		return
+	}
+	if !isFourDigitYear(params.Year) {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Year must be 4 numeric digits (YYYY)"}, ID: req.ID})
+		return
+	}
+
+	stateStore, err := getGlobalStateStore()
+	if err != nil {
+		// [v0.4.34] Log full error server-side; RPC payload uses generic message
+		// to avoid leaking filesystem paths.
+		EmitLog("episode.snapshotCounterIncrement: state store unavailable: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "State DB unavailable"}, ID: req.ID})
+		return
+	}
+
+	key := "meta:forgotten_snapshot_counter:" + params.Year
+	number, incrErr := stateStore.IncrementCounter(key)
+	if incrErr != nil {
+		EmitLog("episode.snapshotCounterIncrement: %s failed: %v", key, incrErr)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: incrErr.Error()}, ID: req.ID})
+		return
+	}
+
+	EmitLog("episode.snapshotCounterIncrement: year=%s number=%d elapsedMs=%d", params.Year, number, time.Since(start).Milliseconds())
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"number": number}, ID: req.ID})
+}
+
+// isFourDigitYear returns true for ASCII digits of length 4 (e.g. "2026")
+// AND a plausible year range. Defense-in-depth guard so a malformed TS
+// caller cannot create semantically meaningless keys like
+// meta:forgotten_snapshot_counter:0000 or meta:forgotten_snapshot_counter:9999.
+func isFourDigitYear(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return false
+	}
+	// Bounded to plausible operational window. Lower bound = 2024 (first
+	// Episodic-Claw release year). Upper bound = 2100 (centuries out — any
+	// real year is well within this).
+	return n >= 2024 && n <= 2100
+}
+
+// ForgottenSummary is the slim shape returned by episode.listForgottenEpisodes.
+// The full EpisodeRecord contains a 3072-dim vector (~12KB) per record, which
+// is not needed by the caller — the TypeScript worker only needs identity
+// (ID/SourcePath), narrative timestamp, and the forgotten time. Vectors are
+// intentionally excluded to keep RPC payloads small for the weekly sweep.
+type ForgottenSummary struct {
+	ID           string    `json:"id"`
+	SourcePath   string    `json:"path"`
+	Title        string    `json:"title"`
+	Timestamp    time.Time `json:"timestamp"`
+	ForgottenAt time.Time `json:"forgottenAt"`
+}
+
+// handleListForgottenEpisodes returns all records currently in the
+// "forgotten" state for the given agentWs. Used by the weekly semantic
+// snapshot worker in TypeScript to drive the per-item summary+delete loop.
+//
+// Filters by SourcePath prefix when agentWs is non-empty (production);
+// an empty agentWs returns all workspaces (test/admin only).
+//
+// Limit caps the result to avoid pulling a huge list at once; the worker
+// is expected to drain in batches.
+func handleListForgottenEpisodes(conn net.Conn, req RPCRequest) {
+	start := time.Now()
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		Limit   int    `json:"limit"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+	if params.AgentWs == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+	if params.Limit <= 0 {
+		params.Limit = 500
+	}
+
+	vstore, err := getStore(params.AgentWs)
+	if err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed: " + err.Error()}, ID: req.ID})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	records, err := vstore.ListAllForgottenEpisodes(ctx, params.AgentWs, params.Limit)
+	if err != nil {
+		EmitLog("episode.listForgottenEpisodes: ListAllForgottenEpisodes failed: %v", err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	out := make([]ForgottenSummary, 0, len(records))
+	for _, r := range records {
+		out = append(out, ForgottenSummary{
+			ID:           r.ID,
+			SourcePath:   r.SourcePath,
+			Title:        r.Title,
+			Timestamp:    r.Timestamp,
+			ForgottenAt: r.ForgottenAt,
+		})
+	}
+
+	EmitLog("episode.listForgottenEpisodes: agentWs=%q count=%d elapsedMs=%d", params.AgentWs, len(out), time.Since(start).Milliseconds())
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"records": out, "count": len(out)}, ID: req.ID})
+}
+
+// snapshotModelGeminiMain is the primary LLM used by the forgotten semantic
+// snapshot worker. Chosen for low cost + low latency per episode summary.
+const snapshotModelGeminiMain = "gemini-3.1-flash-lite"
+
+// snapshotModelGemmaMain is the fallback LLM when gemini-main fails or
+// rejects (refusal, guardrail miss, timeout). Both call the same Google
+// Generative Language API via NewGoogleStudioProvider, so a single API key
+// (GEMINI_API_KEY) is sufficient.
+const snapshotModelGemmaMain = "gemma-4-31b-it"
+
+// snapshotLLMTimeout caps each individual LLM call at 30s, matching the
+// narrative-worker default. The TypeScript caller is expected to apply its
+// own timeout on top via the RPC client.
+const snapshotLLMTimeout = 30 * time.Second
+
+// handleLLMGenerate is a thin pass-through to ai.GoogleStudioProvider for the
+// snapshot worker. It accepts a logical model name (gemini-main or
+// gemma-main) plus a prompt and returns the raw text response. Timeout is
+// enforced via context; HTTP client retains its 60s safety ceiling. Errors
+// are propagated as JSON-RPC errors so the TypeScript caller can decide
+// whether to fall through to the next model.
+func handleLLMGenerate(conn net.Conn, req RPCRequest) {
+	start := time.Now()
+	var params struct {
+		Model   string `json:"model"`
+		Prompt  string `json:"prompt"`
+		APIKey  string `json:"apiKey,omitempty"`  // optional per-request override
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+	if params.Prompt == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'prompt'"}, ID: req.ID})
+		return
+	}
+
+	model, modelErr := resolveSnapshotModel(params.Model)
+	if modelErr != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: modelErr.Error()}, ID: req.ID})
+		return
+	}
+
+	// Prefer per-request key when supplied (future multi-tenant / rotation);
+	// fall back to env for the current single-key deployment.
+	apiKey := params.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("GEMINI_API_KEY")
+	}
+	if apiKey == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "GEMINI_API_KEY not set"}, ID: req.ID})
+		return
+	}
+
+	prov := ai.NewGoogleStudioProvider(apiKey, model)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotLLMTimeout)
+	defer cancel()
+
+	text, err := prov.GenerateText(ctx, params.Prompt)
+	if err != nil {
+		EmitLog("llm.generate: model=%s elapsedMs=%d err=%v", model, time.Since(start).Milliseconds(), err)
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: err.Error()}, ID: req.ID})
+		return
+	}
+
+	EmitLog("llm.generate: model=%s elapsedMs=%d chars=%d", model, time.Since(start).Milliseconds(), len(text))
+	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: map[string]any{"text": text, "model": model}, ID: req.ID})
+}
+
+// resolveSnapshotModel maps a logical model alias (gemini-main, gemma-main)
+// to its concrete Google Generative Language API model name. Adding a new
+// model only requires extending this switch — the rest of the snapshot
+// worker uses the alias.
+func resolveSnapshotModel(alias string) (string, error) {
+	switch alias {
+	case "gemini-main", "GEMINI_MAIN", "gemini":
+		return snapshotModelGeminiMain, nil
+	case "gemma-main", "GEMMA_MAIN", "gemma":
+		return snapshotModelGemmaMain, nil
+	default:
+		return "", fmt.Errorf("unknown model alias %q (expected gemini-main or gemma-main)", alias)
+	}
 }
 
 func handleSetMeta(conn net.Conn, req RPCRequest) {
@@ -2811,13 +3055,7 @@ func handleExpand(conn net.Conn, req RPCRequest) {
 	}
 
 	now := time.Now()
-	_ = vstore.UpdateRecord(params.Slug, func(rec *vector.EpisodeRecord) error {
-		rec.Retrievals++
-		rec.Hits += 2
-		rec.LastRetrievedAt = now
-		rec.LastHitAt = now
-		return nil
-	})
+	_ = vstore.RecordHit(params.Slug, now)
 
 	obsID := fmt.Sprintf("expand:%s:%d", params.Slug, now.UnixNano())
 	if req.ID != nil {
@@ -3069,6 +3307,12 @@ func handleConnection(conn net.Conn) {
 			go handleStateGet(conn, req)
 		case "state.set":
 			go handleStateSet(conn, req)
+		case "episode.snapshotCounterIncrement":
+			go handleSnapshotCounterIncrement(conn, req)
+		case "episode.listForgottenEpisodes":
+			go handleListForgottenEpisodes(conn, req)
+		case "llm.generate":
+			go handleLLMGenerate(conn, req)
 		case "ai.triggerBackgroundIndex":
 			go handleTriggerBackgroundIndex(conn, req)
 		case "migration.rollbackLegacyNestedEpisodeTree":
