@@ -8,7 +8,7 @@ import (
 	"episodic-core/internal/vector"
 )
 
-// TestRunAutoRebuildScope_LimitsToEpisodesSubdir verifies the v0.4.35 fix:
+// TestRunAutoRebuildScope_LimitsToEpisodesSubdir verifies the v0.4.34-pre.release.hf3 fix:
 // runAutoRebuild must NOT walk files outside the episodes/ subdirectory.
 // Bug A symptom: 200+ spurious "episode record ID must not be empty" errors
 // from memory/, venv/, etc. when rebuild fires.

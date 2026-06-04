@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.34-pre.release.hf3] - 2026-06-04
+
+### Fixed (Bug A, B, C 退治)
+- **Bug A — `runAutoRebuild` scope over-walk** (`go/main.go:1091`): the function used `filepath.Walk(targetDir, ...)` which walked the entire `agentWs` (workspace root) instead of `agentWs/episodes/`. Triggered when the vector store was empty (e.g. after my dry-run probe on 2026-06-04 created a phantom `workspace/vector.db`). Symptom was 200+ spurious "episode record ID must not be empty" errors from `memory/`, `venv/`, `camofox-browser/`, etc., plus wasted Gemini API quota. Fix: the function now constrains the walk to `episodes/` via a `filepath.Join(targetDir, "episodes")` computation guarded by a `strings.HasSuffix(targetDir, "/episodes")` check. The HasSuffix guard is required because existing `main_legacy_tree_migration_test.go:96` already passes an `agentWs` suffixed with `/episodes` and would otherwise double-join to a non-existent path. New unit tests cover the workspace-root, already-suffixed, no-subdir, and "episodes is a regular file" edge cases.
+- **Bug A+ — `getStore` phantom vector.db creation warning** (`go/main.go:178`): the function silently created empty vector.db files at any path. A read-only RPC (e.g. dry-run probe) passing `agentWs=workspace/` (no `/episodes` suffix) would create a phantom `workspace/vector.db` and trigger the auto-rebuild loop, masking real config errors. Fix: emit a `⚠️ getStore: created empty vector.db at ... — verify agentWs path is correct (read-only RPCs should pass agentWs+/episodes)` warning whenever a fresh DB is created. The warning makes misrouted RPCs immediately visible in the log file.
+- **Bug B — `modRequire("./narrative-queue")` MODULE_NOT_FOUND in KASOU** (`src/rpc-client.ts:1021`): `createRequire(__filename)` produced a CJS require that bypasses tsx's `.ts` extension hook. The KASOU OpenClaw runtime runs `src/index.ts` directly and resolves modules through tsx; the `createRequire` path does not pick up that hook and fails with `MODULE_NOT_FOUND`. Local test runs worked because the test runner's tsx hook also intercepts CJS require — KASOU's runtime does not. Fix: replace with `await import("./narrative-queue.js")`. The `.js` extension is explicit because `tsconfig.json` has `module: "CommonJS"` (TS compiler does not auto-append `.js`); the dynamic import works in both dist/ (compiles to `__importStar(require("./narrative-queue.js"))`) and tsx runtime. The function `ingestColdStartSession` was already `async`, so `await` is valid.
+- **Bug C — dry-run probe scripts passing `agentWs="workspace"` instead of `agentWs="workspace/episodes"`**: operational fix for the KASOU probe scripts (`/tmp/episodic-list-forgotten.mjs` and `/tmp/episodic-dryrun-probe.mjs`). Scripts updated to pass the suffixed path so Go's `vector.NewStore(agentWs)` opens the existing `workspace/episodes/vector.db` instead of creating a phantom at `workspace/vector.db`. With Fix A+ also deployed, any future misrouted probe will be visible in the log immediately.
+
+### Verified
+- All 4 new `TestRunAutoRebuildScope_*` tests pass.
+- All existing Go tests pass (`episodic-core`, `episodic-core/internal/{ai,queryparser,state,vector}`).
+- All 13 TS test suites pass (phase4_5, reasoning, classify_attachment, untrusted_metadata, anchor_sanitize, config_pipeline, narrative_quality_gate, openrouter_client, transport_retry, bug1_registration_origin, runtime_mode_detection, snapshot_pipeline, japanese_query_parser).
+- `dist/rpc-client.js` after build contains `await Promise.resolve().then(() => __importStar(require("./narrative-queue.js")))` — both dist/ and tsx resolve this correctly.
+
 ## [0.4.34a-pre.release.2] - 2026-06-04
 
 ### Added
