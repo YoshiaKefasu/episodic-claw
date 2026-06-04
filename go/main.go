@@ -178,6 +178,15 @@ func getStore(agentWs string) (*vector.Store, error) {
 	vectorStores[agentWs] = s
 	consumeLegacyEpisodeCleanupPending(agentWs)
 
+	// v0.4.35: Surface phantom vector.db creation. If a caller passes a path
+	// where no real episodes/vector.db exists, NewStore creates an empty one and
+	// the auto-rebuild trigger (Count()==0) fires. Log a warning so misrouted
+	// RPCs (e.g. dry-run probes passing workspace/ instead of workspace/episodes/)
+	// are immediately visible in logs.
+	if s.Count() == 0 {
+		EmitLog("⚠️ getStore: created empty vector.db at %s — verify agentWs path is correct (read-only RPCs should pass agentWs+/episodes)", agentWs)
+	}
+
 	// ==== Phase B & D: Auto-Rebuild Trigger ====
 	if s.Count() == 0 {
 		EmitLog("⚠️ Vector store is empty for %s — triggering Auto-Rebuild from Markdown", agentWs)
@@ -1078,6 +1087,21 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 		EmitLog("Legacy nested episode tree isolated at %s before auto rebuild", quarantined)
 	}
 
+	// v0.4.35: Constrain walk to episodes/ subdir. Without this guard, the walk
+	// picks up unrelated markdown files from workspace/memory/, workspace/venv/,
+	// workspace/camofox-browser/, etc., causing 200+ spurious "episode record ID
+	// must not be empty" errors and wasted Gemini API calls.
+	// HasSuffix guard prevents double-join for callers that already pass the
+	// episodes/ path (e.g. main_legacy_tree_migration_test.go:96).
+	episodesDir := targetDir
+	if !strings.HasSuffix(targetDir, "/episodes") {
+		episodesDir = filepath.Join(targetDir, "episodes")
+	}
+	if info, err := os.Stat(episodesDir); err != nil || !info.IsDir() {
+		EmitLog("Rebuild: skipped — no episodes/ subdir under %s (stat_err=%v)", targetDir, err)
+		return RebuildResult{}
+	}
+
 	provider := ai.NewGoogleStudioProvider(apiKey, "gemini-embedding-2-preview")
 	ctx := context.Background()
 
@@ -1088,7 +1112,7 @@ func runAutoRebuild(targetDir string, apiKey string, vstore *vector.Store) Rebui
 	}
 
 	var files []fileRecord
-	err := filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(episodesDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}

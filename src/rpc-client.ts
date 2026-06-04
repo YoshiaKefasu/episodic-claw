@@ -1018,7 +1018,12 @@ export async function ingestColdStartSession(
 
   if (hasApiKey) {
     // v0.4.2: Split into 64K chunks and enqueue to cache DB for narrativization
-    const { splitIntoChunks, enqueueNarrativeChunks } = modRequire("./narrative-queue");
+    // v0.4.35: Use dynamic import (was modRequire("./narrative-queue")). KASOU
+    // OpenClaw runs src/index.ts directly; createRequire bypasses tsx's .ts hook,
+    // producing MODULE_NOT_FOUND. Dynamic import works in both dist/ and tsx.
+    // Explicit .js extension ensures TS compiler preserves the path verbatim
+    // (tsconfig has module: CommonJS) and Node.js resolves correctly.
+    const { splitIntoChunks, enqueueNarrativeChunks } = await import("./narrative-queue.js");
     const chunks = splitIntoChunks(rawText, agentWs, agentId, "cold-start", "cold-start-import", 0);
     try {
       await enqueueNarrativeChunks(client, chunks, onWake);
