@@ -5,6 +5,9 @@
 ### Added
 - **`episode.simulateMarkUnusedAsForgotten` JSON-RPC**: read-only dry-run probe for Phase 4 observability and manual pre-flight checks. Accepts `{retentionDays, limit}` (defaults 365 / 500, both upper-clamped to 5 years / 5000). Returns `{count, retentionDays, limit, elapsedMs}`. Per-candidate "would forgotten" detail is emitted to the episodic-claw log file by the Go sidecar (id, ageDays, source basename). Never mutates any record. Bounded by 30s Go-side context and 35s TS-side per-RPC timeout.
 
+### Verified on KASOU
+- **Phase 4 dry-run probe executed at 2026-06-04 19:11 JST** with `retentionDays=30, limit=500` against the live Go sidecar via `/tmp/episodic-claw-socket.addr`. Result: **18 candidates, elapsedMs=82, clientElapsedMs=109**. The candidate list contains long-lived reference notes (ageDays 51-65) — `agent-*.md`, `openclaw-*.md`, `session-*.md`, `model-*.md`, `plugin-*.md`, `episode-*.md`, plus one-off `pneuma-sync-status-check.md` and `memory-recall-and-indexing.md`. **No `notes/` or `manual-save` candidates** (exclusion guard working). Probe used a one-off Node.js script (`/tmp/episodic-dryrun-probe.mjs` on KASOU) that connects to the existing sidecar via shared socket-address file without spawning a duplicate. Result indicates the existing `forgettingEpisodic` config + env-var-gated kill switch + new RPC form a working Phase 4 dry-run path.
+
 ### Hardening
 - **Upper-bound clamps** on `retentionDays` (5 years max) and `limit` (5000 max) to prevent unbounded Pebble prefix scans or large candidate slices under repeated probe calls.
 - **Empty-store handling**: returns `{count: 0, ...}` with a single log line instead of erroring. Allows pre-init probes (e.g. dashboard, CLI) before any episode is loaded.

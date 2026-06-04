@@ -1622,3 +1622,24 @@ Phase 3.2 完了後、Phase 5 で:
 - scheduler の `sweepInProgress` フラグ: state.db 内の `meta:tombstone_sweep_in_progress:1` を acquire/release (Phase 3.2)
 - KASOU dry-run: `EPISODIC_DISABLE_SNAPSHOT_WORKER=1` で disable した状態で `SimulateMarkUnusedAsTombstone` を 1〜2 週間 soak (Phase 4)
 - 出力先の `EPISODIC_SNAPSHOT_OUTPUT_DIR` 環境変数オーバーライド (Phase 5 配線時)
+
+## 24. Phase 4 結果 (2026-06-04 dry-run probe)
+
+### 24.1 実行方法
+
+v0.4.34a-pre.release.2 で追加した `episode.simulateMarkUnusedAsForgotten` RPC を KASOU で 1 回叩いた。`EpisodicCoreClient` を経由すると新規 Go sidecar を spawn してしまうため、共有 socket-address ファイル `/tmp/episodic-claw-socket.addr` を直接読んで既存 sidecar に接続するワンショット Node.js スクリプト `/tmp/episodic-dryrun-probe.mjs` を KASOU 上に配置して実行。プロトコルは newline-delimited JSON-RPC 2.0。`src/rpc-client.ts:343` の `readline` 実装と一致。
+
+`forgettingEpisodic.enabled=true`, `retentionDays=30`, `physicalDeleteTtlDays=14` という KASOU の現 config そのまま + env var `EPISODIC_DISABLE_SNAPSHOT_WORKER=1` (scheduler 停止維持) で実行。
+
+### 24.2 結果
+
+RPC レスポンス: `count=18, retentionDays=30, limit=500, elapsedMs=82`, クライアント全体 109ms。Go 内部ログに 18 行の `dry-run: would forgotten id=... ageDays=... source=...` 構造化ログ。候補は ageDays 51〜65 に分布。`notes/` 配下ゼロ、`manual-save` ゼロ。`agent-*.md` `openclaw-*.md` `session-*.md` `model-*.md` `plugin-*.md` `episode-*.md` `pneuma-sync-status-check.md` `memory-recall-and-indexing.md` の 18 件。Episodic-Claw が長期保持していた reference 系ナレッジ。
+
+### 24.3 解釈
+
+KASOU 運用データ (~1年) では 365 日閾値だと候補ゼロ近辺、30 日閾値だと 18 件出る。`enabled=true` のままだと次の日曜 03:00 に weekly sweep 候補になることは確認済み。実 Phase 5 起動前に「30 日だと reference 系が消える」「60 日 / 90 日に伸ばしたい」等の判断が要る。あるいは `enabled=false` に戻して design 凍結することもできる。
+
+### 24.4 Phase 5 起動の判断ポイント
+
+- 「reference 系 18 件は消していい」と判断 → `retentionDays` を 30-90 で確定 → `enabled=true` 維持 + env var `=0` → 次の日曜 03:00 に Phase 5 sweep。
+- 「reference 系は守りたい」 → `forgettingEpisodic.retentionDays` を 180 まで伸ばす or `physicalDeleteTtlDays=30` で絞る or ep-save で `notes/` 待避後に再 dry-run。
