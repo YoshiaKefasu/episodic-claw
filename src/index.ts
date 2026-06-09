@@ -521,16 +521,10 @@ const PluginConfigSchema = Type.Object(
       description: "Phase 3: Force segment boundary when user message gap exceeds this (minutes). Default: 15."
     })),
     recallSemanticFloor: Type.Optional(Type.Number({
-      description: "Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay."
+      description: "Recall calibration: semantic relevance below this floor should not be overruled by usefulness."
     })),
     recallUsefulnessClamp: Type.Optional(Type.Number({
       description: "Recall calibration: cap usefulness posterior contribution so it stays a correction term."
-    })),
-    recallReplayTieBreakMaxBoost: Type.Optional(Type.Number({
-      description: "Recall calibration: maximum replay-state tie-break boost."
-    })),
-    recallReplayLowRetrievabilityBonus: Type.Optional(Type.Number({
-      description: "Recall calibration: tiny extra boost when a replay candidate is clearly getting stale."
     })),
     recallTopicsMatchBoost: Type.Optional(Type.Number({
       description: "Recall calibration: bonus per matched topic."

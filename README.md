@@ -228,7 +228,7 @@ This project isn't pretending to be neuroscience, but it's not random architectu
     - **Contextual prediction errors reorganize episodic memories** ([PMC8196002](https://pmc.ncbi.nlm.nih.gov/articles/PMC8196002/))
     - **Schemas provide a scaffold for neocortical integration** ([PMC9527246](https://pmc.ncbi.nlm.nih.gov/articles/PMC9527246/))
 
-4. Replay and retention
+4. Replay and retention (scheduler removed in v0.4.35; scientific basis retained for reference)
     - **Hippocampal replay prioritizes weakly learned information** ([PMC6156217](https://pmc.ncbi.nlm.nih.gov/articles/PMC6156217/))
 
 5. Retrieval calibration and Bayesian reranking

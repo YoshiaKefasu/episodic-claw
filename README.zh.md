@@ -182,7 +182,7 @@ openclaw plugins install clawhub:episodic-claw
     - **Contextual prediction errors reorganize episodic memories** ([PMC8196002](https://pmc.ncbi.nlm.nih.gov/articles/PMC8196002/))
     - **Schemas provide a scaffold for neocortical integration** ([PMC9527246](https://pmc.ncbi.nlm.nih.gov/articles/PMC9527246/))
 
-4. Replay 与记忆定着
+4. Replay 与记忆定着（调度器已在 v0.4.35 中移除；科学依据保留供参考）
     - **Hippocampal replay prioritizes weakly learned information** ([PMC6156217](https://pmc.ncbi.nlm.nih.gov/articles/PMC6156217/))
 
 5. Recall 重排与不确定性控制

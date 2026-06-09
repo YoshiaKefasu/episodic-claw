@@ -51,7 +51,6 @@ type d1ConsolidationNode struct {
 type d1ConsolidationCluster struct {
 	Nodes           []d1ConsolidationNode
 	Fingerprint     string
-	ReplayPriority  float64
 	EstimatedTokens int
 	StartTime       time.Time
 	EndTime         time.Time
@@ -214,8 +213,6 @@ func buildD1Clusters(d0Nodes []EpisodeRecord, now time.Time, cfg d1ClusterConfig
 	if shouldFallbackToLegacy(clusters, len(nodes), cfg) {
 		return legacyChunkClusters(active, cfg), nil
 	}
-	assignReplayPriority(clusters, now, cfg)
-	sortClustersByPriority(clusters)
 	return clusters, nil
 }
 
@@ -444,8 +441,6 @@ func legacyChunkClusters(records []EpisodeRecord, cfg d1ClusterConfig) []d1Conso
 	for _, chunk := range chunks {
 		clusters = append(clusters, newD1Cluster(chunk, true))
 	}
-	assignReplayPriority(clusters, time.Now(), cfg)
-	sortClustersByPriority(clusters)
 	return clusters
 }
 
@@ -502,7 +497,6 @@ func newD1Cluster(nodes []d1ConsolidationNode, usedFallback bool) d1Consolidatio
 	return d1ConsolidationCluster{
 		Nodes:           nodes,
 		Fingerprint:     clusterFingerprint(childIDs),
-		ReplayPriority:  priority,
 		EstimatedTokens: totalTokens,
 		StartTime:       start,
 		EndTime:         end,
@@ -516,40 +510,6 @@ func clusterFingerprint(childIDs []string) string {
 	}
 	hash := sha1.Sum([]byte(strings.Join(childIDs, "\x1f")))
 	return "d1-" + hex.EncodeToString(hash[:8])
-}
-
-func assignReplayPriority(clusters []d1ConsolidationCluster, now time.Time, cfg d1ClusterConfig) {
-	for idx := range clusters {
-		var salience float64
-		var weakness float64
-		for _, node := range clusters[idx].Nodes {
-			salience += node.SalienceScore
-			weakness += node.WeaknessScore
-		}
-		meanSalience := salience / float64(len(clusters[idx].Nodes))
-		meanWeakness := weakness / float64(len(clusters[idx].Nodes))
-		recency := 1.0
-		if cfg.MaxWindow > 0 {
-			age := now.Sub(clusters[idx].EndTime)
-			recency = clamp01(1.0 - age.Seconds()/cfg.MaxWindow.Seconds())
-		}
-		clusters[idx].ReplayPriority = 0.55*meanSalience + 0.25*meanWeakness + 0.20*recency
-		if len(clusters[idx].Nodes) == 1 && meanSalience >= cfg.HighSalienceCut {
-			clusters[idx].ReplayPriority += 0.15
-		}
-		if clusters[idx].UsedFallback {
-			clusters[idx].ReplayPriority -= 0.05
-		}
-	}
-}
-
-func sortClustersByPriority(clusters []d1ConsolidationCluster) {
-	sort.SliceStable(clusters, func(i, j int) bool {
-		if clusters[i].ReplayPriority == clusters[j].ReplayPriority {
-			return clusters[i].StartTime.Before(clusters[j].StartTime)
-		}
-		return clusters[i].ReplayPriority > clusters[j].ReplayPriority
-	})
 }
 
 func shouldFallbackToLegacy(clusters []d1ConsolidationCluster, totalNodes int, cfg d1ClusterConfig) bool {

@@ -77,8 +77,6 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "segmentationTimeGapMinutes",
     "recallSemanticFloor",
     "recallUsefulnessClamp",
-    "recallReplayTieBreakMaxBoost",
-    "recallReplayLowRetrievabilityBonus",
     "recallTopicsMatchBoost",
     "recallTopicsMismatchPenalty",
     "recallTopicsMissingPenalty",
@@ -139,8 +137,6 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "segmentationTimeGapMinutes",
     "recallSemanticFloor",
     "recallUsefulnessClamp",
-    "recallReplayTieBreakMaxBoost",
-    "recallReplayLowRetrievabilityBonus",
     "recallTopicsMatchBoost",
     "recallTopicsMismatchPenalty",
     "recallTopicsMissingPenalty",
@@ -247,8 +243,6 @@ test("loadConfig({}) returns correct defaults for all fields", () => {
   assert.equal(cfg.segmentationTimeGapMinutes, 15);
   assert.equal(cfg.recallSemanticFloor, 0.35);
   assert.equal(cfg.recallUsefulnessClamp, 1.0);
-  assert.equal(cfg.recallReplayTieBreakMaxBoost, 0.04);
-  assert.equal(cfg.recallReplayLowRetrievabilityBonus, 0.01);
   assert.equal(cfg.recallTopicsMatchBoost, 0.05);
   assert.equal(cfg.recallTopicsMismatchPenalty, 0.10);
   assert.equal(cfg.recallTopicsMissingPenalty, 0.0);

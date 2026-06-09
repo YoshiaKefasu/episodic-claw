@@ -230,7 +230,7 @@ AIが自主的に使うこともあれば、あなたが指示して使わせる
     - **Contextual prediction errors reorganize naturalistic episodic memories in time** ([PMC8196002](https://pmc.ncbi.nlm.nih.gov/articles/PMC8196002/))
     - **Schemas provide a scaffold for neocortical integration of new memories over time** ([PMC9527246](https://pmc.ncbi.nlm.nih.gov/articles/PMC9527246/))
 
-4. Replay と定着
+4. Replay と定着（スケジューラーは v0.4.35 で廃止。科学的根拠は参考として残置）
     - **Human hippocampal replay during rest prioritizes weakly learned information** ([PMC6156217](https://pmc.ncbi.nlm.nih.gov/articles/PMC6156217/))
 
 5. Recall rerank と不確実性の扱い

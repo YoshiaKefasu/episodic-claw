@@ -47,7 +47,7 @@ func CalculateImportanceStage1(rec *EpisodeRecord) {
 	rawImportance += 2.0 * rec.Surprise
 
 	// 未レビュー(views==0)の場合、未経験ボーナスとして0.5追加し、初期のPruneを防止
-	if rec.Retrievals == 0 && rec.ReplayReviewedCount == 0 {
+	if rec.Retrievals == 0 {
 		rawImportance += 0.5
 	}
 
@@ -80,7 +80,7 @@ func CalculateScoreStage2(rec *EpisodeRecord, params ScoreUpdateParams) {
 	rawImportance += 0.5 * params.TopicsPersistence
 	rawImportance -= 1.0 * params.RedundancyWithD1
 
-	if rec.Retrievals == 0 && rec.ReplayReviewedCount == 0 {
+	if rec.Retrievals == 0 {
 		rawImportance += 0.5
 	}
 

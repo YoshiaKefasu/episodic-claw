@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,12 +51,7 @@ type EpisodeRecord struct {
 	LastRecalledAt       time.Time          `json:"last_recalled_at,omitempty" msgpack:"last_recalled_at,omitempty"`
 	LastExpandedAt       time.Time          `json:"last_expanded_at,omitempty" msgpack:"last_expanded_at,omitempty"`
 	LastInjectedAt       time.Time          `json:"last_injected_at,omitempty" msgpack:"last_injected_at,omitempty"`
-	ReplaySelectedCount  int                `json:"replay_selected_count,omitempty" msgpack:"replay_selected_count,omitempty"`
-	ReplayReviewedCount  int                `json:"replay_reviewed_count,omitempty" msgpack:"replay_reviewed_count,omitempty"`
-	ReplayNoReviewCount  int                `json:"replay_no_review_count,omitempty" msgpack:"replay_no_review_count,omitempty"`
-	BudgetSkipCount      int                `json:"budget_skip_count,omitempty" msgpack:"budget_skip_count,omitempty"`
-	LastReplayAt         time.Time          `json:"last_replay_at,omitempty" msgpack:"last_replay_at,omitempty"`
-	LastReplaySkipReason string             `json:"last_replay_skip_reason,omitempty" msgpack:"last_replay_skip_reason,omitempty"`
+	BudgetSkipCount int `json:"budget_skip_count,omitempty" msgpack:"budget_skip_count,omitempty"`
 	DueLagSecondsLast    int64              `json:"due_lag_seconds_last,omitempty" msgpack:"due_lag_seconds_last,omitempty"`
 	DueLagSecondsMax     int64              `json:"due_lag_seconds_max,omitempty" msgpack:"due_lag_seconds_max,omitempty"`
 	LastDueAt            time.Time          `json:"last_due_at,omitempty" msgpack:"last_due_at,omitempty"`
@@ -78,11 +71,9 @@ type EpisodeRecord struct {
 // RecallCalibration tunes the recall rerank without changing the core retrieval path.
 // Nil fields fall back to the built-in defaults so old callers keep working.
 type RecallCalibration struct {
-	SemanticFloor                *float32 `json:"semanticFloor,omitempty"`
-	UsefulnessClamp              *float32 `json:"usefulnessClamp,omitempty"`
-	ReplayTieBreakMaxBoost       *float32 `json:"replayTieBreakMaxBoost,omitempty"`
-	ReplayLowRetrievabilityBonus *float32 `json:"replayLowRetrievabilityBonus,omitempty"`
-	TopicsMatchBoost             *float32 `json:"topicsMatchBoost,omitempty"`
+	SemanticFloor         *float32 `json:"semanticFloor,omitempty"`
+	UsefulnessClamp       *float32 `json:"usefulnessClamp,omitempty"`
+	TopicsMatchBoost      *float32 `json:"topicsMatchBoost,omitempty"`
 	TopicsMismatchPenalty        *float32 `json:"topicsMismatchPenalty,omitempty"`
 	TopicsMissingPenalty         *float32 `json:"topicsMissingPenalty,omitempty"`
 	LexicalTopK                  *int     `json:"lexicalTopK,omitempty"`
@@ -100,7 +91,6 @@ type ScoredEpisode struct {
 	SurpriseScore       float32       `json:"surpriseScore,omitempty"`
 	UsefulnessScore     float32       `json:"usefulnessScore,omitempty"`
 	ExplorationScore    float32       `json:"explorationScore,omitempty"`
-	ReplayTieBreakScore float32       `json:"replayTieBreakScore,omitempty"`
 	TopicsMode          string        `json:"topicsMode,omitempty"`
 	TopicsState         string        `json:"topicsState,omitempty"`
 	TopicsMatchCount    int           `json:"topicsMatchCount,omitempty"`
@@ -849,8 +839,6 @@ func (s *Store) deleteLocked(id string) error {
 
 	batch.Delete(epKey, nil)
 	batch.Delete(s2iKey, nil)
-	batch.Delete(replayStateKey(id), nil)
-	batch.Delete(replayLeaseKey(id), nil)
 
 	// Clean up reverse path index
 	if oldRec != nil && oldRec.SourcePath != "" {
@@ -977,26 +965,6 @@ func (s *Store) RecordInjected(id string, at time.Time) error {
 	return s.UpdateRecord(id, func(rec *EpisodeRecord) error {
 		rec.InjectedCount++
 		rec.LastInjectedAt = at
-		return nil
-	})
-}
-
-// RecordReplaySelection marks that an episode was selected for replay scheduling.
-func (s *Store) RecordReplaySelection(id string, at time.Time, dueLagSeconds int64) error {
-	if strings.TrimSpace(id) == "" {
-		return nil
-	}
-	if at.IsZero() {
-		at = time.Now()
-	}
-	return s.UpdateRecord(id, func(rec *EpisodeRecord) error {
-		rec.ReplaySelectedCount++
-		rec.LastReplayAt = at
-		rec.LastDueAt = at
-		rec.DueLagSecondsLast = dueLagSeconds
-		if dueLagSeconds > rec.DueLagSecondsMax {
-			rec.DueLagSecondsMax = dueLagSeconds
-		}
 		return nil
 	})
 }
@@ -1141,8 +1109,6 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 
 	semanticFloor := float32(0.35)
 	usefulnessClamp := float32(1.0)
-	replayTieBreakMaxBoost := float32(0.04)
-	replayLowRetrievabilityBonus := float32(0.01)
 	topicsMatchBoost := float32(0.05)
 	topicsMismatchPenalty := float32(0.10)
 	topicsMissingPenalty := float32(0.0)
@@ -1153,8 +1119,6 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 	if calibration != nil {
 		semanticFloor = float32OrDefault(calibration.SemanticFloor, semanticFloor)
 		usefulnessClamp = float32OrDefault(calibration.UsefulnessClamp, usefulnessClamp)
-		replayTieBreakMaxBoost = float32OrDefault(calibration.ReplayTieBreakMaxBoost, replayTieBreakMaxBoost)
-		replayLowRetrievabilityBonus = float32OrDefault(calibration.ReplayLowRetrievabilityBonus, replayLowRetrievabilityBonus)
 		topicsMatchBoost = float32OrDefault(calibration.TopicsMatchBoost, topicsMatchBoost)
 		topicsMismatchPenalty = float32OrDefault(calibration.TopicsMismatchPenalty, topicsMismatchPenalty)
 		topicsMissingPenalty = float32OrDefault(calibration.TopicsMissingPenalty, topicsMissingPenalty)
@@ -1162,12 +1126,6 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 	}
 	if usefulnessClamp <= 0 {
 		usefulnessClamp = 1.0
-	}
-	if replayTieBreakMaxBoost < 0 {
-		replayTieBreakMaxBoost = 0.04
-	}
-	if replayLowRetrievabilityBonus < 0 {
-		replayLowRetrievabilityBonus = 0.01
 	}
 	if topicsMatchBoost < 0 {
 		topicsMatchBoost = 0.05
@@ -1352,28 +1310,6 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 			(defaultRecallWeights.usefulness * usefulnessScore) +
 			(defaultRecallWeights.exploration * explorationScore)
 
-		// Phase 3.1 replay-state tie-breaker:
-		// Keep it tiny and only apply when semantic relevance is already high, so replay cannot hijack recall.
-		replayTieBreakScore := float32(0)
-		if semanticScore >= semanticFloor {
-			cls := classifyReplayRecord(*rec)
-			if cls != replayClassD0 {
-				if st, ok, stErr := s.GetReplayState(rec.ID); stErr == nil && ok && !st.DueAt.IsZero() && now.After(st.DueAt) {
-					overdueHours := now.Sub(st.DueAt).Hours()
-					// 0..24h overdue => partial boost, clamp hard so it stays a tie-breaker.
-					dueBoost := float32(math.Min(float64(replayTieBreakMaxBoost), (overdueHours/24.0)*(float64(replayTieBreakMaxBoost)/2)))
-					if st.Retrievability < 0.60 {
-						dueBoost += replayLowRetrievabilityBonus
-					}
-					if dueBoost > replayTieBreakMaxBoost {
-						dueBoost = replayTieBreakMaxBoost
-					}
-					replayTieBreakScore = dueBoost
-					finalScore *= 1.0 + dueBoost
-				}
-			}
-		}
-
 		topicsMode := "none"
 		topicsState := "none"
 		topicsMatchCount := 0
@@ -1421,7 +1357,6 @@ func (s *Store) baseRecall(queryString string, queryVector []float32, topK int, 
 			SurpriseScore:       surpriseScore,
 			UsefulnessScore:     usefulnessScore,
 			ExplorationScore:    explorationScore,
-			ReplayTieBreakScore: replayTieBreakScore,
 			TopicsMode:          topicsMode,
 			TopicsState:         topicsState,
 			TopicsMatchCount:    topicsMatchCount,

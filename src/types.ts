@@ -112,14 +112,10 @@ export interface EpisodicPluginConfig {
   segmentationFallbackThreshold?: number;
   /** Phase 3: ユーザーメッセージ間の時間ギャップがこれを超えると強制境界（分、デフォルト 15） */
   segmentationTimeGapMinutes?: number;
-  /** Recall calibration: semantic relevance below this floor should not be overruled by usefulness/replay. */
+  /** Recall calibration: semantic relevance below this floor should not be overruled by usefulness. */
   recallSemanticFloor?: number;
   /** Recall calibration: cap usefulness posterior contribution so it stays a correction term. */
   recallUsefulnessClamp?: number;
-  /** Recall calibration: maximum replay-state tie-break boost. */
-  recallReplayTieBreakMaxBoost?: number;
-  /** Recall calibration: tiny extra boost when a replay candidate is clearly getting stale. */
-  recallReplayLowRetrievabilityBonus?: number;
   /** Recall calibration: bonus per matched topic. */
   recallTopicsMatchBoost?: number;
   /** Recall calibration: penalty when topics exist but none match. */
@@ -196,8 +192,6 @@ export interface EpisodicPluginConfig {
 export interface RecallCalibration {
   semanticFloor?: number;
   usefulnessClamp?: number;
-  replayTieBreakMaxBoost?: number;
-  replayLowRetrievabilityBonus?: number;
   topicsMatchBoost?: number;
   topicsMismatchPenalty?: number;
   topicsMissingPenalty?: number;
@@ -209,7 +203,6 @@ export interface RecallScoreBreakdown {
   surpriseScore?: number;
   usefulnessScore?: number;
   explorationScore?: number;
-  replayTieBreakScore?: number;
   topicsMode?: "none" | "strict" | "soft";
   topicsState?: "none" | "matched" | "mismatch" | "missing";
   topicsMatchCount?: number;

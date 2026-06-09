@@ -144,8 +144,6 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
     segmentationTimeGapMinutes: rawConfig?.segmentationTimeGapMinutes ?? 15,
     recallSemanticFloor: rawConfig?.recallSemanticFloor ?? 0.35,
     recallUsefulnessClamp: rawConfig?.recallUsefulnessClamp ?? 1.0,
-    recallReplayTieBreakMaxBoost: rawConfig?.recallReplayTieBreakMaxBoost ?? 0.04,
-    recallReplayLowRetrievabilityBonus: rawConfig?.recallReplayLowRetrievabilityBonus ?? 0.01,
     recallTopicsMatchBoost: rawConfig?.recallTopicsMatchBoost ?? 0.05,
     recallTopicsMismatchPenalty: rawConfig?.recallTopicsMismatchPenalty ?? 0.10,
     recallTopicsMissingPenalty: rawConfig?.recallTopicsMissingPenalty ?? 0.0,
@@ -287,8 +285,6 @@ export function buildRecallCalibration(config: EpisodicPluginConfig): RecallCali
   return {
     semanticFloor: config.recallSemanticFloor,
     usefulnessClamp: config.recallUsefulnessClamp,
-    replayTieBreakMaxBoost: config.recallReplayTieBreakMaxBoost,
-    replayLowRetrievabilityBonus: config.recallReplayLowRetrievabilityBonus,
     topicsMatchBoost: config.recallTopicsMatchBoost,
     topicsMismatchPenalty: config.recallTopicsMismatchPenalty,
     topicsMissingPenalty: config.recallTopicsMissingPenalty,

@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.4.35-pre.release] - 2026-06-09
+
+### Removed
+- **Replay Scheduler completely removed**: the entire replay subsystem (~2,700 lines of Go code) has been deleted. This includes:
+  - `go/internal/vector/replay.go` — replay state machine, candidate selection, observation processing, DueAt scheduling
+  - `go/internal/vector/replay_state_test.go` — all replay tests
+  - `startReplayTimer()` / `checkReplayThreshold()` / `handleReplay()` RPC handler in `go/main.go`
+  - `RecordReplaySelection()` function in `go/internal/vector/store.go`
+  - `sortClustersByPriority()` in `go/internal/vector/d1_clustering.go` (only caller was replay)
+  - Replay observation application in `go/internal/vector/consolidation.go` `handleExpand`
+  - `ReplayReviewedCount`, `ReplayLastReviewedAt`, `ReplayNextCandidateAt`, `ReplaySourcePath` fields from `EpisodeRecord`
+  - `replayTieBreakMaxBoost`, `replayLowRetrievabilityBonus` from `RecallCalibration`
+  - `ReplayTieBreakScore` from `ScoredEpisode`
+  - `recallReplayTieBreakMaxBoost`, `recallReplayLowRetrievabilityBonus` from TS config, types, schema, and tests
+  - "replay scheduling" from `enableBackgroundWorkers` description
+
+### Rationale
+The replay scheduler consumed Gemini API quota on every gateway restart (replaying all past episodes) with no mechanism to skip already-reviewed content. With the forgetting pipeline (Phase 3.2 snapshot worker) now handling unused-episode lifecycle, the replay scheduler became redundant. HealingWorker (embedding generation) and Snapshot worker are preserved.
+
+### Preserved
+- HealingWorker (Pass 1-4 embedding lifecycle) — untouched
+- Snapshot worker (weekly unused-episode review) — untouched
+- `vector.db` orphaned `replay:*` keys — harmless in PebbleDB, no cleanup needed
+
+### Verified
+- Go build: clean (`go build ./...`)
+- Go test: all suites pass (episodic-core, internal/ai, internal/queryparser, internal/state, internal/vector)
+- TS build: clean (`tsc --noEmit`)
+- TS test: all 13 suites pass (200+ tests), 0 failures
+- code-reviewer: Approve with zero blockers
+- grep for `replay`/`Replay` in source: 0 matches (docs/plans excluded)
+
 ## [0.4.34-pre.release.hf3] - 2026-06-04
 
 ### Fixed (Bug A, B, C 退治)

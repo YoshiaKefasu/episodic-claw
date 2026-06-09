@@ -38,8 +38,7 @@ func TestPhase3ScoringGates(t *testing.T) {
 				Tags:     tt.tags,
 				Surprise: tt.surprise,
 				// Assume 0 views/retrievals (newly added)
-				Retrievals:          0,
-				ReplayReviewedCount: 0,
+				Retrievals: 0,
 			}
 			CalculateImportanceStage1(&rec)
 			if rec.ImportanceScore < tt.wantMin {

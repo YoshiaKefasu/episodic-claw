@@ -91,7 +91,6 @@ func processCluster(
 		for _, rec := range selectedRecords {
 			childIDs = append(childIDs, rec.ID)
 		}
-		_ = vstore.PromoteReplayStateToParent(childIDs, existingID, time.Now())
 		return linkClusterChildren(selectedRecords, existingID, vstore)
 	}
 
@@ -233,7 +232,6 @@ Return ONLY the title text, nothing else.
 	}); err != nil {
 		return fmt.Errorf("failed to add D1 to vector store: %w", err)
 	}
-	_ = vstore.PromoteReplayStateToParent(childrenIDs, d1Slug, now)
 	existingKeys[cluster.Fingerprint] = d1Slug
 
 	logger.Info(logger.CatConsolidation, "Generated D1: %s\n", d1Slug)

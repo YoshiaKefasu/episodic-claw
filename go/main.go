@@ -42,7 +42,6 @@ var (
 	stage2TwoPhase         *bool // [v0.4.26g] enable 2-phase lock optimization for Stage2 scoring
 
 	storeMutex    sync.Mutex
-	isReplaying   int32
 	writeMu       sync.Mutex // Atomize writes to net.Conn
 	vectorStores  = make(map[string]*vector.Store)
 	cacheQueues   = make(map[string]*cache.Queue) // agentWs -> cache queue
@@ -3018,48 +3017,6 @@ func startWatchdog() {
 	}()
 }
 
-func startReplayTimer(apiKey string) {
-	ticker := time.NewTicker(15 * time.Minute)
-	go func() {
-		for range ticker.C {
-			storeMutex.Lock()
-			snapshot := make(map[string]*vector.Store)
-			for k, v := range vectorStores {
-				snapshot[k] = v
-			}
-			storeMutex.Unlock()
-
-			for agentWs, vstore := range snapshot {
-				checkReplayThreshold(agentWs, vstore, apiKey)
-			}
-		}
-	}()
-}
-
-func checkReplayThreshold(agentWs string, vstore *vector.Store, apiKey string) {
-	if apiKey == "" {
-		return
-	}
-
-	if !atomic.CompareAndSwapInt32(&isReplaying, 0, 1) {
-		EmitLog("Skipping Replay Timer for %s, replay already in progress", agentWs)
-		return
-	}
-
-	go func(ws string, vs *vector.Store) {
-		defer atomic.StoreInt32(&isReplaying, 0)
-
-		replayCtx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-		defer cancel()
-
-		if err := vector.RunReplayScheduler(replayCtx, ws, apiKey, vs, gemmaLimiter); err != nil {
-			EmitLog("Replay scheduler error for %s: %v", ws, err)
-			return
-		}
-		_ = vs.SetMeta("last_replay", []byte(fmt.Sprintf("%d", time.Now().Unix())))
-	}(agentWs, vstore)
-}
-
 func handleConsolidate(conn net.Conn, req RPCRequest) {
 	EmitLog("[Consolidation] D1 consolidation is disabled in v0.4.1+. " +
 		"Narrative mode replaces D1 pipeline. No action taken.")
@@ -3068,47 +3025,6 @@ func handleConsolidate(conn net.Conn, req RPCRequest) {
 		Result:  "Consolidation disabled (v0.4.1+): narrative mode replaces D1 pipeline",
 		ID:      req.ID,
 	})
-}
-
-func handleReplay(conn net.Conn, req RPCRequest) {
-	var params struct {
-		AgentWs string `json:"agentWs"`
-		APIKey  string `json:"apiKey"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
-		return
-	}
-
-	apiKey := params.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("GEMINI_API_KEY")
-	}
-
-	vstore, err := getStore(params.AgentWs)
-	if err != nil {
-		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32000, Message: "Store init failed"}, ID: req.ID})
-		return
-	}
-
-	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "Replay Scheduler Started", ID: req.ID})
-
-	go func() {
-		if !atomic.CompareAndSwapInt32(&isReplaying, 0, 1) {
-			EmitLog("Replay skipped: already running")
-			return
-		}
-		defer atomic.StoreInt32(&isReplaying, 0)
-
-		replayCtx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-		defer cancel()
-
-		if err := vector.RunReplayScheduler(replayCtx, params.AgentWs, apiKey, vstore, gemmaLimiter); err != nil {
-			EmitLog("Replay scheduler error (manual): %v", err)
-			return
-		}
-		_ = vstore.SetMeta("last_replay", []byte(fmt.Sprintf("%d", time.Now().Unix())))
-	}()
 }
 
 func handleExpand(conn net.Conn, req RPCRequest) {
@@ -3156,19 +3072,6 @@ func handleExpand(conn net.Conn, req RPCRequest) {
 
 	now := time.Now()
 	_ = vstore.RecordHit(params.Slug, now)
-
-	obsID := fmt.Sprintf("expand:%s:%d", params.Slug, now.UnixNano())
-	if req.ID != nil {
-		obsID = fmt.Sprintf("expand:%s:%d", params.Slug, *req.ID)
-	}
-	_ = vstore.ApplyReplayObservation(vector.ReplayObservation{
-		ObservationID: obsID,
-		WorkspaceID:   params.AgentWs,
-		EpisodeID:     params.Slug,
-		Outcome:       "ExpandedGood",
-		OccurredAt:    now,
-		Source:        "ep-expand",
-	})
 
 	sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: result, ID: req.ID})
 }
@@ -3301,9 +3204,7 @@ func main() {
 		startWatchdog()
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
 	// [v0.4.26c] SleepTimer removed — D1 consolidation deprecated in v0.4.1+, idle monitoring unused
-	startReplayTimer(apiKey)
 	go queryparser.WarmUpKagomeTokenizer()
 
 	EmitLog("Starting Go Sidecar on socket %s", *socketPath)
@@ -3421,8 +3322,6 @@ func handleConnection(conn net.Conn) {
 			go handleRollbackLegacyNestedEpisodeTree(conn, req)
 		case "ai.consolidate":
 			go handleConsolidate(conn, req)
-		case "ai.replay":
-			go handleReplay(conn, req)
 		case "ai.expand":
 			go handleExpand(conn, req)
 		case "ai.rebuildLexical":
