@@ -8,8 +8,10 @@ import { EpisodicCoreClient } from "./rpc-client";
 import { estimateTokens } from "./utils";
 import type { Message } from "./segmenter";
 import { extractText } from "./segmenter";
+import type { BoundaryMetadata } from "./types";
 
-const SOFT_TOKEN_TARGET = 48_000;
+// [v0.5.0 Phase 1.5] Exported for near-64K trigger in segmenter.ts
+export const SOFT_TOKEN_TARGET = 48_000;
 // [v0.4.22b] Exported for 64K boundary unification in segmenter.ts
 export const HARD_TOKEN_CAP = 64_000;
 
@@ -31,6 +33,12 @@ export interface CacheQueueItem {
   leaseOwner?: string;
   leaseUntil?: string;
   lastError?: string;
+  // [v0.5.0 Phase 2] Boundary metadata — optional, omitempty for backward compat
+  boundaryNote?: string;
+  boundaryBy?: string;
+  boundaryReason?: string;
+  boundaryTitleHint?: string;
+  boundaryCreatedAt?: string;
 }
 
 let _chunkCounter = 0;
@@ -55,6 +63,7 @@ export function detectRoleLine(line: string): "user" | "assistant" | null {
  * Tries to split at role boundaries or natural break points.
  * [v0.4.19b] Option A: When messages[] is provided, uses structured role data
  * for accurate boundary detection. Falls back to detectRoleLine() when not available.
+ * [v0.5.0 Phase 2] boundaryMeta: optional boundary metadata propagated to each chunk.
  */
 export function splitIntoChunks(
   rawText: string,
@@ -64,6 +73,7 @@ export function splitIntoChunks(
   reason: CacheQueueItem["reason"],
   surprise: number,
   messages?: Message[],  // [v0.4.19b] Option A: structured conversation-boundary-aware chunking
+  boundaryMeta?: BoundaryMetadata, // [v0.5.0 Phase 2] boundary metadata from ep-boundary tool
 ): CacheQueueItem[] {
   const parentIngestId = `ingest-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const totalTokens = estimateTokens(rawText);
@@ -89,6 +99,14 @@ export function splitIntoChunks(
         attempts: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        // [v0.5.0 Phase 2] Propagate boundary metadata
+        ...(boundaryMeta ? {
+          boundaryNote: boundaryMeta.boundaryNote,
+          boundaryBy: boundaryMeta.boundaryBy,
+          boundaryReason: boundaryMeta.boundaryReason,
+          boundaryTitleHint: boundaryMeta.boundaryTitleHint,
+          boundaryCreatedAt: boundaryMeta.boundaryCreatedAt,
+        } : {}),
       },
     ];
   }
@@ -142,6 +160,14 @@ export function splitIntoChunks(
       attempts: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      // [v0.5.0 Phase 2] Propagate boundary metadata to each chunk
+      ...(boundaryMeta ? {
+        boundaryNote: boundaryMeta.boundaryNote,
+        boundaryBy: boundaryMeta.boundaryBy,
+        boundaryReason: boundaryMeta.boundaryReason,
+        boundaryTitleHint: boundaryMeta.boundaryTitleHint,
+        boundaryCreatedAt: boundaryMeta.boundaryCreatedAt,
+      } : {}),
     });
   };
 

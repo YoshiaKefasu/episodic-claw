@@ -11,7 +11,7 @@ import { createRequire } from "node:module";
 const modRequire = createRequire(__filename);
 import type { CacheQueueItem } from "./narrative-queue";
 
-import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult, ForgottenSummary } from "./types";
+import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult, ForgottenSummary, GoForceBoundaryResult, BoundaryState, BoundaryStateGetResponse, BoundaryStateSetResponse } from "./types";
 import { agentWsHash } from "./utils";
 
 // BUG-1修正: クロスクロージャ/スレッド対応 — ソケットアドレスをファイルシステム経由で共有
@@ -714,6 +714,60 @@ export class EpisodicCoreClient {
       .catch((err) => console.warn("[Episodic Memory] Failed to persist narrative save hashes:", err));
   }
 
+  // --- [v0.5.0 Phase 4] Boundary state persistence via dedicated Go RPCs ---
+
+  /**
+   * Get the persisted boundary state for a given agent+workspace.
+   * Returns the state from Go, or empty state if not found or on error.
+   * Respects the EPISODIC_DISABLE_GO_BOUNDARY_STATE kill switch.
+   */
+  async getBoundaryState(agentWs: string, agentId: string): Promise<BoundaryState> {
+    try {
+      const resp = await this.request<BoundaryStateGetResponse>(
+        "narrative.boundaryStateGet",
+        { agentWs, agentId },
+        2000, // 2s timeout — same budget as other boundary RPCs
+      );
+      if (!resp.exists || !resp.state) {
+        return {};
+      }
+      return resp.state;
+    } catch (err) {
+      // Method not found on old sidecar → degrade to empty state (pure-TS behavior)
+      const msg = err instanceof Error ? (err.message || "") : String(err);
+      if (msg.includes("Method not found")) {
+        console.debug("[episodic-claw] boundaryStateGet: old sidecar, returning empty state");
+      } else {
+        console.warn("[episodic-claw] boundaryStateGet failed, returning empty state:", msg);
+      }
+      return {};
+    }
+  }
+
+  /**
+   * Persist the boundary state for a given agent+workspace.
+   * This is called when checkpoints change or are cleared.
+   * Respects the EPISODIC_DISABLE_GO_BOUNDARY_STATE kill switch.
+   */
+  async setBoundaryState(agentWs: string, agentId: string, state: BoundaryState): Promise<boolean> {
+    try {
+      const resp = await this.request<BoundaryStateSetResponse>(
+        "narrative.boundaryStateSet",
+        { agentWs, agentId, state },
+        2000, // 2s timeout
+      );
+      return resp.persisted;
+    } catch (err) {
+      const msg = err instanceof Error ? (err.message || "") : String(err);
+      if (msg.includes("Method not found")) {
+        console.debug("[episodic-claw] boundaryStateSet: old sidecar, skipping persist");
+      } else {
+        console.warn("[episodic-claw] boundaryStateSet failed:", msg);
+      }
+      return false;
+    }
+  }
+
   async batchIngest(items: BatchIngestItem[], agentWs: string, savedBy: string = ""): Promise<string[]> {
     return this.request<string[]>("ai.batchIngest", { items, agentWs, savedBy });
   }
@@ -768,6 +822,24 @@ export class EpisodicCoreClient {
 
   async cacheGetLatestNarrative(agentWs: string, agentId: string): Promise<{ episodeId: string; body: string; found: boolean }> {
     return this.request("cache.getLatestNarrative", { agentWs, agentId });
+  }
+
+  // --- [v0.5.0 Phase 3] narrative.forceBoundary RPC ---
+
+  /**
+   * Ask Go to record a boundary intent deterministically in the state store.
+   * Go does NOT flush — it returns fallbackReason="ts-fallback" so TS can
+   * continue with its existing forceFlush path.
+   * Returns method-not-found when old Go sidecars are running.
+   */
+  async forceBoundary(params: {
+    agentWs: string;
+    agentId: string;
+    note?: string;
+    reason?: string;
+    titleHint?: string;
+  }, timeoutMs = 5000): Promise<GoForceBoundaryResult> {
+    return this.request<GoForceBoundaryResult>("narrative.forceBoundary", params, timeoutMs);
   }
 
   // --- Forgotten-episode semantic snapshot (v0.4.34 Phase 3.2) ---

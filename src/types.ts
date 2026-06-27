@@ -257,6 +257,32 @@ export interface SegmentScoreResult {
   reason: string;
 }
 
+/**
+ * [v0.5.0 Phase 1.5] A meaningful Surprise checkpoint in the current buffer.
+ * Used by near-64K prefix flush to find the last semantic cut point.
+ */
+/**
+ * [v0.5.0 Phase 3] Result from Go's narrative.forceBoundary RPC.
+ * Go records boundary intent deterministically but defers actual flush to TS.
+ */
+export interface GoForceBoundaryResult {
+  flushed: boolean;
+  enqueuedChunks: number;
+  fallbackReason: string;
+  elapsedMs: number;
+}
+
+export interface SurpriseCheckpoint {
+  /** Buffer message index (0-based) — boundary position immediately after the message that produced this score. */
+  index: number;
+  /** Raw surprise score at checkpoint time. */
+  rawSurprise: number;
+  /** Whether this was a full boundary (score.isBoundary === true) or raw-threshold only. */
+  isFullBoundary: boolean;
+  /** Timestamp when checkpoint was recorded. */
+  createdAt: string;
+}
+
 export interface Watermark {
   dateSeq: string;
   absIndex: number;
@@ -274,13 +300,33 @@ export interface BatchIngestItem {
 }
 
 // Narrative architecture (v0.4.0) — moved from narrative-worker.ts (F2)
+/**
+ * [v0.5.0 Phase 2] Boundary metadata attached to queue items.
+ * Carries editorial context from agent-driven boundaries (ep-boundary tool)
+ * without contaminating the transcript rawText.
+ */
+export interface BoundaryMetadata {
+  /** Agent editorial note, max 2000 chars. Never appended to rawText. */
+  boundaryNote?: string;
+  /** Resolved agentId that triggered the boundary. */
+  boundaryBy?: string;
+  /** Semantic reason (e.g. "task-complete", "topic-shift"). Separate from queue Reason. */
+  boundaryReason?: string;
+  /** Optional title hint for the narrative, max 120 chars. */
+  boundaryTitleHint?: string;
+  /** ISO 8601 timestamp when the boundary was triggered. */
+  boundaryCreatedAt?: string;
+}
+
 export interface PoolFlushItem {
   messages: Message[];
   rawText: string;
   surprise: number;
-  reason: "surprise-boundary" | "size-limit" | "force-flush";
+  reason: "surprise-boundary" | "size-limit" | "force-flush" | "idle-timeout" | "time-gap";
   agentWs: string;
   agentId: string;
+  /** [v0.5.0 Phase 2] Optional boundary metadata from agent-driven boundaries. */
+  boundaryMeta?: BoundaryMetadata;
 }
 
 export interface NarrativeResult {
@@ -297,5 +343,48 @@ export interface ForgettingConfig {
   retentionDays?: number;
   /** TTL (days) for forgotten records before physical delete. Default: 14. */
   physicalDeleteTtlDays?: number;
+}
+
+// --- [v0.5.0 Phase 4] Boundary state for Go persistence ---
+
+/**
+ * Compact summary of a Surprise checkpoint persisted to Go state store.
+ * Used by near-64K prefix flush to find the last semantic cut point.
+ */
+export interface SurpriseCheckpointSummary {
+  /** Buffer index at the time of the checkpoint. */
+  index: number;
+  /** Raw Surprise score from the segment score RPC. */
+  rawSurprise: number;
+  /** Whether this was a full boundary (surprise-boundary) vs near-threshold checkpoint. */
+  isFullBoundary: boolean;
+  /** ISO 8601 timestamp when the checkpoint was created. */
+  createdAt: string;
+}
+
+/**
+ * Persisted boundary state synced from TS segmenter to Go state store.
+ * This is NOT the full transcript buffer — only metadata for checkpoint continuity.
+ */
+export interface BoundaryState {
+  /** Most recent meaningful Surprise checkpoint for near-64K prefix flush. */
+  latestCheckpoint?: SurpriseCheckpointSummary;
+  /** Semantic reason of the last boundary event. */
+  lastBoundaryReason?: string;
+  /** ISO 8601 timestamp of the last boundary event. */
+  lastBoundaryAt?: string;
+  /** Monotonic counter for boundary events (for future ordering). */
+  boundarySequence?: number;
+}
+
+/** Response shape for narrative.boundaryStateGet */
+export interface BoundaryStateGetResponse {
+  exists: boolean;
+  state: BoundaryState;
+}
+
+/** Response shape for narrative.boundaryStateSet */
+export interface BoundaryStateSetResponse {
+  persisted: boolean;
 }
 

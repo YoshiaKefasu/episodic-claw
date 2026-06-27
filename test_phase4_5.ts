@@ -24,6 +24,7 @@ import {
   runCacheQueueIntegrationSmoke,
   runCacheQueueSmoke
 } from "./test_phase4_5_cache_compaction_segmenter.ts";
+import { runNear64kPrefixFlushTests } from "./test_phase4_5_near64k_prefix_flush.ts";
 
 async function main() {
   console.log("=== Phase 4/5 Smoke & Regression Tests (Modular) ===");
@@ -55,6 +56,9 @@ async function main() {
   await runIdlePollLogStormRegression();
   await runCacheQueueIntegrationSmoke();
   await runCacheQueueSmoke();
+
+  // [v0.5.0 Phase 1.5] Near-64K prefix flush tests
+  await runNear64kPrefixFlushTests();
 
   console.log("=== ALL PHASE 4/5 TESTS PASSED ===");
 }

@@ -29,6 +29,7 @@ export async function runGatewayStartSmoke(): Promise<void> {
   const runtimeGo = path.join(runtimeRoot, "go");
   const observedSidecarLines: string[] = [];
   fs.mkdirSync(runtimeDist, { recursive: true });
+  fs.copyFileSync("package.json", path.join(runtimeRoot, "package.json"));
   const distJsFiles = [
     "anchor-store.js",
     "archiver.js",

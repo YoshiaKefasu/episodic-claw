@@ -3238,6 +3238,379 @@ func main() {
 	}
 }
 
+// --- [v0.5.0 Phase 3] narrative.forceBoundary RPC handler ---
+
+// validBoundaryReasons is the allowed set of semantic boundary reasons.
+var validBoundaryReasons = map[string]bool{
+	"task-complete": true,
+	"topic-shift":   true,
+	"manual":        true,
+	"safety":        true,
+	"handoff":       true,
+}
+
+// sanitizeControlChars replaces control characters (except \n, \r, \t) with the
+// Unicode replacement character. This rejects or sanitizes invalid UTF-8 /
+// control-heavy text before storage.
+func sanitizeControlChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
+			b.WriteRune('\uFFFD')
+		} else if r == 0x7F || (r >= 0x80 && r <= 0x9F) {
+			b.WriteRune('\uFFFD')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// truncateRunes truncates a string to maxRunes, respecting rune boundaries.
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
+}
+
+func handleNarrativeForceBoundary(conn net.Conn, req RPCRequest) {
+	start := time.Now()
+
+	// Context for the state-store write path.
+	// Aligns with go/AGENTS.md: interactive RPC methods must respect context/cancellation.
+	// 2s ceiling keeps this well under the TS 5s caller budget while allowing
+	// SQLite busy-wait to settle.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Kill switch: EPISODIC_DISABLE_GO_BOUNDARY=1 skips entirely
+	if os.Getenv("EPISODIC_DISABLE_GO_BOUNDARY") == "1" {
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"flushed":        false,
+				"enqueuedChunks": 0,
+				"fallbackReason": "disabled",
+				"elapsedMs":      time.Since(start).Milliseconds(),
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	var params struct {
+		AgentWs   string `json:"agentWs"`
+		AgentId   string `json:"agentId"`
+		Note      string `json:"note"`
+		Reason    string `json:"reason"`
+		TitleHint string `json:"titleHint"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	// Validate required fields
+	if strings.TrimSpace(params.AgentWs) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+	if strings.TrimSpace(params.AgentId) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentId'"}, ID: req.ID})
+		return
+	}
+
+	// Sanitize and cap note (max 2000 chars)
+	if params.Note != "" {
+		params.Note = sanitizeControlChars(params.Note)
+		params.Note = truncateRunes(params.Note, 2000)
+	}
+
+	// Sanitize and cap titleHint (max 120 chars)
+	if params.TitleHint != "" {
+		params.TitleHint = sanitizeControlChars(params.TitleHint)
+		params.TitleHint = truncateRunes(params.TitleHint, 120)
+	}
+
+	// Validate reason against allowed enum; log + ignore invalid values
+	if params.Reason != "" && !validBoundaryReasons[params.Reason] {
+		EmitLog("[NarrativeForceBoundary] Invalid reason '%s', ignoring (treating as empty)", params.Reason)
+		params.Reason = ""
+	}
+
+	// Write boundary intent to the Go state store with deterministic key naming.
+	// This survives TS restarts more robustly than pure in-memory TS state.
+	// The ctx guard ensures we never block the connection indefinitely if the
+	// state DB is locked or slow.
+	boundaryIntent := map[string]any{
+		"agentWs":     params.AgentWs,
+		"agentId":     params.AgentId,
+		"reason":      params.Reason,
+		"note":        params.Note,
+		"titleHint":   params.TitleHint,
+		"createdAt":   time.Now().UTC().Format(time.RFC3339Nano),
+		"flushed":     false,
+		"source":      "go-sidecar",
+	}
+	intentJSON, marshalErr := json.Marshal(boundaryIntent)
+	if marshalErr != nil {
+		EmitLog("[NarrativeForceBoundary] Failed to marshal boundary intent: %v", marshalErr)
+	} else {
+		if ctx.Err() != nil {
+			EmitLog("[NarrativeForceBoundary] Context cancelled before state-store write, skipping persist")
+		} else {
+			stateStore, ssErr := getGlobalStateStore()
+			if stateStore != nil && ssErr == nil {
+				key := fmt.Sprintf("agent:%s:ws:%s:narrative:force-boundary:last", params.AgentId, state.AgentWsHash(params.AgentWs))
+				if setErr := stateStore.Set(key, string(intentJSON)); setErr != nil {
+					EmitLog("[NarrativeForceBoundary] Failed to persist boundary intent: %v", setErr)
+				}
+			} else {
+				EmitLog("[NarrativeForceBoundary] StateDB unavailable, boundary intent not persisted (store=nil err=%v)", ssErr)
+			}
+		}
+	}
+
+	elapsed := time.Since(start).Milliseconds()
+
+	// Return flushed=false with fallbackReason="ts-fallback"
+	// Go does not yet replace TS flush — TS continues with its current forceFlush path.
+	sendResponse(conn, RPCResponse{
+		JSONRPC: "2.0",
+		Result: map[string]any{
+			"flushed":        false,
+			"enqueuedChunks": 0,
+			"fallbackReason": "ts-fallback",
+			"elapsedMs":      elapsed,
+		},
+		ID: req.ID,
+	})
+}
+
+// --- [v0.5.0 Phase 4] narrative.boundaryStateGet/Set RPC handlers ---
+
+// BoundaryState represents the small persisted boundary metadata that TS segmenter
+// syncs to Go for checkpoint continuity. This is NOT the full transcript buffer —
+// only metadata that helps with boundary decisions across restarts.
+type BoundaryState struct {
+	// LatestSurpriseCheckpoint is the most recent meaningful Surprise checkpoint.
+	// Used by near-64K prefix flush to find the last semantic cut point.
+	LatestCheckpoint *SurpriseCheckpointSummary `json:"latestCheckpoint,omitempty"`
+	// LastBoundaryReason is the semantic reason of the last boundary event.
+	LastBoundaryReason string `json:"lastBoundaryReason,omitempty"`
+	// LastBoundaryAt is the ISO 8601 timestamp of the last boundary event.
+	LastBoundaryAt string `json:"lastBoundaryAt,omitempty"`
+	// BoundarySequence is a monotonic counter for boundary events (for future ordering).
+	BoundarySequence uint64 `json:"boundarySequence,omitempty"`
+}
+
+// SurpriseCheckpointSummary is a compact summary of a Surprise checkpoint.
+type SurpriseCheckpointSummary struct {
+	Index         int     `json:"index"`
+	RawSurprise   float64 `json:"rawSurprise"`
+	IsFullBoundary bool   `json:"isFullBoundary"`
+	CreatedAt     string  `json:"createdAt"`
+}
+
+func boundaryStateKey(agentId string, agentWs string) string {
+	return fmt.Sprintf("agent:%s:ws:%s:narrative:boundary-state", agentId, state.AgentWsHash(agentWs))
+}
+
+// handleNarrativeBoundaryStateGet retrieves the persisted boundary state for an agent.
+// Returns an empty/default state if no state exists yet.
+func handleNarrativeBoundaryStateGet(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string `json:"agentWs"`
+		AgentId string `json:"agentId"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if strings.TrimSpace(params.AgentWs) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+	if strings.TrimSpace(params.AgentId) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentId'"}, ID: req.ID})
+		return
+	}
+
+	// Kill switch: when disabled, return empty state (TS keeps current behavior)
+	if os.Getenv("EPISODIC_DISABLE_GO_BOUNDARY_STATE") == "1" {
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"exists": false,
+				"state":  BoundaryState{},
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	stateStore, err := getGlobalStateStore()
+	if err != nil || stateStore == nil {
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"exists": false,
+				"state":  BoundaryState{},
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	key := boundaryStateKey(params.AgentId, params.AgentWs)
+	raw, err := stateStore.Get(key)
+	if err != nil {
+		EmitLog("[BoundaryState] Get failed for key %s: %v", key, err)
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"exists": false,
+				"state":  BoundaryState{},
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	if raw == "" {
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"exists": false,
+				"state":  BoundaryState{},
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	var state BoundaryState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		EmitLog("[BoundaryState] Unmarshal failed for key %s: %v", key, err)
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"exists": false,
+				"state":  BoundaryState{},
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{
+		JSONRPC: "2.0",
+		Result: map[string]any{
+			"exists": true,
+			"state":  state,
+		},
+		ID: req.ID,
+	})
+}
+
+// handleNarrativeBoundaryStateSet persists the boundary state for an agent.
+// This is called by TS segmenter when checkpoints change or are cleared.
+func handleNarrativeBoundaryStateSet(conn net.Conn, req RPCRequest) {
+	var params struct {
+		AgentWs string        `json:"agentWs"`
+		AgentId string        `json:"agentId"`
+		State   BoundaryState `json:"state"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Invalid params"}, ID: req.ID})
+		return
+	}
+
+	if strings.TrimSpace(params.AgentWs) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentWs'"}, ID: req.ID})
+		return
+	}
+	if strings.TrimSpace(params.AgentId) == "" {
+		sendResponse(conn, RPCResponse{JSONRPC: "2.0", Error: &RPCError{Code: -32602, Message: "Missing 'agentId'"}, ID: req.ID})
+		return
+	}
+
+	// Kill switch: when disabled, skip persist (TS keeps current behavior)
+	if os.Getenv("EPISODIC_DISABLE_GO_BOUNDARY_STATE") == "1" {
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"persisted": false,
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	stateStore, err := getGlobalStateStore()
+	if err != nil || stateStore == nil {
+		EmitLog("[BoundaryState] StateDB unavailable, boundary state not persisted (store=nil err=%v)", err)
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Result: map[string]any{
+				"persisted": false,
+			},
+			ID: req.ID,
+		})
+		return
+	}
+
+	data, err := json.Marshal(params.State)
+	if err != nil {
+		EmitLog("[BoundaryState] Marshal failed: %v", err)
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Error:   &RPCError{Code: -32000, Message: "Failed to marshal state: " + err.Error()},
+			ID:      req.ID,
+		})
+		return
+	}
+
+	key := boundaryStateKey(params.AgentId, params.AgentWs)
+	if existingRaw, getErr := stateStore.Get(key); getErr == nil && existingRaw != "" {
+		var existing BoundaryState
+		if unmarshalErr := json.Unmarshal([]byte(existingRaw), &existing); unmarshalErr == nil {
+			if params.State.BoundarySequence > 0 && existing.BoundarySequence > params.State.BoundarySequence {
+				sendResponse(conn, RPCResponse{
+					JSONRPC: "2.0",
+					Result: map[string]any{
+						"persisted": false,
+						"stale":     true,
+					},
+					ID: req.ID,
+				})
+				return
+			}
+		}
+	}
+	if err := stateStore.Set(key, string(data)); err != nil {
+		EmitLog("[BoundaryState] Set failed for key %s: %v", key, err)
+		sendResponse(conn, RPCResponse{
+			JSONRPC: "2.0",
+			Error:   &RPCError{Code: -32000, Message: "Failed to persist state: " + err.Error()},
+			ID:      req.ID,
+		})
+		return
+	}
+
+	sendResponse(conn, RPCResponse{
+		JSONRPC: "2.0",
+		Result: map[string]any{
+			"persisted": true,
+		},
+		ID: req.ID,
+	})
+}
+
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	defer func() {
@@ -3342,6 +3715,12 @@ func handleConnection(conn net.Conn) {
 			go handleCacheRequeue(conn, req)
 		case "cache.getLatestNarrative":
 			go handleGetLatestNarrative(conn, req)
+		case "narrative.forceBoundary":
+			go handleNarrativeForceBoundary(conn, req)
+		case "narrative.boundaryStateGet":
+			go handleNarrativeBoundaryStateGet(conn, req)
+		case "narrative.boundaryStateSet":
+			go handleNarrativeBoundaryStateSet(conn, req)
 		case "ping":
 			go sendResponse(conn, RPCResponse{JSONRPC: "2.0", Result: "pong", ID: req.ID})
 		default:

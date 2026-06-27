@@ -5,11 +5,13 @@
 
 import { extractText } from "./segmenter";
 import type { Message } from "./segmenter";
-import { PoolFlushItem } from "./types";
+import { PoolFlushItem, BoundaryMetadata } from "./types";
 
 export class NarrativePool {
   private buffer: Message[] = [];
   private charCount: number = 0;
+  // [v0.5.0 Phase 2] Boundary metadata from ep-boundary tool — carried through to flush item
+  private pendingBoundaryMeta: BoundaryMetadata | undefined;
 
   constructor() {}
 
@@ -17,13 +19,19 @@ export class NarrativePool {
    * Add messages to the pool (passive accumulator — always returns null).
    * Flush triggers are decided by segmenter only:
    * surprise / 64K hard cap (HARD_TOKEN_CAP) / idle / time-gap / force-flush.
+   * [v0.5.0 Phase 2] boundaryMeta: optional boundary metadata from ep-boundary tool.
    */
-  add(messages: Message[], surprise: number, agentWs: string, agentId: string): PoolFlushItem | null {
+  add(messages: Message[], surprise: number, agentWs: string, agentId: string, boundaryMeta?: BoundaryMetadata): PoolFlushItem | null {
     // Add messages to buffer
     for (const m of messages) {
       const text = extractText(m.content);
       this.buffer.push(m);
       this.charCount += text.length;
+    }
+
+    // Store boundary metadata if provided (only from forceBoundary path)
+    if (boundaryMeta) {
+      this.pendingBoundaryMeta = boundaryMeta;
     }
 
     // Flush is triggered by segmenter boundaries only (surprise/64K/idle/time-gap/force-flush).
@@ -50,6 +58,7 @@ export class NarrativePool {
   clear(): void {
     this.buffer = [];
     this.charCount = 0;
+    this.pendingBoundaryMeta = undefined;
   }
 
   private buildFlushItem(reason: PoolFlushItem["reason"], surprise: number, agentWs: string, agentId: string): PoolFlushItem {
@@ -72,6 +81,8 @@ export class NarrativePool {
       reason,
       agentWs,
       agentId,
+      // [v0.5.0 Phase 2] Carry boundary metadata through to flush item
+      ...(this.pendingBoundaryMeta ? { boundaryMeta: this.pendingBoundaryMeta } : {}),
     };
   }
 }

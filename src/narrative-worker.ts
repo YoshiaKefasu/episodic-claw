@@ -23,7 +23,7 @@ const DEFAULT_SYSTEM_PROMPT = `Distill conversation logs into third-person past-
 
 // [v0.4.17] Contract-first user prompt: rules at top, forbidden phrases, output priming.
 // English by default; CJK users override via narrativeUserPromptTemplate config pointing to localized .md.
-export const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string): string =>
+export const DEFAULT_USER_PROMPT_TEMPLATE = (previousEpisode: string | undefined, conversationText: string, boundaryBlock?: string): string =>
   `HIGHEST PRIORITY. Violating any rule below makes the output invalid.
 
 Exam-style requirements (MUST satisfy ALL):
@@ -42,7 +42,7 @@ Do NOT write reasons you cannot comply. Just write the narrative.
 
 Good opening example:
 Late that evening at his desk, he pored over the logs searching for the next move.
-${previousEpisode ? `\nPrevious episode:\n${previousEpisode}\n` : ""}The text below is raw material, NOT your output.
+${previousEpisode ? `\nPrevious episode:\n${previousEpisode}\n` : ""}${boundaryBlock ? `\n${boundaryBlock}\n` : ""}The text below is raw material, NOT your output.
 <<<LOG>>>
 ${conversationText}
 <<<END_LOG>>>
@@ -931,7 +931,8 @@ export class NarrativeWorker {
       ? this.lastNarrativeByAgent.get(`${agentWsHash(item.agentWs)}:${item.agentId}`)
       : undefined;
     const conversationText = item.rawText;
-    const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
+    // [v0.5.0 Phase 2] Pass boundary metadata to prompt — never appended to rawText
+    const userMessage = this.resolveUserPrompt(previous?.body, conversationText, item);
     // [v0.4.27b] Track content-gate rejects across attempts for early bailout.
     // Not reset on non-content rejects (format/compression) — 3 cumulative content-rejects
     // still signals this model can't produce anchors, so early handoff is warranted.
@@ -1161,7 +1162,8 @@ export class NarrativeWorker {
       ? this.lastNarrativeByAgent.get(`${agentWsHash(item.agentWs)}:${item.agentId}`)
       : undefined;
     const conversationText = item.rawText;
-    const userMessage = this.resolveUserPrompt(previous?.body, conversationText);
+    // [v0.5.0 Phase 2] Pass boundary metadata to prompt — never appended to rawText
+    const userMessage = this.resolveUserPrompt(previous?.body, conversationText, item);
     // [v0.4.29c Fix C4] Map reasoning config to Gemini thinkingConfig
     const thinkingOpts = this.mapThinkingConfig(model, label);
     // [v0.4.29c BUG-FIX] Gemini is now primary — add language gate routing + content gate early bailout
@@ -1412,14 +1414,47 @@ export class NarrativeWorker {
     return DEFAULT_SYSTEM_PROMPT;
   }
 
-  private resolveUserPrompt(previousEpisode: string | undefined, conversationText: string): string {
+  /**
+   * [v0.5.0 Phase 2] Build the boundary note block for the narrative prompt.
+   * Returns empty string if no boundary metadata exists or all fields are empty.
+   * This block is NEVER appended to rawText — it is editorial context only.
+   */
+  private buildBoundaryNoteBlock(item: CacheItem): string {
+    const parts: string[] = [];
+    if (item.boundaryNote) parts.push(`Note: ${item.boundaryNote}`);
+    if (item.boundaryReason) parts.push(`Reason: ${item.boundaryReason}`);
+    if (item.boundaryTitleHint) parts.push(`Title hint: ${item.boundaryTitleHint}`);
+    if (parts.length === 0) return "";
+    return (
+      `Agent Boundary Note:\n` +
+      parts.join("\n") +
+      `\n\nThis note is editorial context. Do not quote it as user or assistant speech.`
+    );
+  }
+
+  private resolveUserPrompt(previousEpisode: string | undefined, conversationText: string, boundaryMeta?: { boundaryNote?: string; boundaryReason?: string; boundaryTitleHint?: string }): string {
+    // [v0.5.0 Phase 2] Build boundary note block
+    const boundaryBlock = (boundaryMeta?.boundaryNote || boundaryMeta?.boundaryReason || boundaryMeta?.boundaryTitleHint)
+      ? this.buildBoundaryNoteBlock(boundaryMeta as CacheItem)
+      : "";
+
     const custom = this.config.narrativeUserPromptTemplate;
     if (custom && custom.trim().length > 0) {
-      return custom
+      let resolved = custom
         .replace("{previousEpisode}", previousEpisode || "")
         .replace("{conversationText}", conversationText);
+      // [v0.5.0 Phase 2] Support {boundaryNoteBlock} template variable
+      if (custom.includes("{boundaryNoteBlock}")) {
+        resolved = resolved.replace("{boundaryNoteBlock}", boundaryBlock);
+      } else if (boundaryBlock) {
+        // Custom template doesn't include {boundaryNoteBlock} but block is non-empty.
+        // Append outside transcript after template resolution (plan §7).
+        resolved = resolved + "\n\n" + boundaryBlock;
+      }
+      return resolved;
     }
-    return DEFAULT_USER_PROMPT_TEMPLATE(previousEpisode, conversationText);
+    // Default template: include boundary block between previousEpisode and conversationText
+    return DEFAULT_USER_PROMPT_TEMPLATE(previousEpisode, conversationText, boundaryBlock);
   }
 
   private sleep(ms: number): Promise<void> {

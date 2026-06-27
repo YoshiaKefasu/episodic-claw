@@ -45,6 +45,12 @@ type QueueItem struct {
 	LeaseUntil       string      `json:"leaseUntil,omitempty"`
 	BackoffUntil     string      `json:"backoffUntil,omitempty"` // delayed requeue after failure
 	LastError        string      `json:"lastError,omitempty"`
+	// [v0.5.0 Phase 2] Boundary metadata — optional, omitempty for backward compat
+	BoundaryNote      string `json:"boundaryNote,omitempty"`
+	BoundaryBy        string `json:"boundaryBy,omitempty"`
+	BoundaryReason    string `json:"boundaryReason,omitempty"`
+	BoundaryTitleHint string `json:"boundaryTitleHint,omitempty"`
+	BoundaryCreatedAt string `json:"boundaryCreatedAt,omitempty"`
 }
 
 // FooterMarker is the HTML comment marker for Invisible Footer metadata.

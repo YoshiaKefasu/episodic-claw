@@ -3,12 +3,12 @@ import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel, SummarizationLevel } from "./summary-escalation";
 import { NarrativePool } from "./narrative-pool";
 import { NarrativeWorker } from "./narrative-worker";
-import { splitIntoChunks, enqueueNarrativeChunks, HARD_TOKEN_CAP } from "./narrative-queue";
+import { splitIntoChunks, enqueueNarrativeChunks, HARD_TOKEN_CAP, SOFT_TOKEN_TARGET } from "./narrative-queue";
 import { getEnvVal } from "./env-var";
 import { estimateTokens } from "./utils";
 import * as fs from "fs";
 import * as path from "path";
-import type { PoolFlushItem } from "./types";
+import type { PoolFlushItem, SurpriseCheckpoint, BoundaryMetadata, BoundaryState, SurpriseCheckpointSummary } from "./types";
 
 export const EXCLUDED_ROLES = new Set(["toolResult", "tool_result"]);
 
@@ -27,6 +27,16 @@ export function extractText(content: any): string {
 }
 
 
+
+/**
+ * [v0.5.0 Phase 1] Result of an agent-driven boundary request.
+ */
+export interface BoundaryResult {
+  flushed: boolean;
+  reason: string;
+  enqueuedChunks: number;
+  noOpReason?: "empty-buffer" | "compaction-skip";
+}
 
 export class EventSegmenter {
   private buffer: Message[] = [];
@@ -86,6 +96,10 @@ export class EventSegmenter {
   // [v0.4.22c-audit] Strict durability mode: set EPISODIC_WAL_STRICT=1 to flush every line
   // [v0.4.31b] Initialized in constructor via getEnvVal to bypass ClawHub scanner
   private readonly WAL_FLUSH_INTERVAL_LINES: number;
+  // [v0.5.0 Phase 1.5] Latest meaningful Surprise checkpoint for near-64K prefix flush
+  private latestSurpriseCheckpoint: SurpriseCheckpoint | null = null;
+  // [v0.5.0 Phase 4] Monotonic sequence for Go boundary-state sync ordering.
+  private boundaryStateSequence = 0;
 
   // ─── [v0.4.22b] WAL (Write-Ahead Log) for buffer durability ──────────────
   // Active:  {agentWs}/.episodic-wal.{agentId}.active.jsonl
@@ -498,6 +512,10 @@ export class EventSegmenter {
     this.persistCursor(agentWs, agentId);
     this.buffer = [];
     this.resetBufferTokens();
+    // [v0.5.0 Phase 1.5] Clear checkpoint on idle flush — buffer is empty, checkpoint is stale
+    this.latestSurpriseCheckpoint = null;
+    // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+    this.syncCheckpointToGo(agentWs, agentId);
     // [v0.4.22c] WAL: ensure write buffer is flushed after idle boundary
     this.walFlushWriteBuffer();
     return true;
@@ -559,6 +577,10 @@ export class EventSegmenter {
       this.lastProcessedLength = 0;
       this.buffer = []; // forceFlush 失敗時も確実にクリア
       this.resetBufferTokens();
+      // [v0.5.0 Phase 1.5] Clear checkpoint on context reset — buffer is empty, checkpoint is stale
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
       // [v0.4.22c] BUG-3: clear all WAL files on context reset — new session must start clean
       this.walClearAll(agentWs, agentId);
     }
@@ -666,6 +688,10 @@ export class EventSegmenter {
       await this.handleSegmentBoundary(agentWs, agentId, 0, "time-gap", timeGapFlushId);
       this.buffer = [...dedupedMessages];
       this.recomputeBufferTokens();
+      // [v0.5.0 Phase 1.5] Clear checkpoint on time-gap boundary — buffer is replaced with new context
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
       // [v0.4.22b] WAL: persist new-context messages
       for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
       this.lastProcessedLength = currentMessages.length;
@@ -693,7 +719,44 @@ export class EventSegmenter {
       });
 
       const surprise = score?.rawSurprise ?? 0;
-      const shouldBoundary = sizeLimitExceeded || !!score?.isBoundary;
+      let shouldBoundary = sizeLimitExceeded || !!score?.isBoundary;
+
+      // [v0.5.0 Phase 1.5] Record latest meaningful Surprise checkpoint
+      // Checkpoint rules: (1) score.isBoundary === true, OR
+      // (2) rawSurprise >= segmentationMinRawSurprise even if cooldown suppressed isBoundary
+      const isFullBoundary = !!score?.isBoundary;
+      const meetsRawThreshold = surprise >= this.segmentationMinRawSurprise;
+      if (isFullBoundary || meetsRawThreshold) {
+        // Checkpoint index = current buffer length (boundary after last buffered message)
+        this.latestSurpriseCheckpoint = {
+          index: this.buffer.length,
+          rawSurprise: surprise,
+          isFullBoundary,
+          createdAt: new Date().toISOString(),
+        };
+        // [v0.5.0 Phase 4] Sync checkpoint only when it remains live in the buffer.
+        // If a full boundary fires immediately below, the checkpoint will be cleared right away.
+        if (!shouldBoundary) this.syncCheckpointToGo(agentWs, agentId);
+      }
+
+      // [v0.5.0 Phase 1.5] Near-64K prefix flush: when buffer approaches SOFT_TOKEN_TARGET,
+      // flush only the prefix up to the latest Surprise checkpoint, keeping suffix live.
+      if (!shouldBoundary && this.bufferTokenCount >= SOFT_TOKEN_TARGET) {
+        const prefixFlushed = await this.flushPrefixAtCheckpoint(agentWs, agentId);
+        if (prefixFlushed) {
+          // Prefix flushed successfully. Append new messages to the suffix buffer.
+          this.buffer.push(...dedupedMessages);
+          this.addBufferTokens(dedupedMessages);
+          for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
+          this.lastProcessedLength = currentMessages.length;
+          this.maybePersistCursor(agentWs, agentId);
+          this.scheduleIdleFlush(agentWs, agentId);
+          return true;
+        }
+        // Prefix flush failed (no valid checkpoint or error) — escalate to full size-limit flush.
+        // This preserves safety when we're already near 64K but no valid semantic cut point exists.
+        shouldBoundary = true;
+      }
 
       if (shouldBoundary || this.turnSeq % 5 === 0) {
         const mean = (score?.mean ?? 0).toFixed(4);
@@ -723,6 +786,10 @@ export class EventSegmenter {
         // Clear buffer and start fresh with the new context
         this.buffer = [...dedupedMessages];
         this.recomputeBufferTokens();
+        // [v0.5.0 Phase 1.5] Clear checkpoint on full boundary — buffer is replaced with new context
+        this.latestSurpriseCheckpoint = null;
+        // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+        this.syncCheckpointToGo(agentWs, agentId);
         for (const msg of dedupedMessages) { this.walAppend(agentWs, agentId, msg); }
         // Reschedule idle flush for the new buffer after boundary
         this.scheduleIdleFlush(agentWs, agentId);
@@ -792,6 +859,10 @@ export class EventSegmenter {
     this.resetBufferTokens();
     this.lastProcessedLength = savedCursor;
     this.persistCursor(agentWs, agentId);
+    // [v0.5.0 Phase 1.5] Clear checkpoint on full flush — buffer is empty, checkpoint is stale
+    this.latestSurpriseCheckpoint = null;
+    // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+    this.syncCheckpointToGo(agentWs, agentId);
   }
 
   /**
@@ -816,7 +887,8 @@ export class EventSegmenter {
       // Flush occurred: split and enqueue to cache DB
       // Preserve idle-timeout reason for observability — don't collapse it into size-limit
       const cacheReason = this.mapBoundaryReasonToCacheReason(reason);
-      const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise, item.messages);
+      // [v0.5.0 Phase 2] Pass boundary metadata from pool flush item to chunks
+      const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", cacheReason, surprise, item.messages, item.boundaryMeta);
 
       // [v0.4.13] Defer pool.clear() until after enqueue confirmation
       // (requires enqueueNarrativeChunks to re-throw errors — see Phase 0)
@@ -872,6 +944,10 @@ export class EventSegmenter {
     this.resetBufferTokens();
     this.turnSeq = 0;
     this.clearIdleFlushTimer();
+    // [v0.5.0 Phase 1.5] Clear checkpoint on compaction — stale checkpoint would point to old buffer
+    this.latestSurpriseCheckpoint = null;
+    // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+    this.syncCheckpointToGo(agentWs, agentId);
     // [v0.4.22d] WAL: compaction後は会話が再構成済みのためWALも明示クリア
     if (agentWs && agentId) {
       this.walClearAll(agentWs, agentId);
@@ -895,6 +971,10 @@ export class EventSegmenter {
     this.resetBufferTokens();
     this.turnSeq = 0;
     this.clearIdleFlushTimer();
+    // [v0.5.0 Phase 1.5] Clear checkpoint on bootstrap — buffer is empty, checkpoint is stale
+    this.latestSurpriseCheckpoint = null;
+    // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+    this.syncCheckpointToGo(agentWs, agentId);
     console.log(JSON.stringify({ source: "episodic-claw", event: "bootstrap-cursor", cursor: this.lastProcessedLength, reason }));
     // [v0.4.21d] Only persist when value changed or user-explicit manual operation.
     // This avoids unnecessary DB writes (pebble.Sync) when restoreCursor returns the same
@@ -927,6 +1007,81 @@ export class EventSegmenter {
     if (!agentWs || !agentId) return; // skip if caller didn't provide identity
     this.rpc.setSegmenterCursor(agentWs, agentId, { lastProcessedLength: this.lastProcessedLength })
       .catch((err) => console.warn("[Episodic Memory] Failed to persist segmenter cursor:", err));
+  }
+
+  // --- [v0.5.0 Phase 4] Boundary state sync to Go ---
+
+  /**
+   * [v0.5.0 Phase 4] Check the EPISODIC_DISABLE_GO_BOUNDARY_STATE kill switch.
+   * When set, TS skips Go boundary-state sync entirely.
+   */
+  private isGoBoundaryStateDisabled(): boolean {
+    return getEnvVal("EPISODIC_DISABLE_GO_BOUNDARY_STATE") === "1";
+  }
+
+  /**
+   * [v0.5.0 Phase 4] Sync the current checkpoint state to Go state store.
+   * Fire-and-forget — errors are logged but not propagated.
+   * Called when checkpoint is set or cleared.
+   */
+  private syncCheckpointToGo(agentWs: string, agentId: string): void {
+    if (this.isGoBoundaryStateDisabled()) return;
+    if (!agentWs || !agentId) return;
+    // Guard: old sidecar / test mock may not have the method yet
+    if (typeof this.rpc.setBoundaryState !== "function") return;
+
+    const state: BoundaryState = {};
+    this.boundaryStateSequence += 1;
+    state.boundarySequence = this.boundaryStateSequence;
+    if (this.latestSurpriseCheckpoint) {
+      const cp = this.latestSurpriseCheckpoint;
+      const summary: SurpriseCheckpointSummary = {
+        index: cp.index,
+        rawSurprise: cp.rawSurprise,
+        isFullBoundary: cp.isFullBoundary,
+        createdAt: cp.createdAt,
+      };
+      state.latestCheckpoint = summary;
+      state.lastBoundaryReason = cp.isFullBoundary ? "surprise-boundary" : "checkpoint";
+      state.lastBoundaryAt = cp.createdAt;
+    }
+
+    this.rpc.setBoundaryState(agentWs, agentId, state)
+      .catch((err) => console.warn("[Episodic Memory] Failed to sync checkpoint to Go:", err));
+  }
+
+  /**
+   * [v0.5.0 Phase 4] Restore checkpoint from Go state store on warm-start.
+   * Called during bootstrapCursor if Go state has a persisted checkpoint.
+   * Only restores if the in-memory checkpoint is null (Go is backup, not source of truth).
+   */
+  async restoreCheckpointFromGo(agentWs: string, agentId: string): Promise<void> {
+    if (this.isGoBoundaryStateDisabled()) return;
+    if (!agentWs || !agentId) return;
+    if (this.latestSurpriseCheckpoint !== null) return; // already have an in-memory checkpoint
+    // Guard: old sidecar / test mock may not have the method yet
+    if (typeof this.rpc.getBoundaryState !== "function") return;
+
+    try {
+      const goState = await this.rpc.getBoundaryState(agentWs, agentId);
+      this.boundaryStateSequence = Math.max(this.boundaryStateSequence, goState.boundarySequence || 0);
+      if (goState.latestCheckpoint) {
+        this.latestSurpriseCheckpoint = {
+          index: goState.latestCheckpoint.index,
+          rawSurprise: goState.latestCheckpoint.rawSurprise,
+          isFullBoundary: goState.latestCheckpoint.isFullBoundary,
+          createdAt: goState.latestCheckpoint.createdAt,
+        };
+        console.log(JSON.stringify({
+          source: "episodic-claw",
+          event: "checkpoint-restore-from-go",
+          index: this.latestSurpriseCheckpoint.index,
+          isFullBoundary: this.latestSurpriseCheckpoint.isFullBoundary,
+        }));
+      }
+    } catch (err) {
+      console.warn("[Episodic Memory] Failed to restore checkpoint from Go:", err);
+    }
   }
 
   /**
@@ -1009,6 +1164,309 @@ export class EventSegmenter {
       // [v0.4.22b] On failure: restore cursor so B-1 restart doesn't reprocess everything
       this.lastProcessedLength = savedCursor;
       this.persistCursor(agentWs, agentId);
+    }
+  }
+
+  /**
+   * [v0.5.0 Phase 1.5] Flush only the prefix up to a Surprise checkpoint,
+   * keeping the suffix live in the buffer for the next episode.
+   *
+   * Flow:
+   * 1. Validate checkpoint is inside the current buffer.
+   * 2. Split buffer into prefix (up to checkpoint.index) and suffix (after).
+   * 3. If prefix is empty, skip and return false.
+   * 4. Enqueue prefix via forceFlush-style direct path.
+   * 5. Replace buffer with suffix, recompute tokens.
+   * 6. Clear the used checkpoint.
+   *
+   * Returns true if prefix was enqueued, false if fallback needed.
+   */
+  private async flushPrefixAtCheckpoint(
+    agentWs: string,
+    agentId: string,
+  ): Promise<boolean> {
+    const checkpoint = this.latestSurpriseCheckpoint;
+    if (!checkpoint) {
+      console.log("[Episodic Memory] flushPrefixAtCheckpoint: no checkpoint available, fallback needed.");
+      return false;
+    }
+
+    // Validate checkpoint is inside the current buffer
+    if (checkpoint.index <= 0 || checkpoint.index >= this.buffer.length) {
+      console.log(`[Episodic Memory] flushPrefixAtCheckpoint: checkpoint index ${checkpoint.index} is outside buffer (length=${this.buffer.length}), fallback needed.`);
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
+      return false;
+    }
+
+    const prefix = this.buffer.slice(0, checkpoint.index);
+    const suffix = this.buffer.slice(checkpoint.index);
+
+    // Guard: empty prefix would be a no-op
+    if (prefix.length === 0) {
+      console.log("[Episodic Memory] flushPrefixAtCheckpoint: prefix is empty, fallback needed.");
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
+      return false;
+    }
+
+    console.log(
+      `[Episodic Memory] Near-64K prefix flush: checkpoint index=${checkpoint.index}, ` +
+      `rawSurprise=${checkpoint.rawSurprise.toFixed(4)}, isFullBoundary=${checkpoint.isFullBoundary}, ` +
+      `prefix=${prefix.length} msgs, suffix=${suffix.length} msgs.`
+    );
+
+    const savedCursor = this.lastProcessedLength;
+    try {
+      this.clearIdleFlushTimer();
+
+      // WAL rotate for the prefix flush
+      const prefixFlushId = this.walRotateForFlush(agentWs, agentId);
+
+      if (this.pool) {
+        // Add prefix to pool, then force flush
+        this.pool.add(prefix, checkpoint.rawSurprise, agentWs, agentId);
+        const item = this.pool.forceFlush(agentWs, agentId, checkpoint.rawSurprise);
+
+        if (item) {
+          // Use "size-limit" as queue reason for operational compatibility
+          const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "size-limit", checkpoint.rawSurprise, item.messages);
+
+          await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
+
+          // Restore the suffix into the new active WAL before deleting the staged full-buffer WAL.
+          // The rotate staged the entire old buffer; without rewriting suffix here, deleting staged
+          // would orphan the tail that must remain live for the next episode.
+          for (const msg of suffix) {
+            this.walAppend(agentWs, agentId, msg);
+          }
+          this.walFlushWriteBuffer();
+
+          if (prefixFlushId >= 0) {
+            this.walDeleteStaged(agentWs, agentId, prefixFlushId);
+          }
+
+          console.log(JSON.stringify({
+            source: "episodic-claw",
+            event: "near-64k-prefix-flush",
+            agentId,
+            enqueuedChunks: chunks.length,
+            checkpointIndex: checkpoint.index,
+            rawSurprise: checkpoint.rawSurprise,
+          }));
+
+          this.pool.clear();
+        }
+      } else {
+        // Legacy path — no narrative architecture
+        await this.chunkAndIngest(prefix, agentWs, "size-limit", agentId, checkpoint.rawSurprise);
+
+        for (const msg of suffix) {
+          this.walAppend(agentWs, agentId, msg);
+        }
+        this.walFlushWriteBuffer();
+
+        if (prefixFlushId >= 0) {
+          this.walDeleteStaged(agentWs, agentId, prefixFlushId);
+        }
+      }
+
+      // Replace buffer with suffix, recompute tokens
+      this.buffer = suffix;
+      this.recomputeBufferTokens();
+      // Cursor tracks how many source conversation messages were already seen,
+      // not how many buffered messages remain after the semantic split.
+      this.lastProcessedLength = savedCursor;
+      this.persistCursor(agentWs, agentId);
+
+      // Clear the used checkpoint
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
+
+      // Reschedule idle flush for the suffix buffer
+      this.scheduleIdleFlush(agentWs, agentId);
+
+      return true;
+    } catch (err) {
+      console.error("[Episodic Memory] Error in flushPrefixAtCheckpoint:", err);
+      this.walFlushWriteBuffer();
+      this.lastProcessedLength = savedCursor;
+      this.persistCursor(agentWs, agentId);
+      // On failure, clear checkpoint so we don't retry a broken state
+      this.latestSurpriseCheckpoint = null;
+      // [v0.5.0 Phase 4] Sync cleared checkpoint to Go state store
+      this.syncCheckpointToGo(agentWs, agentId);
+      return false;
+    }
+  }
+
+  /**
+   * [v0.5.0 Phase 1] Agent-driven narrative boundary.
+   * Uses forceFlush-style direct-enqueue path (not poolAndQueue auto path).
+   * Phase 1 only: accepts semantic boundary intent from the tool,
+   * but does not yet persist that metadata into queue/prompt payloads.
+   *
+   * [v0.5.0 Phase 3] Go-path wrapper: calls Go first to record boundary intent
+   * deterministically in the state store. If Go reports disabled/fallback or is
+   * unavailable, falls back to the existing TS forceFlush path.
+   *
+   * Routing rule: uses queue reason "force-flush" for operational compatibility.
+   */
+  async forceBoundary(
+    agentWs: string,
+    agentId: string,
+    boundaryMeta: {
+      note?: string;
+      boundaryReason?: string;
+      titleHint?: string;
+    } = {},
+  ): Promise<BoundaryResult> {
+    const chunkBoundaryMeta = (boundaryMeta.note || boundaryMeta.boundaryReason || boundaryMeta.titleHint)
+      ? {
+          boundaryNote: boundaryMeta.note,
+          boundaryBy: agentId,
+          boundaryReason: boundaryMeta.boundaryReason,
+          boundaryTitleHint: boundaryMeta.titleHint,
+          boundaryCreatedAt: new Date().toISOString(),
+        }
+      : undefined;
+
+    // ─── [v0.5.0 Phase 3] Go-path wrapper ───────────────────────────────
+    // Try Go first; fall back to TS path if Go is unavailable, disabled, or errors.
+    // 5s timeout is the TS-side caller budget. Go's state-store write path uses
+    // a 2s context (well under this), so the RPC should always resolve before
+    // the TS timeout fires unless Go is hung or unreachable.
+    const goKillSwitch = getEnvVal("EPISODIC_DISABLE_GO_BOUNDARY") === "1";
+    if (!goKillSwitch) {
+      try {
+        const goResult = await this.rpc.forceBoundary({
+          agentWs,
+          agentId,
+          note: boundaryMeta.note,
+          reason: boundaryMeta.boundaryReason,
+          titleHint: boundaryMeta.titleHint,
+        }, 5000);
+
+        if (getEnvVal("DEBUG_EPISODIC_GO_BOUNDARY")) {
+          console.log(JSON.stringify({
+            source: "episodic-claw", event: "go-boundary-result",
+            agentId, fallbackReason: goResult.fallbackReason, elapsedMs: goResult.elapsedMs,
+          }));
+        }
+
+        // Go returned "disabled" → kill switch was on Go side; proceed with TS path
+        if (goResult.fallbackReason === "disabled") {
+          // TS path continues below
+        }
+        // Go returned "ts-fallback" → Go recorded intent, TS handles flush
+        // Both paths fall through to TS forceFlush below
+      } catch (err: any) {
+        // Old Go sidecar without narrative.forceBoundary → method not found
+        // Any other Go error → log and fall through to TS path
+        if (getEnvVal("DEBUG_EPISODIC_GO_BOUNDARY")) {
+          console.warn(`[Episodic Memory] Go boundary RPC failed, falling back to TS path: ${err?.message || err}`);
+        }
+      }
+    }
+    // ─── End Go-path wrapper ────────────────────────────────────────────
+
+    // Guard: pending compaction skip — do not resurrect compacted messages
+    if (this.pendingCompactionSkip) {
+      return {
+        flushed: false,
+        reason: "force-flush",
+        enqueuedChunks: 0,
+        noOpReason: "compaction-skip",
+      };
+    }
+
+    // Guard: empty buffer and empty pool → no-op
+    if (this.buffer.length === 0 && !this.pool) {
+      return {
+        flushed: false,
+        reason: "force-flush",
+        enqueuedChunks: 0,
+        noOpReason: "empty-buffer",
+      };
+    }
+
+    const savedCursor = this.lastProcessedLength;
+    try {
+      console.log(`[Episodic Memory] Agent boundary: flushing ${this.buffer.length} messages (reason=${boundaryMeta.boundaryReason || "manual"})...`);
+      this.clearIdleFlushTimer();
+
+      // WAL rotate only when segmenter buffer has data
+      const hasBufferedMessages = this.buffer.length > 0;
+      const boundaryFlushId = hasBufferedMessages ? this.walRotateForFlush(agentWs, agentId) : -1;
+
+      if (this.pool) {
+        if (hasBufferedMessages) {
+          // [v0.5.0 Phase 2] Pass boundary metadata through pool → flush item → chunks
+          this.pool.add(this.buffer.slice(), 0, agentWs, agentId, chunkBoundaryMeta);
+        }
+        const item = this.pool.forceFlush(agentWs, agentId);
+        if (item) {
+           // Use "force-flush" as queue reason for operational compatibility.
+           // [v0.5.0 Phase 2] Pass item.boundaryMeta (from pool) to splitIntoChunks
+           const chunks = splitIntoChunks(item.rawText, agentWs, agentId, "live-turn", "force-flush", 0, item.messages, item.boundaryMeta);
+
+           // Await enqueue — agent tool needs confirmation
+           await enqueueNarrativeChunks(this.rpc, chunks, () => this.narrativeWorker?.wake());
+
+          if (boundaryFlushId >= 0) {
+            this.walDeleteStaged(agentWs, agentId, boundaryFlushId);
+          }
+
+          console.log(JSON.stringify({
+            source: "episodic-claw",
+            event: "agent-boundary-enqueue",
+            agentId,
+            enqueuedChunks: chunks.length,
+            boundaryReason: boundaryMeta.boundaryReason || "manual",
+          }));
+
+          this.pool.clear();
+          this.finalizeAfterBoundary(savedCursor, agentWs, agentId);
+          return {
+            flushed: true,
+            reason: "force-flush",
+            enqueuedChunks: chunks.length,
+          };
+        }
+        // Pool returned null — no data to flush
+        this.finalizeAfterBoundary(savedCursor, agentWs, agentId);
+        return {
+          flushed: false,
+          reason: "force-flush",
+          enqueuedChunks: 0,
+          noOpReason: "empty-buffer",
+        };
+      }
+
+      // Legacy path — no narrative architecture
+      await this.chunkAndIngest(this.buffer, agentWs, "force-flush", agentId);
+      if (boundaryFlushId >= 0) {
+        this.walDeleteStaged(agentWs, agentId, boundaryFlushId);
+      }
+      this.finalizeAfterBoundary(savedCursor, agentWs, agentId);
+      return {
+        flushed: true,
+        reason: "force-flush",
+        enqueuedChunks: 1,
+      };
+    } catch (err) {
+      console.error("[Episodic Memory] Error in agent boundary:", err);
+      this.walFlushWriteBuffer();
+      this.lastProcessedLength = savedCursor;
+      this.persistCursor(agentWs, agentId);
+      return {
+        flushed: false,
+        reason: "force-flush",
+        enqueuedChunks: 0,
+      };
     }
   }
 

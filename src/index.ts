@@ -940,6 +940,8 @@ const episodicClawPlugin = {
         if (restoredCursor > 0) {
           const clamped = Math.min(restoredCursor, msgs.length);
           state.segmenter.bootstrapCursor(clamped, "warm-start", agentWs, agentId);
+          // [v0.5.0 Phase 4] Restore checkpoint from Go state store after bootstrap
+          await state.segmenter.restoreCheckpointFromGo(agentWs, agentId).catch(() => {});
           console.log(JSON.stringify({
             source: "episodic-claw",
             event: "segmenter-cursor-init",
@@ -1831,6 +1833,98 @@ const episodicClawPlugin = {
             };
           } catch (e: any) {
             return { content: [{ type: "text", text: `Something went wrong saving the anchor: ${e.message}` }] };
+          }
+        }
+      }));
+
+      // ─── [v0.5.0 Phase 1] ep-boundary: agent-driven narrative boundary ───
+      const EpBoundarySchema = Type.Object({
+        note: Type.Optional(Type.String({
+          description: "Editorial note for the narrative writer. This is NOT user speech; it is guidance for summarizing this chapter. Max 2000 characters.",
+          maxLength: 2000,
+        })),
+        reason: Type.Optional(Type.Union([
+          Type.Literal("task-complete"),
+          Type.Literal("topic-shift"),
+          Type.Literal("manual"),
+          Type.Literal("safety"),
+          Type.Literal("handoff"),
+        ], {
+          description: "Semantic reason for closing this chapter. Defaults to 'manual' if omitted.",
+        })),
+        titleHint: Type.Optional(Type.String({
+          description: "Optional title hint for the narrative writer. Max 120 characters.",
+          maxLength: 120,
+        })),
+      });
+
+      api.registerTool((ctx: any) => ({
+        name: "ep-boundary",
+        description: "Close the current episodic narrative chapter now. Use this when the task is complete, the conversation is switching topics, or you need to attach a short editorial note for the narrative writer. The note is not user speech; it is guidance for summarizing this chapter.",
+        parameters: EpBoundarySchema,
+        execute: async (_toolCallId: string, params: any) => {
+          const resolution = resolveAgentWorkspaces(ctx, openClawGlobalConfig);
+          const { agentId, agentWs } = resolution;
+          if (!agentWs) {
+            return { content: [{ type: "text", text: "My memory isn't up yet — the gateway hasn't started. Try again in a moment." }] };
+          }
+          await prepareWorkspaces(resolution);
+          const state = getAgentState(agentId);
+          state.lastAgentWs = agentWs;
+
+          try {
+            const p = (params || {}) as Record<string, unknown>;
+
+            // Sanitize note — cap at 2000 chars
+            let note: string | undefined;
+            if (typeof p.note === "string" && p.note.trim()) {
+              const runes = Array.from(p.note);
+              note = runes.length > 2000 ? runes.slice(0, 2000).join("") : p.note;
+            }
+
+            // Validate reason against allowed enum
+            const validReasons = ["task-complete", "topic-shift", "manual", "safety", "handoff"];
+            let reason: string | undefined;
+            if (typeof p.reason === "string" && validReasons.includes(p.reason)) {
+              reason = p.reason;
+            }
+
+            // Sanitize titleHint — cap at 120 chars
+            let titleHint: string | undefined;
+            if (typeof p.titleHint === "string" && p.titleHint.trim()) {
+              const runes = Array.from(p.titleHint);
+              titleHint = runes.length > 120 ? runes.slice(0, 120).join("") : p.titleHint;
+            }
+
+            const result = await state.segmenter.forceBoundary(agentWs, agentId, {
+              note,
+              boundaryReason: reason,
+              titleHint,
+            });
+
+            if (result.noOpReason === "empty-buffer") {
+              return {
+                content: [{ type: "text", text: "No active segment to close — the buffer is already empty." }],
+                details: { flushed: false, reason: result.reason, enqueuedChunks: 0, noOpReason: result.noOpReason },
+              };
+            }
+            if (result.noOpReason === "compaction-skip") {
+              return {
+                content: [{ type: "text", text: "Compaction is in progress — boundary deferred. The segment will close after compaction completes." }],
+                details: { flushed: false, reason: result.reason, enqueuedChunks: 0, noOpReason: result.noOpReason },
+              };
+            }
+
+            return {
+              content: [{ type: "text", text: "Closed the current story segment." }],
+              details: {
+                flushed: result.flushed,
+                reason: result.reason,
+                enqueuedChunks: result.enqueuedChunks,
+              },
+            };
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `Something went wrong closing the segment: ${e.message}` }] };
           }
         }
       }));
