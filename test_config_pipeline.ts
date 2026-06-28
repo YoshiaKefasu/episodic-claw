@@ -105,6 +105,8 @@ test("every EpisodicPluginConfig field appears in loadConfig() output", () => {
     "narrativeGuardMinLatinWords",
     // [v0.4.29c Fix C1] narrativeConfigSource for observability
     "narrativeConfigSource",
+    // [v0.5.0] narrativeBoundary — auto-flush boundary switches
+    "narrativeBoundary",
   ];
 
   const missingKeys: string[] = [];
@@ -169,6 +171,8 @@ test("loadConfig() has no keys not in EpisodicPluginConfig", () => {
     "forgettingEpisodic",
     // [v0.4.34] tombstoneRetentionDays — DEPRECATED back-compat shim
     "tombstoneRetentionDays",
+    // [v0.5.0] narrativeBoundary — auto-flush boundary switches
+    "narrativeBoundary",
   ]);
 
   const extraKeys: string[] = [];
@@ -920,6 +924,67 @@ test("test_config_env_kill_switch_precedence", () => {
   const cfg = loadConfig({ forgettingEpisodic: { enabled: true } });
   // forgettingEpisodic.enabled is set to true, but the scheduler checks env var first
   assert.equal(cfg.forgettingEpisodic?.enabled, true);
+});
+
+// ─── 15. Narrative Boundary Config Tests ──────────────────────────────
+
+console.log("\n=== 15. Narrative Boundary Config Tests ===\n");
+
+test("loadConfig({}) defaults all narrativeBoundary switches to true", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeBoundary?.autoIdleFlush, true, "autoIdleFlush should default to true");
+  assert.equal(cfg.narrativeBoundary?.autoTimeGapFlush, true, "autoTimeGapFlush should default to true");
+  assert.equal(cfg.narrativeBoundary?.autoSurpriseFlush, true, "autoSurpriseFlush should default to true");
+});
+
+test("loadConfig({ narrativeBoundary: { autoIdleFlush: false } }) preserves false", () => {
+  const cfg = loadConfig({ narrativeBoundary: { autoIdleFlush: false } });
+  assert.equal(cfg.narrativeBoundary?.autoIdleFlush, false, "autoIdleFlush=false should be preserved");
+  assert.equal(cfg.narrativeBoundary?.autoTimeGapFlush, true, "autoTimeGapFlush should still default to true");
+  assert.equal(cfg.narrativeBoundary?.autoSurpriseFlush, true, "autoSurpriseFlush should still default to true");
+});
+
+test("loadConfig({ narrativeBoundary: { autoTimeGapFlush: false } }) preserves false", () => {
+  const cfg = loadConfig({ narrativeBoundary: { autoTimeGapFlush: false } });
+  assert.equal(cfg.narrativeBoundary?.autoIdleFlush, true, "autoIdleFlush should still default to true");
+  assert.equal(cfg.narrativeBoundary?.autoTimeGapFlush, false, "autoTimeGapFlush=false should be preserved");
+  assert.equal(cfg.narrativeBoundary?.autoSurpriseFlush, true, "autoSurpriseFlush should still default to true");
+});
+
+test("loadConfig({ narrativeBoundary: { autoSurpriseFlush: false } }) preserves false", () => {
+  const cfg = loadConfig({ narrativeBoundary: { autoSurpriseFlush: false } });
+  assert.equal(cfg.narrativeBoundary?.autoIdleFlush, true, "autoIdleFlush should still default to true");
+  assert.equal(cfg.narrativeBoundary?.autoTimeGapFlush, true, "autoTimeGapFlush should still default to true");
+  assert.equal(cfg.narrativeBoundary?.autoSurpriseFlush, false, "autoSurpriseFlush=false should be preserved");
+});
+
+test("loadConfig({ narrativeBoundary: { autoIdleFlush: false, autoTimeGapFlush: false, autoSurpriseFlush: false } }) preserves all false", () => {
+  const cfg = loadConfig({
+    narrativeBoundary: {
+      autoIdleFlush: false,
+      autoTimeGapFlush: false,
+      autoSurpriseFlush: false,
+    },
+  });
+  assert.equal(cfg.narrativeBoundary?.autoIdleFlush, false, "autoIdleFlush=false should be preserved");
+  assert.equal(cfg.narrativeBoundary?.autoTimeGapFlush, false, "autoTimeGapFlush=false should be preserved");
+  assert.equal(cfg.narrativeBoundary?.autoSurpriseFlush, false, "autoSurpriseFlush=false should be preserved");
+});
+
+test("REGRESSION: narrativeBoundary is not silently dropped by loadConfig", () => {
+  const cfg = loadConfig({ narrativeBoundary: { autoIdleFlush: false } });
+  assert.ok(cfg.narrativeBoundary, "narrativeBoundary should exist in output");
+  assert.equal(cfg.narrativeBoundary!.autoIdleFlush, false, "user's false should be preserved, not overridden");
+});
+
+test("openclaw.plugin.json schema contains narrativeBoundary with additionalProperties:false", () => {
+  const pluginJson = JSON.parse(readSource("openclaw.plugin.json"));
+  const nb = pluginJson.configSchema.properties.narrativeBoundary;
+  assert.ok(nb, "narrativeBoundary should exist in plugin.json schema");
+  assert.equal(nb.additionalProperties, false, "narrativeBoundary should have additionalProperties: false");
+  assert.ok(nb.properties.autoIdleFlush, "autoIdleFlush should exist");
+  assert.ok(nb.properties.autoTimeGapFlush, "autoTimeGapFlush should exist");
+  assert.ok(nb.properties.autoSurpriseFlush, "autoSurpriseFlush should exist");
 });
 
 // ─── Summary ────────────────────────────────────────────────

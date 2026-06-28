@@ -607,6 +607,18 @@ const PluginConfigSchema = Type.Object(
       retentionDays: Type.Optional(Type.Integer({ minimum: 1, description: "Days an episode must remain unused before eligibility. Default: 365." })),
       physicalDeleteTtlDays: Type.Optional(Type.Integer({ minimum: 1, description: "TTL for forgotten records before physical delete. Default: 14." })),
     }, { additionalProperties: false, description: "Weekly unused-episode forgetting sweep. Default: disabled." })),
+    // [v0.5.0] narrativeBoundary — controls which automatic flush paths are enabled
+    narrativeBoundary: Type.Optional(Type.Object({
+      autoIdleFlush: Type.Optional(Type.Boolean({
+        description: "Auto-flush buffer after a quiet period (idle timeout). Default: true.\n⚠️ [Blast Radius] If false: quiet-period episode creation stops and buffers may wait for manual/near-64K/safety paths."
+      })),
+      autoTimeGapFlush: Type.Optional(Type.Boolean({
+        description: "Auto-flush buffer when user-message timestamps have a large gap. Default: true.\n⚠️ [Blast Radius] If false: timestamp gaps no longer force a chapter close."
+      })),
+      autoSurpriseFlush: Type.Optional(Type.Boolean({
+        description: "Auto-flush buffer immediately when Surprise says the topic changed. Default: true.\n⚠️ [Blast Radius] If false: Surprise still places bookmarks but no longer closes the chapter immediately."
+      })),
+    }, { additionalProperties: false, description: "[v0.5.0] Controls which automatic narrative episode creation paths are enabled. Disabling a toggle does NOT affect Surprise checkpoint recording, near-64K prefix flush, or manual ep-boundary." })),
     // [v0.4.34] tombstoneRetentionDays — DEPRECATED back-compat shim
     tombstoneRetentionDays: Type.Optional(Type.Integer({ minimum: 1, description: "[DEPRECATED v0.4.34] Use forgettingEpisodic.physicalDeleteTtlDays instead. Migrated automatically at load time when forgettingEpisodic.physicalDeleteTtlDays is not set." })),
   },
@@ -846,6 +858,9 @@ const episodicClawPlugin = {
             stdFloor: cfg.segmentationStdFloor,
             fallbackThreshold: cfg.segmentationFallbackThreshold,
             timeGapMinutes: cfg.segmentationTimeGapMinutes,
+            autoIdleFlush: cfg.narrativeBoundary?.autoIdleFlush ?? true,
+            autoTimeGapFlush: cfg.narrativeBoundary?.autoTimeGapFlush ?? true,
+            autoSurpriseFlush: cfg.narrativeBoundary?.autoSurpriseFlush ?? true,
           },
           pool,
           narrativeWorker,

@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { EpisodicPluginConfig, NarrativeConfig, OpenRouterReasoningConfig, RecallCalibration, ForgettingConfig } from "./types";
+import { EpisodicPluginConfig, NarrativeConfig, NarrativeBoundaryConfig, OpenRouterReasoningConfig, RecallCalibration, ForgettingConfig } from "./types";
 import { getEnvVal } from "./env-var";
 
 let warnedOpenrouterDeprecated = false;
@@ -116,6 +116,19 @@ function normalizeForgettingConfig(rawConfig: any): ForgettingConfig {
 }
 
 /**
+ * [v0.5.0] Parse and normalize narrativeBoundary config.
+ * Each boolean defaults to true for backward compatibility.
+ */
+function normalizeNarrativeBoundaryConfig(rawConfig: any): NarrativeBoundaryConfig {
+  const raw = rawConfig?.narrativeBoundary as NarrativeBoundaryConfig | undefined;
+  return {
+    autoIdleFlush: raw?.autoIdleFlush ?? true,
+    autoTimeGapFlush: raw?.autoTimeGapFlush ?? true,
+    autoSurpriseFlush: raw?.autoSurpriseFlush ?? true,
+  };
+}
+
+/**
  * Parses and resolves default configuration for the plugin.
  * Handles the configSchema defined in openclaw.plugin.json.
  */
@@ -124,6 +137,8 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
   return {
     // [v0.4.34] forgettingEpisodic — user-facing config for weekly unused-episode sweep
     forgettingEpisodic: normalizeForgettingConfig(rawConfig),
+    // [v0.5.0] narrativeBoundary — controls which automatic flush paths are enabled
+    narrativeBoundary: normalizeNarrativeBoundaryConfig(rawConfig),
     enableBackgroundWorkers: rawConfig?.enableBackgroundWorkers ?? true,
     lexicalPreFilterLimit: rawConfig?.lexicalPreFilterLimit ?? 1000,
     reserveTokens: rawConfig?.reserveTokens ?? 2048,

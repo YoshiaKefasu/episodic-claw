@@ -124,6 +124,28 @@
           }
         }
       },
+      "narrativeBoundary": {
+        "type": "object",
+        "description": "[v0.5.0] Controls which automatic narrative episode creation paths are enabled. Each toggle defaults to true for backward compatibility. Disabling a toggle does NOT affect Surprise checkpoint recording, near-64K prefix flush, or manual ep-boundary.",
+        "additionalProperties": false,
+        "properties": {
+          "autoIdleFlush": {
+            "type": "boolean",
+            "default": true,
+            "description": "Auto-flush buffer after a quiet period (idle timeout). Default: true.\n⚠️ [Blast Radius] If false: quiet-period episode creation stops and buffers may wait for manual/near-64K/safety paths."
+          },
+          "autoTimeGapFlush": {
+            "type": "boolean",
+            "default": true,
+            "description": "Auto-flush buffer when user-message timestamps have a large gap. Default: true.\n⚠️ [Blast Radius] If false: timestamp gaps no longer force a chapter close."
+          },
+          "autoSurpriseFlush": {
+            "type": "boolean",
+            "default": true,
+            "description": "Auto-flush buffer immediately when Surprise says the topic changed. Default: true. Note: Surprise checkpoint recording is independent of this toggle and always runs.\n⚠️ [Blast Radius] If false: Surprise still places bookmarks but no longer closes the chapter immediately."
+          }
+        }
+      },
       "enableBackgroundWorkers": {
         "type": "boolean",
         "description": "Enables background maintenance workers: HealingWorker (auto-rebuilds lexical/vector indexes, handles embedding 429 recovery). Default: true.\n⚠️ If false: Index auto-repair and embedding rate-limit recovery are disabled. Narrative generation continues normally."

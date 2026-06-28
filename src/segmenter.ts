@@ -77,6 +77,10 @@ export class EventSegmenter {
   private segmentationFallbackThreshold: number;
   // Surprise improvements (v0.4.0 Phase 3)
   private segmentationTimeGapMinutes: number;
+  // [v0.5.0] Auto-flush boundary switches — default true for backward compatibility
+  private autoIdleFlush: boolean;
+  private autoTimeGapFlush: boolean;
+  private autoSurpriseFlush: boolean;
   // Idle flush timer (v0.4.3): auto-flush buffer after silence
   private idleFlushTimer: NodeJS.Timeout | null = null;
   private lastBufferActivityAt = 0;
@@ -420,6 +424,9 @@ export class EventSegmenter {
       stdFloor?: number;
       fallbackThreshold?: number;
       timeGapMinutes?: number;
+      autoIdleFlush?: boolean;
+      autoTimeGapFlush?: boolean;
+      autoSurpriseFlush?: boolean;
     },
     pool?: NarrativePool | null,
     narrativeWorker?: NarrativeWorker | null,
@@ -434,6 +441,10 @@ export class EventSegmenter {
     this.segmentationStdFloor = Math.max(0.0001, tuning?.stdFloor ?? 0.01);
     this.segmentationFallbackThreshold = Math.max(0, tuning?.fallbackThreshold ?? 0.2);
     this.segmentationTimeGapMinutes = tuning?.timeGapMinutes ?? 15;
+    // [v0.5.0] Auto-flush boundary switches — default true for backward compatibility
+    this.autoIdleFlush = tuning?.autoIdleFlush ?? true;
+    this.autoTimeGapFlush = tuning?.autoTimeGapFlush ?? true;
+    this.autoSurpriseFlush = tuning?.autoSurpriseFlush ?? true;
     this.pool = pool ?? null;
     this.narrativeWorker = narrativeWorker ?? null;
     // [v0.4.31b] constructor-init via getEnvVal (ClawHub scanner false positive avoidance)
@@ -466,6 +477,13 @@ export class EventSegmenter {
    * Fires after `segmentationTimeGapMinutes` of no new activity.
    */
   private scheduleIdleFlush(agentWs: string, agentId: string): void {
+    // [v0.5.0 Phase C] When autoIdleFlush is disabled, clear any existing timer and bail.
+    // This covers all callers uniformly: WAL restore, processTurn, prefix flush, error fallback.
+    if (!this.autoIdleFlush) {
+      this.clearIdleFlushTimer();
+      return;
+    }
+
     if (this.buffer.length === 0) return;
 
     this.clearIdleFlushTimer();
@@ -681,7 +699,9 @@ export class EventSegmenter {
     const sizeLimitExceeded = this.bufferTokenCount >= HARD_TOKEN_CAP;
 
     // Phase 3: Time gap boundary check
-    if (this.isTimeGapBoundary(dedupedMessages)) {
+    // [v0.5.0 Phase D] Gate: when autoTimeGapFlush is disabled, skip the time-gap auto-send
+    // path. Messages continue through Surprise scoring and normal buffering.
+    if (this.autoTimeGapFlush && this.isTimeGapBoundary(dedupedMessages)) {
       console.log(`[Episodic Memory] Time gap boundary detected (${this.segmentationTimeGapMinutes}min threshold). Forcing segment...`);
       // [v0.4.22b] WAL: rotate before boundary processing
       const timeGapFlushId = this.walRotateForFlush(agentWs, agentId);
@@ -719,7 +739,9 @@ export class EventSegmenter {
       });
 
       const surprise = score?.rawSurprise ?? 0;
-      let shouldBoundary = sizeLimitExceeded || !!score?.isBoundary;
+      // [v0.5.0 Phase E] Gate: when autoSurpriseFlush is disabled, Surprise still scores
+      // and records checkpoints, but does not immediately force a segment boundary.
+      let shouldBoundary = sizeLimitExceeded || (this.autoSurpriseFlush && !!score?.isBoundary);
 
       // [v0.5.0 Phase 1.5] Record latest meaningful Surprise checkpoint
       // Checkpoint rules: (1) score.isBoundary === true, OR
@@ -767,6 +789,15 @@ export class EventSegmenter {
           `[Episodic Memory] SegmentScore: raw=${surprise.toFixed(4)} ` +
           `mean=${mean} std=${std} threshold=${th} z=${z} ` +
           `boundary=${shouldBoundary} reason=${score?.reason ?? "n/a"}`
+        );
+      }
+
+      // [v0.5.0 Phase E] Diagnostic: when Surprise fires isBoundary but autoSurpriseFlush
+      // is off, log it so operators don't mistake suppression for a broken Surprise score.
+      if (!this.autoSurpriseFlush && score?.isBoundary) {
+        console.log(
+          `[Episodic Memory] Surprise isBoundary=true suppressed by autoSurpriseFlush=false. ` +
+          `Checkpoint recorded at index=${this.latestSurpriseCheckpoint?.index ?? "n/a"}.`
         );
       }
 

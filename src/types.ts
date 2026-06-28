@@ -187,6 +187,10 @@ export interface EpisodicPluginConfig {
   narrativeGuardMinLatinWords?: number;
   /** Weekly unused-episode forgetting sweep config. Default: disabled. */
   forgettingEpisodic?: ForgettingConfig;
+  /** [v0.5.0] Controls which automatic narrative episode creation paths are enabled.
+   *  Default: all true (backward compatible). Disabling a toggle does NOT affect
+   *  Surprise checkpoint recording, near-64K prefix flush, or manual ep-boundary. */
+  narrativeBoundary?: NarrativeBoundaryConfig;
 }
 
 export interface RecallCalibration {
@@ -343,6 +347,19 @@ export interface ForgettingConfig {
   retentionDays?: number;
   /** TTL (days) for forgotten records before physical delete. Default: 14. */
   physicalDeleteTtlDays?: number;
+}
+
+/** [v0.5.0] Controls which automatic narrative episode creation paths are enabled.
+ *  Each toggle defaults to true for backward compatibility.
+ *  Disabling a toggle does NOT disable Surprise observation or checkpoint recording. */
+export interface NarrativeBoundaryConfig {
+  /** Auto-flush buffer after a quiet period (idle timeout). Default: true. */
+  autoIdleFlush?: boolean;
+  /** Auto-flush buffer when user-message timestamps have a large gap. Default: true. */
+  autoTimeGapFlush?: boolean;
+  /** Auto-flush buffer immediately when Surprise says the topic changed. Default: true.
+   *  Note: Surprise checkpoint recording is independent of this toggle and always runs. */
+  autoSurpriseFlush?: boolean;
 }
 
 // --- [v0.5.0 Phase 4] Boundary state for Go persistence ---
