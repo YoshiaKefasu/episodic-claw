@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.5.0] - 2026-06-28
+
+### Added
+- **Agent-driven narrative boundary tool (`ep-boundary`)**: Kasou can now manually close the current live conversation buffer and attach a short boundary note/title hint without polluting the raw transcript. Boundary metadata is carried as separate queue fields and rendered into the narrative prompt as an out-of-band `{boundaryNoteBlock}`.
+- **Near-64K checkpoint prefix flush**: when the live buffer approaches the soft narrative limit, Episodic-Claw now flushes only the prefix up to the latest valid Surprise checkpoint and keeps the suffix live for the next episode.
+- **Go-backed boundary/checkpoint state (small-state persistence)**: Phase 3/4 store and restore boundary intent + Surprise checkpoint metadata through the Go sidecar while keeping the live buffer and WAL in TypeScript.
+
+### Changed
+- **Configurable auto-boundary behavior** via new `narrativeBoundary` config object:
+  - `autoIdleFlush`
+  - `autoTimeGapFlush`
+  - `autoSurpriseFlush`
+
+  All three default to `true` for backward compatibility.
+
+- **Quiet-room / time-gap / immediate Surprise auto-send can now be disabled independently** while keeping the safety rails alive.
+
+### Preserved
+- **Manual `ep-boundary` always remains available**.
+- **Surprise checkpoint recording remains active even when `autoSurpriseFlush=false`**.
+- **near-64K prefix flush remains always active** and is not user-disableable.
+- **Hard safety flush at the size limit remains always active**.
+
+### Technical
+- Added focused tests for:
+  - idle auto-send gate
+  - time-gap auto-send gate
+  - Surprise auto-send gate
+  - near-64K checkpoint preservation under suppressed Surprise auto-send
+- Updated v0.5.0 addendum plan with implementation status and verification notes.
+
+### Release status
+- **GitHub**: published as a **Pre Release** even though the version number is the normal `v0.5.0`.
+- **ClawHub note**: *Probably this version still on pre-release testing phase. You could monitor Github Release Status to see if this version was stable.*
+
 ## [0.4.35-pre.release] - 2026-06-09
 
 ### Removed
