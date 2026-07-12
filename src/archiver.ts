@@ -6,6 +6,7 @@ import { BatchIngestItem } from "./types";
 import { splitIntoChunks, enqueueNarrativeChunks } from "./narrative-queue";
 import { normalizeMessageText } from "./large-payload";
 import { buildSummaryForLevel } from "./summary-escalation";
+import { formatNarrativeTranscript } from "./narrative-transcript";
 
 /**
  * EpisodicArchiver — pre-compaction memory protection.
@@ -154,7 +155,7 @@ export class EpisodicArchiver {
             } else if (typeof obj.message.content === "string") {
               contentStr = obj.message.content;
             }
-            allMsgs.push({ ...obj.message, content: contentStr });
+            allMsgs.push({ ...obj.message, content: contentStr, timestamp: obj.timestamp ?? obj.message?.timestamp });
           }
         } catch { /* skip malformed lines */ }
       }
@@ -185,7 +186,14 @@ export class EpisodicArchiver {
     if (unprocessed.length > 50) {
       // v0.4.2: Large gap → split into 64K chunks and enqueue to cache DB
       console.log(`[Episodic Memory] Large gap detected (${unprocessed.length} msgs). Enqueuing to cache...`);
-      const rawText = unprocessed.map(m => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`).join("\n\n");
+      // [v0.5.0 addendum] Use shared formatter for timestamped transcript
+      const rawText = formatNarrativeTranscript(
+        unprocessed.map(m => ({
+          role: m.role,
+          text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+          timestamp: m.timestamp,
+        })),
+      );
       try {
         const chunks = splitIntoChunks(rawText, params.agentWs, params.agentId, "gap-archive", "gap-archive", 0);
         await enqueueNarrativeChunks(this.rpcClient, chunks, () => this.segmenter.wakeNarrativeWorker());

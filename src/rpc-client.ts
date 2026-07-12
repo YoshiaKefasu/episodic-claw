@@ -10,6 +10,10 @@ import * as https from "https";
 import { createRequire } from "node:module";
 const modRequire = createRequire(__filename);
 import type { CacheQueueItem } from "./narrative-queue";
+import { formatNarrativeTranscript } from "./narrative-transcript";
+// [v0.5.0 addendum] Pure leaf parser — re-exported for backward compatibility
+import { parseJsonlToMessages as _parseJsonlToMessages } from "./cold-start-session";
+export { parseJsonlToMessages } from "./cold-start-session";
 
 import { FileEvent, EpisodeMetadata, MarkdownDocument, Watermark, BatchIngestItem, SegmentScoreResult, RecallCalibration, RecallRpcEpisodeResult, JapaneseQueryParseResult, ForgottenSummary, GoForceBoundaryResult, BoundaryState, BoundaryStateGetResponse, BoundaryStateSetResponse } from "./types";
 import { agentWsHash } from "./utils";
@@ -1031,43 +1035,9 @@ export class FileEventDebouncer {
 // Cold-Start Ingestion Helpers
 // ──────────────────────────────────────────────────────────────────────────
 
-/**
- * parseJsonlToMessages reads a .jsonl session file and extracts user/assistant messages.
- * Handles both string and array-of-objects content formats.
- */
-export function parseJsonlToMessages(sessionFile: string): Array<{ role: string; content: string }> {
-  const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
-  const messages: Array<{ role: string; content: string }> = [];
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type !== "message" || entry.message?.role === "system") continue;
-
-      const role = entry.message.role;
-      const rawContent = entry.message.content;
-      let text = "";
-
-      if (typeof rawContent === "string") {
-        text = rawContent;
-      } else if (Array.isArray(rawContent)) {
-        text = rawContent
-          .filter((c: any) => c.type === "text")
-          .map((c: any) => c.text)
-          .join("\n");
-      }
-
-      if (text.trim()) {
-        messages.push({ role, content: text });
-      }
-    } catch {
-      // Skip malformed lines
-    }
-  }
-
-  return messages;
-}
+// parseJsonlToMessages is now in src/cold-start-session.ts and re-exported above.
+// Legacy alias preserved for internal callers.
+const parseJsonlToMessages = _parseJsonlToMessages;
 
 /**
  * ingestColdStartSession converts a .jsonl session into narrative cache queue items.
@@ -1085,8 +1055,10 @@ export async function ingestColdStartSession(
   const messages = parseJsonlToMessages(sessionFile);
   if (messages.length === 0) return 0;
 
-  // Combine all messages into a single raw text blob
-  const rawText = messages.map(m => `${m.role}: ${m.content}`).join("\n\n");
+  // [v0.5.0 addendum] Use shared formatter for timestamped transcript
+  const rawText = formatNarrativeTranscript(
+    messages.map(m => ({ role: m.role, text: m.content, timestamp: m.timestamp })),
+  );
 
   if (hasApiKey) {
     // v0.4.2: Split into 64K chunks and enqueue to cache DB for narrativization
@@ -1118,7 +1090,10 @@ export async function ingestColdStartSession(
     const chunkSize = 50;
     for (let i = 0; i < messages.length; i += chunkSize) {
       const chunk = messages.slice(i, i + chunkSize);
-      const body = chunk.map(m => `${m.role}: ${m.content}`).join("\n\n");
+      // [v0.5.0 addendum] Use shared formatter for timestamped transcript in fallback
+      const body = formatNarrativeTranscript(
+        chunk.map(m => ({ role: m.role, text: m.content, timestamp: m.timestamp })),
+      );
       const slug = `genesis-chunk-${String(Math.floor(i / chunkSize)).padStart(4, "0")}`;
       const mdPath = path.join(dateDir, `${slug}.md`);
 
@@ -1144,7 +1119,7 @@ export async function ingestColdStartSession(
  * Fallback: use the old triggerBackgroundIndex path if cache enqueue fails.
  */
 async function ingestColdStartSessionFallback(
-  messages: Array<{ role: string; content: string }>,
+  messages: Array<{ role: string; content: string; timestamp?: string }>,
   agentWs: string,
   client: EpisodicCoreClient
 ): Promise<void> {

@@ -5,6 +5,7 @@
 import { splitIntoChunks, detectRoleLine } from "./src/narrative-queue";
 import { NarrativePool } from "./src/narrative-pool";
 import type { Message } from "./src/segmenter";
+import { formatNarrativeTranscript, formatTranscriptMessageLines } from "./src/narrative-transcript";
 
 let passed = 0;
 let failed = 0;
@@ -21,13 +22,25 @@ function assert(label: string, actual: any, expected: any) {
   }
 }
 
+function assertIncludes(label: string, actual: string, substr: string) {
+  if (actual.includes(substr)) {
+    console.log(`  ✅ ${label}`);
+    passed++;
+  } else {
+    console.error(`  ❌ ${label}`);
+    console.error(`     Expected to include: ${JSON.stringify(substr)}`);
+    console.error(`     Actual: ${JSON.stringify(actual)}`);
+    failed++;
+  }
+}
+
 console.log("\n=== Narrative Chunking Tests (v0.4.19b) ===");
 
 // === Fix 5a: Role labels in rawText (buildFlushItem) ===
 
 console.log("\n[1] buildFlushItem Role Labels");
 
-const pool = new NarrativePool(100000);
+const pool = new NarrativePool();
 
 pool.add([
   { role: "user", content: "テスト送るね" },
@@ -313,6 +326,132 @@ assert(
   fixedLineToRole.get("user: Thanks for the help") === "user",
   true
 );
+
+
+// === [v0.5.0 addendum] Timestamped role detection tests ===
+
+console.log("\n[9] detectRoleLine — timestamped role lines");
+
+assert(
+  "detectRoleLine detects '[19:30] user: ' prefix",
+  detectRoleLine("[19:30] user: Hello"),
+  "user"
+);
+
+assert(
+  "detectRoleLine detects '[08:15] assistant: ' prefix",
+  detectRoleLine("[08:15] assistant: Response here"),
+  "assistant"
+);
+
+assert(
+  "detectRoleLine returns null for timestamp line without role",
+  detectRoleLine("[19:30] some text"),
+  null
+);
+
+assert(
+  "detectRoleLine still detects legacy 'user: ' prefix",
+  detectRoleLine("user: Legacy message"),
+  "user"
+);
+
+assert(
+  "detectRoleLine still detects legacy 'assistant: ' prefix",
+  detectRoleLine("assistant: Legacy response"),
+  "assistant"
+);
+
+// === [v0.5.0 addendum] Timestamped structured path with messages ===
+
+console.log("\n[10] splitIntoChunks — timestamped structured path");
+
+const tsMessages: Message[] = [
+  { role: "user", content: "Hello", timestamp: "2026-07-05T12:00:00Z" },
+  { role: "assistant", content: "Hi there", timestamp: "2026-07-05T12:02:00Z" },
+];
+// The formatter produces: "(2026-07-06 Sunday)\n[19:00] user: Hello\n[19:02] assistant: Hi there"
+const tsRawText = formatNarrativeTranscript(tsMessages.map(m => ({
+    role: m.role,
+    text: m.content as string,
+    timestamp: m.timestamp,
+  })), { timeZone: "Asia/Jakarta" });
+const tsChunks = splitIntoChunks(tsRawText, "/ws", "main", "live-turn", "size-limit", 0, tsMessages);
+assert(
+  "timestamped single chunk is returned",
+  tsChunks.length === 1,
+  true
+);
+assertIncludes(
+  "timestamped chunk contains formatted lines",
+  tsChunks[0].rawText,
+  "[19:00] user: Hello"
+);
+
+// === [v0.5.0 addendum] Structured assistant literal 'user:' protection with timestamps ===
+
+console.log("\n[11] Timestamped structured path — literal 'user:' inside assistant");
+
+const trickyTsMessages: Message[] = [
+  { role: "assistant", content: "I created a user: command for testing", timestamp: "2026-07-05T12:00:00Z" },
+  { role: "user", content: "Thanks", timestamp: "2026-07-05T12:02:00Z" },
+];
+const trickyTsRawText = formatNarrativeTranscript(trickyTsMessages.map(m => ({
+    role: m.role,
+    text: m.content as string,
+    timestamp: m.timestamp,
+  })), { timeZone: "Asia/Jakarta" });
+const trickyTsChunks = splitIntoChunks(trickyTsRawText, "/ws", "main", "live-turn", "size-limit", 0, trickyTsMessages);
+assert(
+  "timestamped tricky chunk returns single chunk",
+  trickyTsChunks.length === 1,
+  true
+);
+// The structured path should map the embedded "user:" line to assistant, not user
+const trickyLineToRoleTs = new Map<string, "user" | "assistant" | null>();
+for (const m of trickyTsMessages) {
+  const text = m.content as string;
+  const role = m.role === "user" || m.role === "assistant" ? m.role : null;
+  const formattedLines = formatTranscriptMessageLines({ role: m.role, text, timestamp: m.timestamp }, { timeZone: "Asia/Jakarta" });
+  for (const fLine of formattedLines) {
+    if (!trickyLineToRoleTs.has(fLine)) {
+      trickyLineToRoleTs.set(fLine, role);
+    }
+  }
+}
+// The line "[19:00] assistant: I created a user: command for testing" should map to assistant
+const assistantTsLine = Array.from(trickyLineToRoleTs.keys()).find(k => k.includes("I created a user:"));
+assert(
+  "structured path maps timestamped assistant line with embedded 'user:' to assistant",
+  assistantTsLine ? trickyLineToRoleTs.get(assistantTsLine) === "assistant" : false,
+  true
+);
+
+// === [v0.5.0 addendum] Legacy no-timestamp chunking unchanged ===
+
+console.log("\n[12] Legacy no-timestamp chunking — backward compat");
+
+const legacyLines: string[] = [];
+for (let i = 0; i < 2000; i++) {
+  legacyLines.push(`user: Message ${i}. ${"Padding text to ensure adequate token count. ".repeat(3)}`);
+  legacyLines.push(`assistant: Response ${i}. ${"More padding for realistic message size in the chunking test. ".repeat(3)}`);
+}
+const legacyRawText = legacyLines.join("\n");
+const legacyChunks = splitIntoChunks(legacyRawText, "/ws", "main", "live-turn", "size-limit", 0);
+assert(
+  "legacy no-timestamp chunking produces multiple chunks",
+  legacyChunks.length > 1,
+  true
+);
+// Verify no date headers in legacy chunks
+let hasDateHeader = false;
+for (const chunk of legacyChunks) {
+  if (/\(\d{4}-\d{2}-\d{2}/.test(chunk.rawText.split("\n")[0])) {
+    hasDateHeader = true;
+    break;
+  }
+}
+assert("legacy chunks have no date headers", hasDateHeader, false);
 
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

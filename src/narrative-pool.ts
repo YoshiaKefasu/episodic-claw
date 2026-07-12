@@ -6,6 +6,7 @@
 import { extractText } from "./segmenter";
 import type { Message } from "./segmenter";
 import { PoolFlushItem, BoundaryMetadata } from "./types";
+import { formatNarrativeTranscript } from "./narrative-transcript";
 
 export class NarrativePool {
   private buffer: Message[] = [];
@@ -62,17 +63,16 @@ export class NarrativePool {
   }
 
   private buildFlushItem(reason: PoolFlushItem["reason"], surprise: number, agentWs: string, agentId: string): PoolFlushItem {
-    // [v0.4.19b] Role labels for conversation-boundary-aware chunking + narrative model context
-    // Format: "role: text" — only for primary conversation roles (user, assistant)
-    const rawText = this.buffer
+    // [v0.5.0 addendum] Use shared formatter for timestamped narrative transcript.
+    // Converts pool messages into TranscriptMessage values with their original m.timestamp.
+    const transcriptMessages = this.buffer
       .map((m) => {
         const text = extractText(m.content);
-        if (!text) return "";
-        const role = m.role === "user" || m.role === "assistant" ? m.role : null;
-        return role ? `${role}: ${text}` : text;
+        if (!text) return null;
+        return { role: m.role, text, timestamp: m.timestamp };
       })
-      .filter(Boolean)
-      .join("\n");
+      .filter((m): m is NonNullable<typeof m> => m !== null);
+    const rawText = formatNarrativeTranscript(transcriptMessages);
 
     return {
       messages: [...this.buffer],

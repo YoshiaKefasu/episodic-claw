@@ -9,6 +9,7 @@ import { estimateTokens } from "./utils";
 import type { Message } from "./segmenter";
 import { extractText } from "./segmenter";
 import type { BoundaryMetadata } from "./types";
+import { formatTranscriptMessageLines } from "./narrative-transcript";
 
 // [v0.5.0 Phase 1.5] Exported for near-64K trigger in segmenter.ts
 export const SOFT_TOKEN_TARGET = 48_000;
@@ -51,8 +52,16 @@ let _chunkCounter = 0;
  * [v0.4.19b] Detect if a line is a role-labeled conversation boundary.
  * Returns the role prefix ("user" or "assistant") or null.
  * Used as fallback when messages[] is not available (cold-start, gap-archive).
+ *
+ * [v0.5.0 addendum] Recognizes both legacy and timestamped role lines:
+ *   - `user: text`
+ *   - `[19:30] user: text`
  */
 export function detectRoleLine(line: string): "user" | "assistant" | null {
+  // Timestamped: [HH:mm] role: ...
+  const tsMatch = line.match(/^\[\d{2}:\d{2}\]\s+(user|assistant):\s/);
+  if (tsMatch) return tsMatch[1] as "user" | "assistant";
+  // Legacy: role: ...
   if (line.startsWith("user: ")) return "user";
   if (line.startsWith("assistant: ")) return "assistant";
   return null;
@@ -119,21 +128,21 @@ export function splitIntoChunks(
   let lastRoleInChunk: string | null = null;
 
   // [v0.4.19b] Build line→role mapping from messages[] for structured path
-  // Key fix: multi-line message content (e.g. assistant code blocks) must be split
-  // into individual lines so each sub-line maps to the message's real role.
-  // Without this, a line like "user: I need help" embedded in an assistant response
-  // would fail the Map lookup and fall back to detectRoleLine() → false positive.
+  // [v0.5.0 addendum] Use formatTranscriptMessageLines() to get exact formatted lines,
+  // ensuring the lineToRole map matches the actual rawText produced by the formatter.
   const lineToRole = new Map<string, "user" | "assistant" | null>();
   if (messages && messages.length > 0) {
     for (const m of messages) {
       const text = extractText(m.content);
       if (!text) continue;
       const role = m.role === "user" || m.role === "assistant" ? m.role : null;
-      const labeledLine = role ? `${role}: ${text}` : text;
-      // Split multi-line content so each sub-line maps to the message's role
-      for (const subLine of labeledLine.split("\n")) {
-        if (!lineToRole.has(subLine)) {  // first-occurrence wins on collision
-          lineToRole.set(subLine, role);
+      const formattedLines = formatTranscriptMessageLines(
+        { role: m.role, text, timestamp: m.timestamp },
+      );
+      // Map each formatted line to the message's real role
+      for (const fLine of formattedLines) {
+        if (!lineToRole.has(fLine)) {  // first-occurrence wins on collision
+          lineToRole.set(fLine, role);
         }
       }
     }
@@ -172,14 +181,59 @@ export function splitIntoChunks(
   };
 
   let chunkIndex = 0;
+  // [v0.5.0 addendum] Track active date header for carry-forward across splits
+  let activeDateHeader: string | null = null;
+
   for (const line of lines) {
     const lineTokens = estimateTokens(line);
     // [v0.4.19b] Determine role for this line — structured path first, string fallback
     const lineRole = lineToRole.get(line) ?? detectRoleLine(line);
 
+    // [v0.5.0 addendum] Detect date header lines: (YYYY-MM-DD Weekday)
+    const isDateHeader = /^\(\d{4}-\d{2}-\d{2}\s+\w+\)$/.test(line);
+    if (isDateHeader) {
+      activeDateHeader = line;
+    }
+
+    // [v0.5.0 addendum] Hard cap: force split even mid-line if needed.
+    // Checked BEFORE soft-cap so oversized timestamped lines are handled without
+    // creating standalone header-only chunks. Every hard-cap segment in timestamped
+    // context receives the active date header.
+    if (lineTokens > HARD_TOKEN_CAP) {
+      // Push any accumulated lines first
+      if (currentLines.length > 0) {
+        pushChunk(currentLines, chunkIndex);
+        chunkIndex++;
+        currentLines = [];
+        currentTokens = 0;
+        lastRoleInChunk = null;
+      }
+      // Prepend active date header to the first hard-cap segment if timestamped context.
+      // This handles the case where the oversized line is the first line in a new chunk
+      // (after the accumulated push) and the soft-split header-prepend path never ran.
+      const useHeader = (activeDateHeader && !isDateHeader &&
+        (lineRole || /^\[\d{2}:\d{2}\]\s/.test(line)))
+        ? activeDateHeader : null;
+      // Reduce segment size to account for header token cost so resulting chunks
+      // do not exceed HARD_TOKEN_CAP due to the injected header.
+      const headerTokens = useHeader ? estimateTokens(useHeader) : 0;
+      const effectiveCap = HARD_TOKEN_CAP - headerTokens;
+      const maxChars = Math.floor((effectiveCap * 3) * 0.9); // rough: 1 token ≈ 3 chars
+      // Split the long line — EVERY segment gets the header (timestamped context)
+      let remaining = line;
+      while (remaining.length > 0) {
+        const segment = remaining.slice(0, maxChars);
+        remaining = remaining.slice(maxChars);
+        const segLines = useHeader ? [useHeader, segment] : [segment];
+        pushChunk(segLines, chunkIndex);
+        chunkIndex++;
+      }
+      continue;
+    }
+
     // If adding this line exceeds soft target, push current chunk
     if (currentTokens + lineTokens > SOFT_TOKEN_TARGET && currentLines.length > 0) {
-      if (!lineRole) {
+      if (!lineRole && !isDateHeader) {
         console.log(
           `[Episodic Cache] Chunk split at non-conversation boundary ` +
           `(chunkIndex=${chunkIndex}, lastRole=${lastRoleInChunk}). ` +
@@ -191,28 +245,17 @@ export function splitIntoChunks(
       currentLines = [];
       currentTokens = 0;
       lastRoleInChunk = null;
-    }
-
-    // Hard cap: force split even mid-line if needed
-    if (lineTokens > HARD_TOKEN_CAP) {
-      // Push any accumulated lines first
-      if (currentLines.length > 0) {
-        pushChunk(currentLines, chunkIndex);
-        chunkIndex++;
-        currentLines = [];
-        currentTokens = 0;
-        lastRoleInChunk = null;
+      // [v0.5.0 addendum] After a soft split, prepend active date header to the new chunk
+      // if we are in a timestamped context (activeDateHeader is set) and the current line
+      // is not itself a date header. This covers:
+      // - Timestamped line ([HH:mm] role: …) → header placed before it
+      // - Continuation line of a multi-line timestamped message → date context preserved
+      // - Any other content in a timestamped context → date context preserved
+      // Does NOT fire for date header lines (they carry their own date).
+      if (activeDateHeader && !isDateHeader) {
+        currentLines.push(activeDateHeader);
+        currentTokens += estimateTokens(activeDateHeader);
       }
-      // Split the long line by character chunks (approximate)
-      const maxChars = Math.floor((HARD_TOKEN_CAP * 3) * 0.9); // rough: 1 token ≈ 3 chars
-      let remaining = line;
-      while (remaining.length > 0) {
-        const segment = remaining.slice(0, maxChars);
-        remaining = remaining.slice(maxChars);
-        pushChunk([segment], chunkIndex);
-        chunkIndex++;
-      }
-      continue;
     }
 
     currentLines.push(line);
