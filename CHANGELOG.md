@@ -6,6 +6,7 @@
 - **Agent-driven narrative boundary tool (`ep-boundary`)**: Kasou can now manually close the current live conversation buffer and attach a short boundary note/title hint without polluting the raw transcript. Boundary metadata is carried as separate queue fields and rendered into the narrative prompt as an out-of-band `{boundaryNoteBlock}`.
 - **Near-64K checkpoint prefix flush**: when the live buffer approaches the soft narrative limit, Episodic-Claw now flushes only the prefix up to the latest valid Surprise checkpoint and keeps the suffix live for the next episode.
 - **Go-backed boundary/checkpoint state (small-state persistence)**: Phase 3/4 store and restore boundary intent + Surprise checkpoint metadata through the Go sidecar while keeping the live buffer and WAL in TypeScript.
+- **Timestamped narrative transcripts**: the `{conversationText}` variable now renders messages with local-device timestamps (`[HH:mm] role: text`) and date headers (`(YYYY-MM-DD Weekday)`). Date headers are carried through soft splits, hard-cap splits, and cold-start JSONL imports. Non-primary roles and messages without timestamps retain the legacy format.
 
 ### Changed
 - **Configurable auto-boundary behavior** via new `narrativeBoundary` config object:
@@ -29,11 +30,35 @@
   - time-gap auto-send gate
   - Surprise auto-send gate
   - near-64K checkpoint preservation under suppressed Surprise auto-send
-- Updated v0.5.0 addendum plan with implementation status and verification notes.
+  - timestamp formatting, date headers, hard-cap carry-forward, cold-start JSONL parsing, multiline split continuity
+- Updated v0.5.0 addendum plans with implementation status and verification notes.
 
 ### Release status
 - **GitHub**: published as a **Pre Release** even though the version number is the normal `v0.5.0`.
 - **ClawHub note**: *Probably this version still on pre-release testing phase. You could monitor Github Release Status to see if this version was stable.*
+
+## [0.5.1] - 2026-07-12
+
+### Added
+- **Unified custom narrative prompt (`narrativeSystemPrompt: false`)**: setting `narrativeSystemPrompt` to the boolean `false` omits the system instruction entirely from both OpenRouter and Gemini API calls. Combined with `narrativeUserPromptTemplate`, a single custom file becomes the sole non-empty instruction sent to the LLM.
+- **Startup warning for unsafe no-system config**: when `narrativeSystemPrompt=false` and no `narrativeUserPromptTemplate` is provided, Episodic-Claw logs a concise warning that the default user template remains active.
+
+### Changed
+- **Provider request shape**: OpenRouter omits the `system` message when system prompt is empty. Gemini omits the `systemInstruction` field entirely (distinct from sending an empty string).
+- **Config normalization**: `resolveSystemPrompt()` in `src/config.ts` now preserves boolean `false` as a distinct sentinel through the pipeline, instead of coercing it to `""`.
+
+### Preserved
+- **Backward compatible**: omitting `narrativeSystemPrompt` or setting it to `""` still uses the code-default `DEFAULT_SYSTEM_PROMPT`.
+- **All existing configurations remain behaviorally unchanged**.
+
+### Technical
+- Added `checkNoSystemPromptWarning()` pure helper in `config.ts` with 6 deterministic tests.
+- Added OpenRouter and Gemini direct client tests for empty/non-empty system prompt request shape.
+- Fixed missing `narrative-transcript.js` / `cold-start-session.js` in 6 explicit test runtime copy lists.
+
+### Release status
+- **GitHub**: published as a **Pre Release**.
+- **ClawHub note**: *This version is in pre-release testing. Monitor GitHub Release Status for stability.*
 
 ## [0.4.35-pre.release] - 2026-06-09
 

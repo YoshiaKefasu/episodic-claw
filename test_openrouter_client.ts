@@ -160,7 +160,82 @@ async function main() {
   await testRetryOnWrapped503ThenSuccess();
   await testWrapped400IsNonRetriable();
   await testMissingChoicesClassified();
+  await testNoSystemMessageWhenEmpty();
+  await testSystemMessagePresentWhenNonEmpty();
   console.log("\n✅ test_openrouter_client.ts passed");
+}
+
+// [v0.5.1] Tests for no-system mode: empty system prompt omits system message entirely
+async function testNoSystemMessageWhenEmpty() {
+  const client = new OpenRouterClient({
+    apiKey: "test-key",
+    model: "openrouter/free",
+    temperature: 0.4,
+    timeoutMs: 3000,
+    maxRetries: 0,
+    baseRetryDelayMs: 0,
+    maxRetryDelayMs: 0,
+    baseUrl: "https://example.com/api/v1",
+  });
+
+  let capturedBody: any = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: any) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "narrative only" } }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await client.chatCompletion({ systemPrompt: "", userMessage: "user content" });
+    assert.equal(result, "narrative only");
+    assert.ok(capturedBody, "should have captured request body");
+    assert.equal(capturedBody.messages.length, 1, "should have exactly 1 message (user only)");
+    assert.equal(capturedBody.messages[0].role, "user", "the single message should be user role");
+    assert.equal(capturedBody.messages[0].content, "user content");
+    console.log("  ✓ empty system prompt sends only user message (no system role)");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testSystemMessagePresentWhenNonEmpty() {
+  const client = new OpenRouterClient({
+    apiKey: "test-key",
+    model: "openrouter/free",
+    temperature: 0.4,
+    timeoutMs: 3000,
+    maxRetries: 0,
+    baseRetryDelayMs: 0,
+    maxRetryDelayMs: 0,
+    baseUrl: "https://example.com/api/v1",
+  });
+
+  let capturedBody: any = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: any) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "narrative" } }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await client.chatCompletion({ systemPrompt: "system instruction", userMessage: "user content" });
+    assert.equal(result, "narrative");
+    assert.ok(capturedBody, "should have captured request body");
+    assert.equal(capturedBody.messages.length, 2, "should have 2 messages (system + user)");
+    assert.equal(capturedBody.messages[0].role, "system");
+    assert.equal(capturedBody.messages[0].content, "system instruction");
+    assert.equal(capturedBody.messages[1].role, "user");
+    assert.equal(capturedBody.messages[1].content, "user content");
+    console.log("  ✓ non-empty system prompt sends system + user messages");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 main().catch((err) => {

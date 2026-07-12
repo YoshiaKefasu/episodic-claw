@@ -603,3 +603,159 @@ module.exports = { detectLanguage: () => "en", detectLanguageDetailed: () => ({ 
   }
 
 }
+
+// [v0.5.1] Test that narrativeSystemPrompt=false resolves to empty string (no-system mode)
+// while custom user template placeholders are still resolved correctly.
+export async function runNarrativeWorkerFalseSystemMode(): Promise<void> {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `episodic-claw-false-system-${process.pid}-`));
+  const tempCjsPath = path.join(tempDir, "narrative-worker.cjs");
+  fs.copyFileSync(path.resolve("dist", "narrative-worker.js"), tempCjsPath);
+  const distFiles = fs.readdirSync(path.resolve("dist"));
+  for (const file of distFiles) {
+    const src = path.resolve("dist", file);
+    if (fs.statSync(src).isFile()) {
+      fs.copyFileSync(src, path.join(tempDir, file));
+    }
+  }
+  // Stub lang-detect.js for CJS require context
+  fs.writeFileSync(
+    path.join(tempDir, "lang-detect.js"),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initLanguageDetector = initLanguageDetector;
+exports.detectLanguage = detectLanguage;
+exports.detectLanguageDetailed = detectLanguageDetailed;
+async function initLanguageDetector() { return true; }
+function detectLanguage(_text) { return "unknown"; }
+function detectLanguageDetailed(_text) { return { lang: "unknown", confidence: 0, isReliable: false }; }
+`,
+    "utf8"
+  );
+  const req = createRequire(import.meta.url);
+  const workerModule = req(tempCjsPath);
+  const NarrativeWorker = workerModule.NarrativeWorker;
+  if (!NarrativeWorker) {
+    throw new Error("NarrativeWorker class not found in compiled module");
+  }
+
+  try {
+    // Test 1: false mode → system prompt resolves to empty string
+    {
+      let capturedSystem: string | undefined;
+      let capturedUser: string | undefined;
+      const mockOpenRouter = {
+        chatCompletion: async (params: { systemPrompt: string; userMessage: string }) => {
+          capturedSystem = params.systemPrompt;
+          capturedUser = params.userMessage;
+          return "test narrative";
+        },
+      };
+      const mockRpcClient = {
+        getNarrativeSaveHashes: async () => ({}),
+        cacheLeaseNext: async () => null,
+        cacheAck: async () => "ok",
+        cacheRetry: async () => "ok",
+        batchIngest: async () => ["test-slug"],
+        cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+        request: async () => null,
+        setMeta: async () => "ok",
+        getMeta: async () => null,
+        recall: async () => [],
+        recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+      };
+      const mockConfig = {
+        openrouterModel: "test-model",
+        openrouterConfig: { model: "test-model" },
+        narrativeSystemPrompt: false as const,
+        narrativeUserPromptTemplate: "Previous: {previousEpisode}\nBoundary: {boundaryNoteBlock}\nLog: {conversationText}",
+        narrativePreviousEpisodeRef: true,
+      };
+
+      const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+      // Access private resolveSystemPrompt via any cast
+      const resolved = (worker as any).resolveSystemPrompt();
+      assert.equal(resolved, "", "false should resolve to empty string in worker");
+
+      // Test user template resolution
+      const userResolved = (worker as any).resolveUserPrompt("prev-ep", "conv-text", undefined);
+      assert.ok(userResolved.includes("prev-ep"), "user template should resolve {previousEpisode}");
+      assert.ok(userResolved.includes("conv-text"), "user template should resolve {conversationText}");
+      assert.ok(userResolved.includes("Previous:"), "user template should preserve custom structure");
+      console.log("  ✓ false mode: system resolves to empty, user template placeholders resolved");
+    }
+
+    // Test 2: omitted system → DEFAULT_SYSTEM_PROMPT
+    {
+      const mockOpenRouter = {
+        chatCompletion: async () => "test",
+      };
+      const mockRpcClient = {
+        getNarrativeSaveHashes: async () => ({}),
+        cacheLeaseNext: async () => null,
+        cacheAck: async () => "ok",
+        cacheRetry: async () => "ok",
+        batchIngest: async () => ["test-slug"],
+        cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+        request: async () => null,
+        setMeta: async () => "ok",
+        getMeta: async () => null,
+        recall: async () => [],
+        recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+      };
+      const mockConfig = {
+        openrouterModel: "test-model",
+        openrouterConfig: { model: "test-model" },
+        narrativeSystemPrompt: undefined,
+        narrativeUserPromptTemplate: undefined,
+        narrativePreviousEpisodeRef: true,
+      };
+
+      const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+      const resolved = (worker as any).resolveSystemPrompt();
+      assert.ok(resolved.length > 0, "omitted system should fall back to DEFAULT_SYSTEM_PROMPT");
+      assert.ok(resolved.includes("Distill"), "should be the default system prompt content");
+      console.log("  ✓ omitted system: resolves to DEFAULT_SYSTEM_PROMPT");
+    }
+
+    // Test 3: false mode with no custom user template → default user template still works
+    {
+      const mockOpenRouter = {
+        chatCompletion: async () => "test",
+      };
+      const mockRpcClient = {
+        getNarrativeSaveHashes: async () => ({}),
+        cacheLeaseNext: async () => null,
+        cacheAck: async () => "ok",
+        cacheRetry: async () => "ok",
+        batchIngest: async () => ["test-slug"],
+        cacheGetLatestNarrative: async () => ({ episodeId: "", body: "", found: false }),
+        request: async () => null,
+        setMeta: async () => "ok",
+        getMeta: async () => null,
+        recall: async () => [],
+        recallFeedback: async () => ({ updated: 0, skipped: 0 }),
+      };
+      const mockConfig = {
+        openrouterModel: "test-model",
+        openrouterConfig: { model: "test-model" },
+        narrativeSystemPrompt: false as const,
+        narrativeUserPromptTemplate: undefined,
+        narrativePreviousEpisodeRef: true,
+      };
+
+      const worker = new NarrativeWorker(mockOpenRouter, mockRpcClient, mockConfig);
+      const systemResolved = (worker as any).resolveSystemPrompt();
+      assert.equal(systemResolved, "", "false mode system should be empty");
+
+      const userResolved = (worker as any).resolveUserPrompt("prev", "conv", undefined);
+      assert.ok(userResolved.includes("Previous episode"), "default user template should be used");
+      assert.ok(userResolved.includes("conv"), "default user template should resolve {conversationText}");
+      console.log("  ✓ false mode + no custom user: system empty, default user template active");
+    }
+
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
+
+  console.log("  narrative worker false system mode: all 3 tests passed");
+}

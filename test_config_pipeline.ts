@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadConfig, normalizeOpenRouterReasoning, _resetWarnedOpenrouterDeprecatedForTest } from "./src/config";
+import { loadConfig, normalizeOpenRouterReasoning, _resetWarnedOpenrouterDeprecatedForTest, checkNoSystemPromptWarning } from "./src/config";
 import type { EpisodicPluginConfig } from "./src/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -985,6 +985,111 @@ test("openclaw.plugin.json schema contains narrativeBoundary with additionalProp
   assert.ok(nb.properties.autoIdleFlush, "autoIdleFlush should exist");
   assert.ok(nb.properties.autoTimeGapFlush, "autoTimeGapFlush should exist");
   assert.ok(nb.properties.autoSurpriseFlush, "autoSurpriseFlush should exist");
+});
+
+// ─── 16. v0.5.1 narrativeSystemPrompt=false Tests ──────────────────────────────
+
+console.log("\n=== 16. v0.5.1 narrativeSystemPrompt=false Tests ===\n");
+
+test("narrativeSystemPrompt: false survives loadConfig() as false", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: false });
+  assert.equal(cfg.narrativeSystemPrompt, false, "false should survive normalization as exactly false");
+});
+
+test("narrativeSystemPrompt: undefined results in empty string (backward compat)", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.narrativeSystemPrompt, "", "omitted should be empty string");
+});
+
+test("narrativeSystemPrompt: empty string results in empty string (backward compat)", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: "" });
+  assert.equal(cfg.narrativeSystemPrompt, "", "empty string should remain empty");
+});
+
+test("narrativeSystemPrompt: non-empty inline string passes through", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: "custom system instruction" });
+  assert.equal(cfg.narrativeSystemPrompt, "custom system instruction");
+});
+
+test("narrativeSystemPrompt: numeric value is treated as missing (backward compat)", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: 123 as any });
+  assert.equal(cfg.narrativeSystemPrompt, "", "non-string non-false value should become empty string");
+});
+
+test("narrativeSystemPrompt: null is treated as missing (backward compat)", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: null as any });
+  assert.equal(cfg.narrativeSystemPrompt, "", "null should become empty string");
+});
+
+test("narrativeUserPromptTemplate: does NOT accept boolean false", () => {
+  const cfg = loadConfig({ narrativeUserPromptTemplate: false as any });
+  // resolvePrompt() returns "" for non-string values; false does not survive
+  assert.equal(cfg.narrativeUserPromptTemplate, "", "boolean false on user template should become empty string");
+});
+
+test("narrativeSystemPrompt: false with custom user template preserves both", () => {
+  const cfg = loadConfig({
+    narrativeSystemPrompt: false,
+    narrativeUserPromptTemplate: "custom user template with {previousEpisode}",
+  });
+  assert.equal(cfg.narrativeSystemPrompt, false, "system=false should survive");
+  assert.equal(cfg.narrativeUserPromptTemplate, "custom user template with {previousEpisode}");
+});
+
+test("narrativeSystemPrompt: false without custom user template is valid (no crash)", () => {
+  const cfg = loadConfig({ narrativeSystemPrompt: false });
+  assert.equal(cfg.narrativeSystemPrompt, false);
+  assert.equal(cfg.narrativeUserPromptTemplate, "", "user template should be empty when not provided");
+});
+
+test("openclaw.plugin.json schema has oneOf for narrativeSystemPrompt", () => {
+  const pluginJson = JSON.parse(readSource("openclaw.plugin.json"));
+  const nsp = pluginJson.configSchema.properties.narrativeSystemPrompt;
+  assert.ok(nsp, "narrativeSystemPrompt should exist in schema");
+  assert.ok(nsp.oneOf, "narrativeSystemPrompt should have oneOf for union type");
+  assert.equal(nsp.oneOf.length, 2, "oneOf should have 2 variants (string + false)");
+  // Check that one variant is string type
+  const hasString = nsp.oneOf.some((v: any) => v.type === "string");
+  assert.ok(hasString, "oneOf should include a string variant");
+  // Check that one variant is boolean false literal
+  const hasFalse = nsp.oneOf.some((v: any) => v.type === "boolean" && Array.isArray(v.enum) && v.enum.includes(false));
+  assert.ok(hasFalse, "oneOf should include a boolean false literal variant");
+});
+
+// ─── 17. v0.5.1 checkNoSystemPromptWarning Pure Helper Tests ────────────────
+
+console.log("\n=== 17. v0.5.1 checkNoSystemPromptWarning Pure Helper Tests ===\n");
+
+test("warning fires: false + empty user template", () => {
+  const msg = checkNoSystemPromptWarning(false, undefined);
+  assert.ok(msg, "should return warning message");
+  assert.ok(msg.includes("narrativeSystemPrompt=false"), "message should mention the config key");
+  assert.ok(msg.includes("default user template remains active"), "message should mention default template");
+});
+
+test("warning fires: false + empty string user template", () => {
+  const msg = checkNoSystemPromptWarning(false, "");
+  assert.ok(msg, "empty string user template is falsy — should warn");
+});
+
+test("no warning: false + non-empty user template", () => {
+  const msg = checkNoSystemPromptWarning(false, "custom template {previousEpisode}");
+  assert.equal(msg, null, "custom user template present — should not warn");
+});
+
+test("no warning: undefined system prompt (omitted/default)", () => {
+  const msg = checkNoSystemPromptWarning(undefined, undefined);
+  assert.equal(msg, null, "undefined system prompt is default behavior — should not warn");
+});
+
+test("no warning: empty string system prompt (backward compat default)", () => {
+  const msg = checkNoSystemPromptWarning("", undefined);
+  assert.equal(msg, null, "empty string system prompt is default behavior — should not warn");
+});
+
+test("no warning: custom string system prompt + no user template", () => {
+  const msg = checkNoSystemPromptWarning("You are a helpful assistant.", undefined);
+  assert.equal(msg, null, "non-empty system prompt — should not warn");
 });
 
 // ─── Summary ────────────────────────────────────────────────

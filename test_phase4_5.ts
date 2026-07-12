@@ -8,7 +8,8 @@ import {
 } from "./test_phase4_5_retriever_anchor.ts";
 import {
   runNarrativeWorkerEmptyRawTextGuardRegression,
-  runLanguageGuardReaskHandoffRegression
+  runLanguageGuardReaskHandoffRegression,
+  runNarrativeWorkerFalseSystemMode
 } from "./test_phase4_5_narrative_worker.ts";
 import { runJapaneseQueryParserFallbackTests } from "./test_phase4_5_japanese_query_parser.ts";
 import {
@@ -43,6 +44,8 @@ async function main() {
   // E4: Narrative Worker tests
   await runNarrativeWorkerEmptyRawTextGuardRegression();
   await runLanguageGuardReaskHandoffRegression();
+  // [v0.5.1] narrativeSystemPrompt=false mode tests
+  await runNarrativeWorkerFalseSystemMode();
 
   // E5: Cache / Compaction / Segmenter tests
   await runCompactionModelSmoke();

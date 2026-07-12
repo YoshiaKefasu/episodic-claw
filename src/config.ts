@@ -116,7 +116,28 @@ function normalizeForgettingConfig(rawConfig: any): ForgettingConfig {
 }
 
 /**
- * [v0.5.0] Parse and normalize narrativeBoundary config.
+ * [v0.5.1] Resolve the narrative system prompt with explicit no-system support.
+ * Unlike resolvePrompt(), this preserves boolean false as a distinct sentinel
+ * meaning "intentionally omit the system instruction."
+ *
+ * Normalization contract:
+ *   false        → false    (explicit no-system mode)
+ *   string/path  → resolved string via resolvePrompt()
+ *   ""           → ""       (empty = use default in worker, backward compat)
+ *   undefined    → ""       (omitted = use default in worker, backward compat)
+ *   any other    → ""       (treat as missing, backward compat)
+ */
+function resolveSystemPrompt(
+  value: string | false | undefined,
+  platform: string = process.platform,
+): string | false {
+  if (value === false) return false;
+  if (typeof value === "string") return resolvePrompt(value, platform);
+  return "";
+}
+
+/**
+ * Parse and normalize narrativeBoundary config.
  * Each boolean defaults to true for backward compatibility.
  */
 function normalizeNarrativeBoundaryConfig(rawConfig: any): NarrativeBoundaryConfig {
@@ -207,7 +228,7 @@ export function loadConfig(rawConfig: any, opts?: { platform?: string }): Episod
         ),
       };
     })(),
-    narrativeSystemPrompt: resolvePrompt(rawConfig?.narrativeSystemPrompt, platform),
+    narrativeSystemPrompt: resolveSystemPrompt(rawConfig?.narrativeSystemPrompt, platform),
     narrativeUserPromptTemplate: resolvePrompt(rawConfig?.narrativeUserPromptTemplate, platform),
     narrativePreviousEpisodeRef: rawConfig?.narrativePreviousEpisodeRef ?? true,
     // [v0.4.28a] Language guard config — transplanted from Guardrails AI correct_language validator
@@ -304,6 +325,23 @@ export function buildRecallCalibration(config: EpisodicPluginConfig): RecallCali
     topicsMismatchPenalty: config.recallTopicsMismatchPenalty,
     topicsMissingPenalty: config.recallTopicsMissingPenalty,
   };
+}
+
+/**
+ * [v0.5.1] Pure predicate for the startup warning when narrativeSystemPrompt=false
+ * has no custom narrativeUserPromptTemplate.
+ *
+ * Returns the warning message string if the condition is met, null otherwise.
+ * Extracted from index.ts init() for deterministic testing.
+ */
+export function checkNoSystemPromptWarning(
+  narrativeSystemPrompt: string | false | undefined,
+  narrativeUserPromptTemplate?: string,
+): string | null {
+  if (narrativeSystemPrompt === false && !narrativeUserPromptTemplate) {
+    return "[Episodic Memory] narrativeSystemPrompt=false has no custom narrativeUserPromptTemplate; default user template remains active.";
+  }
+  return null;
 }
 
 

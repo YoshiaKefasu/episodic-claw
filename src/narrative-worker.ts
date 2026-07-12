@@ -1410,7 +1410,10 @@ export class NarrativeWorker {
 
   private resolveSystemPrompt(): string {
     const custom = this.config.narrativeSystemPrompt;
-    if (custom && custom.trim().length > 0) return custom.trim();
+    // [v0.5.1] false = explicit no-system mode → return empty string so providers omit system instruction.
+    // undefined / "" = backward compat → use code default.
+    if (custom === false) return "";
+    if (typeof custom === "string" && custom.trim().length > 0) return custom.trim();
     return DEFAULT_SYSTEM_PROMPT;
   }
 

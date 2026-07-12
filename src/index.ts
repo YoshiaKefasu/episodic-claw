@@ -4,7 +4,7 @@ import * as fs from "fs";
 import { createHash } from "crypto";
 import { Type } from "@sinclair/typebox";
 import { EpisodicCoreClient, FileEventDebouncer, resolveSessionFile, ingestColdStartSession, ingestedSessions } from "./rpc-client";
-import { buildRecallCalibration, loadConfig } from "./config";
+import { buildRecallCalibration, loadConfig, checkNoSystemPromptWarning } from "./config";
 import { EventSegmenter, Message, extractText } from "./segmenter";
 import { EpisodicRetriever, RecallInjectionOutcome, invalidateTsRecallCache, classifyAndStripAttachment, hasMediaScaffold } from "./retriever";
 import { EpisodicArchiver } from "./archiver";
@@ -559,9 +559,14 @@ const PluginConfigSchema = Type.Object(
     openrouterModel: Type.Optional(Type.String({
       description: "Deprecated: legacy alias for openrouterConfig.model. Use openrouterConfig.model instead."
     })),
-    narrativeSystemPrompt: Type.Optional(Type.String({
-      description: "Custom system prompt for narrative generation. Inline text."
-    })),
+    narrativeSystemPrompt: Type.Optional(Type.Union([
+      Type.String({
+        description: "Custom system prompt for narrative generation. Inline text or path to .md/.txt file. Leave empty for default."
+      }),
+      Type.Literal(false, {
+        description: "Omit system instruction entirely. When combined with narrativeUserPromptTemplate, the user template becomes the sole instruction source."
+      }),
+    ])),
     narrativeUserPromptTemplate: Type.Optional(Type.String({
       description: "Custom user prompt template for narrative generation. Variables: {previousEpisode}, {conversationText}"
     })),
@@ -762,12 +767,21 @@ const episodicClawPlugin = {
         );
         console.log(
           `[Episodic Memory] Config loaded: recallQueryRecentMessageCount=${cfg.recallQueryRecentMessageCount}, ` +
-          `narrativeSystemPrompt=${cfg.narrativeSystemPrompt ? `(custom, ${cfg.narrativeSystemPrompt.length} chars)` : "(default)"}, ` +
+          `narrativeSystemPrompt=${
+            cfg.narrativeSystemPrompt === false ? "(disabled: explicit no-system)"
+            : cfg.narrativeSystemPrompt ? `(custom, ${cfg.narrativeSystemPrompt.length} chars)`
+            : "(default)"
+          }, ` +
           `model=${cfg.openrouterModel}, ` +
           `openrouterTimeoutMs=${cfg.openrouterTimeoutMs}, openrouterMaxRetries=${cfg.openrouterMaxRetries}, ` +
           // [v0.4.29c Fix C6] narrativeConfigSource for observability
           `narrativeConfigSource=${cfg.narrativeConfigSource ?? "(unknown)"}`
         );
+        // [v0.5.1] Warn when narrativeSystemPrompt=false has no custom user template
+        const noSystemWarning = checkNoSystemPromptWarning(cfg.narrativeSystemPrompt, cfg.narrativeUserPromptTemplate);
+        if (noSystemWarning) {
+          console.warn(noSystemWarning);
+        }
 
         const rpcClient = new EpisodicCoreClient();
         const retriever = new EpisodicRetriever(rpcClient, cfg);

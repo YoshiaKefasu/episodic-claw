@@ -32,6 +32,7 @@ function loadModules(): {
     "index.js","large-payload.js","untrusted-metadata.js","retriever.js","config.js",
     "anchor-store.js","archiver.js","compactor.js","cjk-tokenizer.js","lang-detect.js",
     "narrative-worker.js","gemini-direct-client.js","narrative-pool.js","narrative-queue.js",
+    "narrative-transcript.js",
     "openrouter-client.js","reasoning-tags.js","rpc-client.js","env-var.js","runtime-mode.js","bug1-registration-origin.js",
     "segmenter.js","summary-escalation.js","transcript-repair.js","transport-retry.js","types.js","utils.js",
     "episode-extract.js","snapshot-guardrail.js","snapshot-file-writer.js","snapshot-worker.js","snapshot-scheduler.js",

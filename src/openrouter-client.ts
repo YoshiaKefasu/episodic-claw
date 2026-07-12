@@ -255,8 +255,10 @@ export class OpenRouterClient {
     const url = `${this.config.baseUrl}/chat/completions`;
     const body: Record<string, any> = {
       model: effectiveModel,
+      // [v0.5.1] Omit system message entirely when systemPrompt is empty (no-system mode).
+      // This preserves the old shape (system + user) for non-empty system prompts.
       messages: [
-        { role: "system", content: systemPrompt },
+        ...(systemPrompt.trim() ? [{ role: "system", content: systemPrompt }] : []),
         { role: "user", content: userMessage },
       ],
       temperature: this.config.temperature,

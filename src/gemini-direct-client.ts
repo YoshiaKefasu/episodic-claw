@@ -111,10 +111,13 @@ export class GeminiDirectClient {
           "Content-Type": "application/json",
           "x-goog-api-key": this.apiKey,
         },
+        // [v0.5.1] Omit systemInstruction entirely when empty (no-system mode).
+        // Gemini API treats absent systemInstruction as no system instruction,
+        // which is distinct from systemInstruction: { parts: [{ text: "" }] }.
         body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: params.systemPrompt }],
-          },
+          ...(params.systemPrompt.trim()
+            ? { systemInstruction: { parts: [{ text: params.systemPrompt }] } }
+            : {}),
           contents: [
             {
               role: "user",

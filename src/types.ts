@@ -148,8 +148,14 @@ export interface EpisodicPluginConfig {
    *  Sources from openrouterConfig.maxRetries. Clamped to [0, 5]. Default: 3.
    *  Set to 0 for strict fail-fast mode (no retries). */
   openrouterMaxRetries?: number;
-  /** Narrative system prompt (inline text). */
-  narrativeSystemPrompt?: string;
+  /** Narrative system prompt (inline text).
+   *  - string: custom system instruction (resolved via inline text or file path).
+   *  - false: intentionally omit the system instruction entirely (no-system mode).
+   *           When combined with narrativeUserPromptTemplate, the user template
+   *           becomes the sole instruction text sent to the provider.
+   *  - omitted/empty: use the code default system prompt (backward compatible).
+   *  Distinct from omitted/empty, which preserves default system behavior. */
+  narrativeSystemPrompt?: string | false;
   /** Narrative user prompt template (inline text). */
   narrativeUserPromptTemplate?: string;
   /** Pass the full previous episode to the LLM for context continuity. */
